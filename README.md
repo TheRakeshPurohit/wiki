@@ -107,6 +107,7 @@
 | [Emacs 研究](emacs-research.md) | | Emacs 配置与使用 |
 | [编辑器选型 2026](editor-selection-2026.md) | | 编辑器选型对比 |
 | [区块编辑器架构](block-editor-architecture.md) | | 区块编辑器设计 |
+| [Linux 桌面工作流](linux-desktop-workflow.md) | | 平铺 WM 到 COSMIC DE 的架构选择：外层堆叠+内层平铺、Nushell+Pop-Launcher 数据流 |
 | [Linux SSD 优化](linux-ssd-optimization.md) | | SSD 性能优化 |
 | [Debian 容器沙箱](debian-container-sandbox.md) | | 容器化沙箱方案 |
 | [P2P 网格对比](p2p-mesh-networking-comparison.md) | | P2P 网状网络方案对比 |
