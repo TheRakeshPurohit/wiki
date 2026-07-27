@@ -132,12 +132,13 @@ AI 看到这段指令后，先回答用户问题，然后调用 `memory_checkpoi
 
 ### 触发时机
 
-两种记忆，两种触发机制：
+三种记忆，三种触发机制：
 
 | 记忆类型 | 工具 | 谁触发 | 机制 | 优点 | 缺点 |
 |:--|:--|:--|:--|:--|:--|
 | **长期记忆** | `memory_store` | **LLM**（主动判断） | LLM 在对话过程中判断"这条值得记住"时调用 | 精准，只存有价值的 | 依赖 LLM 判断力，可能遗漏 |
 | **短期记忆** | `memory_checkpoint` | **记忆系统**（阈值触发） | 消息累积到 N 条时，prompt 注入尾提示词，Agent 框架执行 DB 操作 | 低频调用，开销可控 | N 条内未压缩（但原始消息仍在 session 中） |
+| **记忆检索** | `memory_search` | **LLM**（主动判断） | LLM 在对话过程中判断"需要查一下"时调用，同时搜索 memories + session_checkpoints | 跨会话知识检索，支持历史对话摘要 | 依赖 LLM 判断力，可能遗漏 |
 | 短期记忆变体 | `memory_checkpoint` | **定时任务** | 用户不活跃时（如凌晨）后台触发 | 不影响用户体验，利用闲置算力 | 需要定时任务基础设施 |
 | 短期记忆变体 | `memory_checkpoint` | **流式计算** | session 闲置 + cache 快过期时触发，续期 checkpoint | 防止 cache 过期失效 | 需要监听 session 活跃状态 |
 | 短期记忆变体 | `memory_checkpoint` | **图谱聚簇** | 检测到对话主题切换时触发，按语义边界压缩 | 摘要更清晰 | 需要主题检测能力（图谱化记忆） |
@@ -161,12 +162,13 @@ LLM 不主动捕捉执行过程中产生的知识——它用判断力筛选，�
 
 **主题转换触发**：检测到对话主题切换时触发压缩。按语义边界压缩，摘要更清晰（"前半段讨论架构，后半段讨论部署"比"100 条消息的混合摘要"更有用）。需要主题检测能力，与图谱化记忆配合——图谱中的聚簇边界就是天然的主题边界。
 
-这是记忆系统的五种触发方式，按记忆类型分组：
+这是记忆系统的六种触发方式，按记忆类型分组：
 
 | 记忆类型 | 方式 | 时机 | 谁触发 | 存什么 |
 |:--|:--|:--|:--|:--|
 | **长期记忆** | 主动触发 | 对话过程中 | **LLM**（主动判断） | LLM 判断值得记住的 → `memories` 表 |
 | **短期记忆** | Prefix Checkpoint | 阈值到达时 | **记忆系统** | 对话摘要 → `session_checkpoints` 表 |
+| **记忆检索** | 主动触发 | 对话过程中 | **LLM**（主动判断） | 搜索 `memories` + `session_checkpoints` |
 | 短期记忆变体 | 夜间定时 | 用户不活跃时 | **定时任务** | 同 Prefix Checkpoint |
 | 短期记忆变体 | 长期闲置 | session 闲置 + cache 快过期 | **流式计算** | 续期 checkpoint |
 | 短期记忆变体 | 主题转换 | 语义边界 | **图谱聚簇** | 按主题分段的摘要 |
@@ -391,6 +393,12 @@ SurrealDB graph  SurrealDB KV      SQLite + vector
 | 提取 | flat KV（LLM 双层输出：checkpoint + memories） |
 | 存储 | SurrealDB（session_messages + session_checkpoints + memories） |
 | 检索 | HNSW + BM25 + RRF 三路融合 |
+| 用户隔离 | 工作记忆：`user_id` + `session_id` 双键查询；长期记忆：`user_id` 查询 |
+
+**用户隔离设计**：
+- 工作记忆表（`session_messages`、`session_checkpoints`）包含 `user_id` 字段，支持同一用户多客户端会话隔离
+- 长期记忆表（`memories`）包含 `user_id` 字段，支持跨会话知识积累
+- `memory_search` 同时搜索 `memories` 和 `session_checkpoints`，结果带 `source` 字段区分来源
 
 #### 核心接口
 
@@ -399,7 +407,7 @@ SurrealDB graph  SurrealDB KV      SQLite + vector
 | 方法 | 用途 |
 |:--|:--|
 | `store(content, category, importance, tags)` | 存储记忆（embedding 由 SurrealDB 内部生成） |
-| `search(query, top_k)` | 混合检索 |
+| `search(query, top_k)` | 混合检索（memories + session_checkpoints） |
 | `forget(memory_id)` | 删除记忆 |
 
 #### 关键设计决策
