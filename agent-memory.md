@@ -37,7 +37,7 @@
 |:--|:--|:--|
 | **触发时机** | auto hooks（每轮系统自动） / 手动调用（Agent 判断） / 阈值触发 | agentmemory 用 hooks，skillforge 用阈值 |
 | **注入方式** | 全量注入 / top-K 检索注入 / checkpoint + 增量 | Hermes 全量，agentmemory top-K，skillforge checkpoint |
-| **框架适配** | 适配层接口（get_session_messages / add_message） | SnapshotSessionDB 适配 Agno |
+| **框架适配** | 适配层接口（push_user_message / get_context / write_assistant_message） | _AgnoAgentWrapper 适配 Agno |
 
 ### Engine
 
@@ -110,13 +110,13 @@ AI 每次回复前都会读一遍完整的对话。如果我们想让 AI 做某�
 
 ```
 [之前的所有对话]           ← AI 已经理解了（缓存中）
-[记忆系统插入的指令]        ← "分析以上对话，提取用户的偏好和事实，
-                              调用 memory_store 工具存储，
-                              然后回答用户的问题"
+[记忆系统插入的指令]        ← "先回答用户的问题，然后调用
+                              memory_checkpoint(session_id, summary)
+                              将对话压缩为摘要"
 [用户的问题]               ← 用户真正想问的
 ```
 
-AI 看到这段指令后，会自动调用记忆工具完成存储，然后正常回答用户。用户完全无感——他只是问了一个问题，AI 回答了，但后台顺便完成了记忆整理。
+AI 看到这段指令后，先回答用户问题，然后调用 `memory_checkpoint` 工具生成对话摘要并存入 checkpoint 表。用户完全无感——他只是问了一个问题，AI 回答了，但后台顺便完成了压缩。
 
 **控制机制**：Agent 是被动的——它只看到 prompt 和可用工具，按照 prompt 中的指令调用工具。记忆系统通过控制两件事实现完全控制：
 1. **注入什么** — 尾提示词（决定 Agent 做什么）
@@ -219,13 +219,13 @@ KV cache 中（不变）：
   [ckpt] + [msg_101..msg_150]
 
 新追加的消息（唯一未缓存的部分）：
-  "先回答用户的问题，然后分析以上对话，调用 memory_store
-   提取偏好/事实，标记 checkpoint"
+  "先回答用户的问题，然后调用 memory_checkpoint(session_id, summary)
+   将对话压缩为摘要"
 
-Agent 一次 turn 完成三件事（注意顺序）：
+Agent 一次 turn 完成两件事（注意顺序）：
   1. "Y"                              ← 先回答用户问题（用户体验优先）
-  2. tool_call: memory_store(...)    ← 再做记忆操作
-  3. tool_call: checkpoint(...)       ← 最后标记 checkpoint
+  2. tool_call: memory_checkpoint(    ← 再压缩对话为摘要
+       session_id, "这段对话讨论了...")
 ```
 
 **历史纯净性**：尾提示词是临时的——只存在于当次 turn 的 prompt 中，从不写入 session。session 里永远是纯净的历史：
@@ -238,9 +238,9 @@ session 中存储的：
   [checkpoint_1] + [尾提示词 + 用户原始消息 X] + [Agent 回答 Y]
 ```
 
-即使 prompt 中为了触发压缩而修改了用户消息（在其末尾追加指令），turn 结束后也需要将 session 中的该条消息**还原为原始内容**。这保证了：
+即使 prompt 中为了触发压缩而注入了尾提示词，session 中也不会残留——用户消息通过 `push_user_message` 缓冲在内存中，`get_context()` 构建上下文时才加入，`write_assistant_message()` 写入 DB 后清空。session 里永远是纯净的历史：
 - 历史可重放——任何时候重新加载 session，内容都是真实的对话
-- 无伪指令——session 中不会残留"分析以上对话，调用 memory_store"这样的系统指令
+- 无伪指令——session 中不会残留系统指令
 - 逻辑连贯——checkpoint + 原始消息 + 回答，构成完整的因果链
 
 **顺序很重要**：必须先回答用户问题，再做记忆操作。用户问了一个问题，如果先看到一堆工具调用在跑，体验很差。提示词中明确要求"先回答，再处理记忆"——用户看到的第一个输出就是答案，记忆操作是"顺便"完成的。
@@ -258,17 +258,20 @@ session 中存储的：
 
 ### 框架适配
 
-适配层隔离框架差异，核心接口只有两个方法：
+**铁律：mem 模块厚，agent 适配层薄。**
+
+适配层只做三步调用，不实现记忆逻辑：
 
 ```python
-class SessionAdapter:
-    def get_session_messages(session_id) → list[dict]  # checkpoint + 所有增量
-    def add_message(session_id, message)                 # 追加消息
+# 适配层（~20 行）
+memory.push_user_message(session_id, user_message)   # 缓冲用户消息
+context = memory.get_context(session_id)              # checkpoint + DB + pending + 尾提示词
+agent.additional_input = context                       # 注入到 agent
+agent.run()
+memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pending
 ```
 
-`get_session_messages` 返回 checkpoint + 后续所有未压缩消息，长度由阈值决定，不需要 limit 参数。
-
-换框架时只重写适配层（几十行），Engine完全复用。
+压缩检测、尾提示词注入、pending 管理全部在 WorkingMemory 内部。换框架时只重写适配层（~20 行），Engine 完全复用。
 
 ---
 
@@ -322,9 +325,10 @@ Turn N+2:  新 checkpoint + 新增量，重新开始
 Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，KV cache 持续命中
               ↓ 达到阈值
 Turn N+1:  用户提问 X
-           prompt 末尾追加: "分析以上对话，调用 memory_store 提取记忆，
-                           标记 checkpoint，然后回答：{X}"
-           → Agent 一次 turn: tool_call(memory_store) + tool_call(checkpoint) + 回答 Y
+           prompt 末尾追加: "先回答用户的问题，然后调用
+                           memory_checkpoint(session_id, summary)
+                           将对话压缩为摘要，然后回答：{X}"
+           → Agent 一次 turn: 回答 Y + tool_call(memory_checkpoint)
 Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 ```
 
@@ -377,8 +381,8 @@ SurrealDB graph  SurrealDB KV      SQLite + vector
 | 决策点 | 选择 |
 |:--|:--|
 | 触发时机 | 阈值触发（100 条）+ Agent 手动调用 |
-| 注入方式 | checkpoint + 增量（SnapshotSessionDB） |
-| 框架适配 | SnapshotSessionDB（适配 Agno session_db） |
+| 注入方式 | checkpoint + 增量（additional_input 注入） |
+| 框架适配 | _AgnoAgentWrapper（三步调用：push → get_context → write） |
 
 #### Engine
 
@@ -410,7 +414,7 @@ SurrealDB graph  SurrealDB KV      SQLite + vector
 
 #### 框架迁移
 
-SnapshotSessionDB 是唯一与框架耦合的部分（实现 `get_session_messages` + `add_message`）。MemoryManager 和 MemoryTools 完全复用。迁移成本：几十行适配代码。
+`_AgnoAgentWrapper` 是唯一与框架耦合的部分（~20 行三步调用）。WorkingMemory、MemoryManager、MemoryTools 完全复用。迁移成本：重写适配层（~20 行）。
 
 ---
 
@@ -530,7 +534,7 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 
 ### MCP 与记忆层
 
-agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记忆层走 MCP 可接受（低频操作），工具执行层走 MCP 不可接受（高频操作）。skillforge 用框架适配层（SnapshotSessionDB）替代 MCP，进程内调用无网络开销。
+agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记忆层走 MCP 可接受（低频操作），工具执行层走 MCP 不可接受（高频操作）。skillforge 用框架适配层（_AgnoAgentWrapper）替代 MCP，进程内调用无网络开销。
 
 ### 合成闭环的缺口
 
@@ -544,19 +548,21 @@ agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记�
 
 ### 当前状态
 
-skillforge 已实现两层架构的Surface（阈值触发 + checkpoint 注入 + SnapshotSessionDB 适配）和Engine的基础形态（flat KV 提取 + HNSW/BM25/RRF 检索 + SurrealDB 存储）。核心接口三个：store / search / forget。
+skillforge 已实现两层架构的Surface（阈值触发 + checkpoint 注入 + _AgnoAgentWrapper 适配）和Engine的基础形态（flat KV 提取 + HNSW/BM25/RRF 检索 + SurrealDB 存储）。核心接口三个：store / search / forget。
 
 ### 演进方向
 
 | 阶段 | 改什么 | 不改什么 |
 |:--|:--|:--|
 | **图谱化** | Engine：flat KV → graph triples，检索增加图遍历 | Surface（触发、注入、适配）不动 |
-| **框架迁移** | Surface：重写 SnapshotSessionDB（几十行） | Engine（MemoryManager、MemoryTools）不动 |
+| **框架迁移** | Surface：重写 _AgnoAgentWrapper（~20 行三步调用） | Engine（WorkingMemory、MemoryManager、MemoryTools）不动 |
 | **权重系统** | Engine：增加 read_count/write_count 追踪和排序 | Surface不动 |
+| **后台压缩** | Surface：后台进程检测空闲，主动触发压缩 | Engine不动 |
 
 ### 设计原则
 
 1. **Surface 和 Engine 分离**：换框架只改Surface，换存储/检索只改Engine
-2. **LLM 调用最小化**：100 条以内无感知，压缩融入 Agent 正常 turn，不单独调 LLM
-3. **框架无关**：记忆逻辑不依赖任何特定 Agent 框架
-4. **渐进式演进**：当前 flat KV 够用就用 flat KV，需要图结构时再升级
+2. **mem 模块厚，agent 适配层薄**：所有记忆逻辑封装在 WorkingMemory，适配层只做三步调用
+3. **LLM 调用最小化**：100 条以内无感知，压缩融入 Agent 正常 turn，不单独调 LLM
+4. **框架无关**：记忆逻辑不依赖任何特定 Agent 框架
+5. **渐进式演进**：当前 flat KV 够用就用 flat KV，需要图结构时再升级
