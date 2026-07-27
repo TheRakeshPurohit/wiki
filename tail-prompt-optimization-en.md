@@ -116,6 +116,19 @@ Tail prompt discarded, no residue.
 | Attention | Fully concentrated on compression task | Split (answer user + execute task) |
 | Control | Compression module controls | Injector controls (via prompt + tools) |
 
+### Cost Analysis
+
+The traditional compression argument ("auxiliary model is cheaper than cache") disappears when amortized per call:
+
+- Auxiliary model price ≈ 1/60 of main model, cache price ≈ 1/10 of main model
+- Compress once every 100 turns: savings = (1/10 - 1/60) = 8.3% of input cost
+- Amortized per call: 8.3% / 100 = **0.083%**
+- Trade-off: compression quality loss (information dropped, compressor lacks Agent context)
+
+Tail prompting is itself compression, but higher quality — it leverages the Agent's normal turn attention to compress, rather than a standalone call. Without tail prompting, using the main model on full context is slow and expensive; tail prompting lets the main model compress incidentally during its normal turn, solving this problem.
+
+The auxiliary model, while fast per-token, has no KV cache (0% hit rate) and must recompute the full input. Main model + tail prompt benefits from ~99% cache hit rate on history, often resulting in lower actual latency.
+
 ## References
 
 - [agent-memory.md](agent-memory.md) — Tail prompt application in Prefix Checkpoint
