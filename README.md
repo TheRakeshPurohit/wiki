@@ -43,7 +43,7 @@
 | [统一数据层](unified-data-layer.md) | | SurrealDB 多模型引擎、SurQL 人体工程学、Redis/PG 统一替代 |
 | [湖仓研究](lakehouse-research.md) | | Iceberg/LanceDB/Delta Lake 选型 |
 | [LanceDB vs Fjall](lancedb-vs-fjall.md) | | 列式向量存储 vs 嵌入式 KV 的定位对比 |
-| [Fjall Openraft ADR](fjall-openraft-adr.md) | | 嵌入式 KV + Raft 共识替代 Redis |
+| [Aura 架构 §5](aura-architecture.md) | | Fjall + Openraft 分布式存算一体 |
 | [Fjall 多模态索引](fjall-multimodal-indexing.md) | | Fjall 的多模态索引设计 |
 | [Arrow HTAP 引擎](arrow-unified-htap-engine.md) | | Arrow 统一 HTAP 引擎设计 |
 | [文件系统方案](filesystem-solution.md) | | 文件系统选型 |

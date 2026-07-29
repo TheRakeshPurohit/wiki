@@ -496,18 +496,54 @@ Redis 只支持 Key-Value 和基础集合（Set/List/Hash）。它**无法处理
 
 **单次请求，单次返回，直达本质。**
 
-## 8. 替代方案
+## 8. RESP 协议 vs 二进制序列化：嵌入式架构的物理优势
+
+Redis 的 RESP（Redis Serialization Protocol）是基于行切分的纯文本协议，使用 `+`、`-`、`:` 和 `\r\n` 作为数据边界。在高吞吐场景下，这种文本协议引入三层开销：
+
+- **字符串扫描开销**：RESP 是行分隔的，CPU 必须逐字节扫描 `\r\n` 分隔符，再将 ASCII 字符串转换为整型。CPU 时钟周期消耗在文本解析上。
+- **带宽浪费**：二进制中 64 位无符号整型只需 8 字节，RESP 文本协议中 `18446744073709551615` 占 20 字节，外加类型符号和结束符。
+- **跨进程内存拷贝**：Redis 是独立进程，数据从内核 Buffer 拷贝到 Redis 进程，序列化后经网络传输，再拷贝到应用进程内存。跨进程、跨网络的多次拷贝是嵌入式架构不存在的开销。
+
+### Bincode：零元数据开销的序列化
+
+Bincode 是 Rust 原生的纯二进制序列化格式。一个包含 `i32` 和 `bool` 的结构体序列化后恰好 5 字节——无字段名、无分隔符、无类型标记。反序列化不需要解析：CPU 从磁盘（Fjall）或网络（Openraft 的二进制 RaftLog）读出字节，在几个时钟周期内直接 cast 为 Rust 内存结构体。
+
+### CBOR：兼顾动态扩展与硬件吞吐
+
+CBOR 是二进制格式，保留 JSON 的 KV 动态扩展能力，但字段名和类型编码为紧凑的二进制头部。二进制头部包含字段长度，解码器可直接跳过不关心的字段，无需逐字节扫描分隔符。
+
+### 零拷贝反序列化
+
+嵌入式架构（Fjall + 多语言引擎在同一 Rust 进程的同一内存地址空间）实现了运行期零拷贝反序列化。Fjall 从 NVMe 读数据到共享 Buffer 后，利用 Rust 生命周期系统与 Bincode/CBOR 结合，脚本引擎的指针可直接指向 Fjall 的底层磁盘缓冲区内存，无需额外内存分配和拷贝。
+
+```rust
+#[derive(Deserialize)]
+struct DistributedAgentContext<'a> {
+    id: u64,           // 固定 8 字节物理映射
+    status: &'a str,   // 零拷贝：指针直接指向 Fjall 磁盘缓冲区
+    raw_payload: &'a [u8], // 零拷贝：无 RAM 复制
+}
+
+fn execute_zero_copy_pipeline(raw_bytes_from_fjall: &[u8]) {
+    let context: DistributedAgentContext = bincode::deserialize(raw_bytes_from_fjall).unwrap();
+    // context.status 的内存指针直接传给内嵌的 Steel Lisp / PyO3 执行
+}
+```
+
+外部 Redis 因跨进程网络隔离，数据必须经过多次拷贝和 RESP 包装，物理上无法实现零拷贝。
+
+## 9. 替代方案
 
 Redis 唯一剩下的合理性是**惯性**——来自 PHP 时代的历史约束。
 
-1. **用于缓存/状态**：**Fjall**（嵌入式 LSM-Tree KV，Rust 原生）— 完整架构见 [Fjall + Openraft ADR](fjall-openraft-adr.md)。
+1. **用于缓存/状态**：**Fjall**（嵌入式 LSM-Tree KV，Rust 原生）— 完整架构见 [Aura 架构](aura-architecture.md) §5。
 2. **用于分布式状态**：**Fjall + Openraft**（嵌入式 Raft 共识）— 本批判的建设性对应物。在 L0（进程内 KV）和 L3（强一致性分布式协调）两个层面替代 Redis。
 
 ---
 
 ## 交叉引用
 
-- **[Fjall + Openraft ADR](fjall-openraft-adr.md)**：替代 Redis 的建设性方案——嵌入式 KV + Raft 共识 + 二进制序列化的完整架构设计，含 RESP 协议对比和零拷贝反序列化分析。
+- **[Aura 架构](aura-architecture.md)**：Fjall + Openraft 的完整架构设计——存算一体的现代分布式 Actor 引擎。
 - **[嵌入式脚本语言](embedded-script-languages.md)**：本批判在脚本层的对应物。
 - **[Fractal.md](Fractal.md)**：第一性原理工程决策闭环——Redis、Koto、Helix 共享的"奥卡姆剃刀"方法论。
 - **[agentmemory](agent-memory.md)**：Agent 记忆层的持久化方案。agentmemory 选择 SQLite + 本地 embedding 而非 Redis，印证了本批判的核心论点——网络延迟主导了 Redis 的微秒级处理优势，嵌入式本地存储是更优解。

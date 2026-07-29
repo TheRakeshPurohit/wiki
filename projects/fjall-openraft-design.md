@@ -2,7 +2,7 @@
 
 **Status:** Decision adopted (2026-06-19)  
 **Replaces:** Redis for distributed coordination, KV storage, distributed locks  
-**ADR:** [重构分布式存储范式](../fjall-openraft-adr.md) — 决策背景与推理链条  
+**架构：** [Aura 架构 §5](../aura-architecture.md) — Fjall + Openraft 分布式存算一体  
 **Cross-ref:** [Redis Critique](../redis-critique.md) — the "why not Redis" argument
 
 ## Core Thesis

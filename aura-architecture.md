@@ -477,7 +477,7 @@ def handle(ctx, user_message=None):
 
 - **"零网络序列化损耗"**：底层数据库只是内嵌在 Rust 进程里的一行代码库（`struct Keyspace`），智能体读写状态是彻底的**进程内调用（In-Process Call）**。数据在物理磁盘到 Steel 虚拟机之间传递，走的是内存指针，速度直逼硬件物理极限。
 
-→ 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#resp-协议-vs-二进制序列化)
+→ 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#8-resp-协议-vs-二进制序列化嵌入式架构的物理优势)
 
 ### 5.4 核心源码实现：Openraft 状态机挂载 Fjall
 

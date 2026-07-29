@@ -402,7 +402,7 @@ SurrealDB 的优势不在性能（性能只是门票），而在**范式层面�
 - **[Redis 批判](redis-critique.md)**：详细论证了为何 Redis 是"网络 RAM 陷阱"，以及 SurrealDB 如何作为统一数据层替代 Redis + Neo4j + MongoDB 的拼凑架构。
 - **[Lakehouse 研究](lakehouse-research.md)**：OLAP 分析型负载的完整选型——Delta Lake / Iceberg / Lance / Vortex 对比，对象存储选型，落地模式。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：对比 Rune/Steel/Koto 等嵌入式脚本语言。SurrealDB 的 SurQL 与这些方案的哲学一致——拒绝在宿主语言中嵌入糟糕的脚本层（如 Redis 的 Lua），而是设计原生的、类型安全的查询语言。
-- **[Fjall + Openraft 设计](fjall-openraft-adr.md)**：当需要完全嵌入式的 KV 存储和分布式共识时（无需独立数据库进程），Fjall + Openraft 是 SurrealDB 的轻量级替代方案。
+- **[Aura 架构 §5](aura-architecture.md)**：当需要完全嵌入式的 KV 存储和分布式共识时（无需独立数据库进程），Fjall + Openraft 是 SurrealDB 的轻量级替代方案。
 - **[MySQL 批判](mysql-critique.md)**：MySQL 的 SQL 反模式和分片幻觉，与 SurrealDB 的原生分布式架构形成对比。
 - **[反应式架构](reactive-architecture.md)**：SurrealDB 的 Live Queries（WebSocket 实时推送）是反应式架构动态层的一个实现路径——客户端订阅数据变更事件，无需轮询。
 
