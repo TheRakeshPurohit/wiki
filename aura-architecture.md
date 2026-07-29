@@ -140,6 +140,11 @@ Rust 原生实现的 Actor 引擎利用 Tokio MPSC 管道建立低开销的 Host
 - **架构本质**：一个 Code-first 的高并发分布式异步任务编排与轻量 FaaS 平台。其最大的亮点是零侵入性——直接利用 Python 的类型提示（Type Hints）在后台自动生成标准的 JSON Schema，从而让普通的 Python 脚本可以直接作为 Tool 回调被大模型完美识别。
 - **技术痛点**：它在本质上不是一个智能体常驻平台。它的底层是为"短时任务（Short-lived Jobs）"和定时脚本设计的。一个 Python 任务跑完即释放，缺乏像 AX 那样的事件状态机死守，也缺乏像 Rivet 这样的内存级同机共生（Co-located State）。在面对密集的"多智能体高频长时交互（Long-running Swarm loops）"时，无状态拉起的进程摩擦力显得过于厚重。
 
+#### ④ Dapr —— Sidecar 抽象层的诱惑与代价
+
+- **架构本质**：CNCF 孵化项目，通过 Sidecar 模式为每个服务附加"构建块"（State Management、Pub/Sub、Service Invocation 等），以 RESTful/gRPC 接口屏蔽底层实现差异。切换 Redis → Kafka → NATS 不需要改业务代码。
+- **技术痛点**：每个调用经过 Sidecar 的一跳，延迟叠加。抽象层过重——每个构建块是一层 REST API 包装，而各领域已有事实标准协议（Kafka 的协议、Postgres 的协议、S3 的协议），在标准之上再抽象一层是退化。Dapr 的核心价值是跨云迁移和厂商锁定规避，但在技术栈可控的系统中，直接使用原生协议始终优于抽象层。Aura 的做法是进程内集成，没有 Sidecar，没有额外跳数。
+
 ## 4. 架构升级：多语言混合动力运行时（Polyglot Embedded Harness）
 
 本架构已从单一的 Steel Lisp 策略层演进为多模态混合运行时控制台。通过在 Rust 主 Actor 内部建立统一的"多语言网关接口（Polyglot Bridge）"，针对不同业务场景派出最合适的"工具人"，同时保持快速启动与 Scale to Zero 的核心设计。

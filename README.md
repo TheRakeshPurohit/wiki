@@ -71,6 +71,7 @@
 | 文档 | English | 内容 |
 |:--|:--|:--|
 | [Aura 架构](aura-architecture.md) | | Event Realm、Actor、事件组合原语、interface_schema |
+| [长连接工程挑战](long-lived-connection-engineering.md) | | WS/WT 长连接的物理限制（背压、碎片化、连接倾斜）与解法 |
 | [Aura Fluxora DevOps](aura-fluxora-devops.md) | | Aura 与 Fluxora 的 DevOps 集成 |
 | [响应式架构](reactive-architecture.md) | | 响应式系统设计 |
 | [WASM 统一运行时](wasm-unified-runtime.md) | | WebAssembly 统一运行时架构 |

@@ -549,3 +549,4 @@ Redis 唯一剩下的合理性是**惯性**——来自 PHP 时代的历史约�
 - **[agentmemory](agent-memory.md)**：Agent 记忆层的持久化方案。agentmemory 选择 SQLite + 本地 embedding 而非 Redis，印证了本批判的核心论点——网络延迟主导了 Redis 的微秒级处理优势，嵌入式本地存储是更优解。
 - **[Lakehouse 研究](lakehouse-research.md)**：索引版本号接口与 Lakehouse Catalog 同源——都是把版本治理从存储层提升到控制面，用最简实现替代缓存失效机制。
 - **[反应式架构](reactive-architecture.md)**：§4 反应式架构的完整独立论述——从被动拉取到主动推送，流计算与消息队列升为核心基础设施。
+- **[长连接工程挑战](long-lived-connection-engineering.md)**：WS/WT 长连接在存算一体架构下的物理限制（背压、碎片化、连接倾斜）与解法。
