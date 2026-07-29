@@ -594,7 +594,7 @@ cargo build -p ui         # 构建 UI（WASM）
 本文档是 Fluxora 项目的完整设计，与以下详细分析形成完整的决策闭环：
 
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，Fluxora 未来可选接入的底层基础设施。
-- **[反应式架构](reactive-architecture.md)**：Fluxora 是反应式架构的激进实践——UI 和协议层完全事件驱动，无 HTTP 请求-响应模型。
+- **[反应式架构](flux-architecture.md)**：Fluxora 是反应式架构的激进实践——UI 和协议层完全事件驱动，无 HTTP 请求-响应模型。
 - **[Aura + Fluxora DevOps](aura-fluxora-devops.md)**：脚本即代码（Script-as-Code）的工程实践，含 GitOps 工作流、CI/CD 配置、脚本测试与调试。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体。
 

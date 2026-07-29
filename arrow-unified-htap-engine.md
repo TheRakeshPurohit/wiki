@@ -497,6 +497,6 @@ Steel Lisp 策略层（DataFrame 作为一等公民函数参数）
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Steel Lisp 作为策略层的确定性优势。
 - **[Fjall + Openraft 设计](fjall-openraft-design.md)**：工作记忆的分布式强一致实现。
 - **[Bincode vs CBOR 分析](bincode-cbor.md)**：行式序列化的极致轻量与动态灵活性的对比。
-- **[反应式架构](reactive-architecture.md)**：Arrow 列式格式是反应式架构静态层的推送载体——预计算聚合结果以列式切片推送到 CDN，数据变更触发重新物化。
+- **[反应式架构](flux-architecture.md)**：Arrow 列式格式是反应式架构静态层的推送载体——预计算聚合结果以列式切片推送到 CDN，数据变更触发重新物化。
 
 **统一的第一性原理**：不搞技术崇拜，不吃开源画的大饼，只看真实的硬件物理限制与团队生产力。

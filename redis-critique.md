@@ -195,7 +195,7 @@ PostgreSQL：分层缓存
 
 Redis 的"低成本"是个神话。在真实世界的中等规模场景中，PostgreSQL 的 TCO 是 **Redis 的 1/6**。Redis 的内存浪费和 CPU 浪费使其成为**最昂贵的缓存解决方案**。
 
-## 4. 反应式架构：CDN、流式推送与版本号接口
+## 4. Flux 架构：从被动拉取到主动推送
 
 传统的 Redis 缓存是**请求驱动的被动模式**——用户请求来了，才去 Redis 查、去源站查。现代架构应该反过来：数据变更时**主动推送**到边缘，用户请求只命中已就绪的缓存。这一节拆解三个层面：CDN 替代 Redis 做静态缓存、流引擎主动推送预计算结果、版本号接口解决缓存失效。
 
@@ -257,7 +257,7 @@ CDN 不需要任何复杂操作——它只是托管静态文件。版本检查�
 
 不需要 Redis 的 TTL 管理、缓存击穿防护、雪崩降级——极动态的数据本身没有缓存的必要，缓存引入的复杂性远大于收益。
 
-**与现代 Lakehouse 架构思路一致**：Lakehouse 通过 Catalog 层（元数据服务）管理数据版本和快照，而不是依赖存储层的 TTL 缓存。索引版本号接口是同一思路的极简实现——把版本治理从存储层提升到控制面，用一个接口替代一整套缓存失效机制。详见 [Lakehouse 研究](lakehouse-research.md)。完整论述见 [反应式架构](reactive-architecture.md)。
+**与现代 Lakehouse 架构思路一致**：Lakehouse 通过 Catalog 层（元数据服务）管理数据版本和快照，而不是依赖存储层的 TTL 缓存。索引版本号接口是同一思路的极简实现——把版本治理从存储层提升到控制面，用一个接口替代一整套缓存失效机制。详见 [Lakehouse 研究](lakehouse-research.md)。完整论述见 [Flux 架构](flux-architecture.md)。
 
 ## 5. 缓存层分类学：Redis 的位置（以及为什么它是错的）
 
@@ -548,5 +548,5 @@ Redis 唯一剩下的合理性是**惯性**——来自 PHP 时代的历史约�
 - **[Fractal.md](Fractal.md)**：第一性原理工程决策闭环——Redis、Koto、Helix 共享的"奥卡姆剃刀"方法论。
 - **[agentmemory](agent-memory.md)**：Agent 记忆层的持久化方案。agentmemory 选择 SQLite + 本地 embedding 而非 Redis，印证了本批判的核心论点——网络延迟主导了 Redis 的微秒级处理优势，嵌入式本地存储是更优解。
 - **[Lakehouse 研究](lakehouse-research.md)**：索引版本号接口与 Lakehouse Catalog 同源——都是把版本治理从存储层提升到控制面，用最简实现替代缓存失效机制。
-- **[反应式架构](reactive-architecture.md)**：§4 反应式架构的完整独立论述——从被动拉取到主动推送，流计算与消息队列升为核心基础设施。
+- **[Flux 架构](flux-architecture.md)**：§4 的完整独立论述——从被动拉取到主动推送，Fluxora = Flux + Aura。
 - **[长连接工程挑战](long-lived-connection-engineering.md)**：WS/WT 长连接在存算一体架构下的物理限制（背压、碎片化、连接倾斜）与解法。

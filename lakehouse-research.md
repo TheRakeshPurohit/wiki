@@ -417,4 +417,4 @@ storage_options = {
 
 - **[统一数据层](unified-data-layer.md)**：SurrealDB 的计算下推原则与对象存储的共识协议本质同源——减少不必要的中转，让逻辑在数据所在的地方执行。
 - **[Redis 批判](redis-critique.md)**：架构批判方法论——从"架构鼓励什么"的视角审视技术选型，而非"工具没问题开发者用错了"。
-- **[反应式架构](reactive-architecture.md)**：Lakehouse 的 Catalog 层管理数据版本和快照，与反应式架构的版本号接口思路一致——把版本治理从存储层提升到控制面。
+- **[反应式架构](flux-architecture.md)**：Lakehouse 的 Catalog 层管理数据版本和快照，与反应式架构的版本号接口思路一致——把版本治理从存储层提升到控制面。

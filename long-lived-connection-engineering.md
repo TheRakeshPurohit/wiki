@@ -5,7 +5,7 @@
 
 ## 导语
 
-WebSocket / WebTransport 长连接是[反应式架构](reactive-architecture.md)动态层的核心通道，也是 [Aura](aura-architecture.md) 存算一体架构中 Actor 的物理载体。短生命周期 HTTP 请求规避了连接状态管理的复杂性，但长连接将连接生命周期与计算单元绑定后，引入了一系列物理层面的工程挑战。本文梳理这些挑战的本质与现代解法。
+WebSocket / WebTransport 长连接是[Flux 架构](flux-architecture.md)的核心通道，也是 [Aura](aura-architecture.md) 存算一体架构中 Actor 的物理载体。短生命周期 HTTP 请求规避了连接状态管理的复杂性，但长连接将连接生命周期与计算单元绑定后，引入了一系列物理层面的工程挑战。本文梳理这些挑战的本质与现代解法。
 
 ## 1. 背压（Backpressure）
 
@@ -143,6 +143,6 @@ Aura 架构选择 Fjall + Openraft，天然支持强一致性路径——群组�
 
 ## 交叉引用
 
-- **[反应式架构](reactive-architecture.md)**：长连接是动态层推送的物理通道，本文讨论该通道的工程挑战。
+- **[Flux 架构](flux-architecture.md)**：长连接是 Flux 架构的核心通道，本文讨论该通道的工程挑战。
 - **[Aura 架构](aura-architecture.md)**：存算一体引擎，本文的内存拓扑模型基于 Actor + Fjall 的进程内架构。
 - **[Redis 批判](redis-critique.md)**：传统架构中连接状态和群组关系存在 Redis，本文展示存算一体如何消除这一层。

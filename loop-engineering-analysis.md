@@ -366,4 +366,4 @@ Loop Engineering 作为方法论本身太简单——看到重复劳动就想到
 - **[LLM 基础认知](llm-fundamentals.md)**：元认知缺失是 Maker/Checker 分离的根本原因（5.3.5）
 - **[Karpathy 的 AI 编程方法论](karpathy-ai-coding-methodology.md)**：单次交互的质量闭环，与 Loop 的多次交互闭环互补
 - **[职场沟通](workplace-communication.md)**：IM vs 邮件范式、AI 主持人架构、沟通量与组织复杂度
-- **[反应式架构](reactive-architecture.md)**：Loop 的"事件驱动优于轮询"（webhook vs cron）与反应式架构的核心命题同源——被动拉取 vs 主动推送，同一原则在基础设施层和 UI 层都成立。
+- **[反应式架构](flux-architecture.md)**：Loop 的"事件驱动优于轮询"（webhook vs cron）与反应式架构的核心命题同源——被动拉取 vs 主动推送，同一原则在基础设施层和 UI 层都成立。

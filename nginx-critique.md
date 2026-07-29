@@ -219,6 +219,6 @@ Nginx 是**遗留工具**——能用，但不是现代架构的正确工具。�
 - **[MySQL 批判](mysql-critique.md)**：MySQL 的 SQL 反模式和分片幻觉，与 Nginx 的配置复杂性同源。
 - **[SurrealDB](unified-data-layer.md)**：现代多模型数据库，与 Nginx 的现代网关替代方案（Envoy/Pingora）哲学一致。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Rune/Steel/Koto 的选型哲学与 Nginx vs Envoy 的选型一致——拒绝遗留设计，拥抱现代架构。
-- **[反应式架构](reactive-architecture.md)**：反应式架构的动态层依赖 WebSocket 推送，Nginx 的 WS 代理配置复杂性与反应式架构的"推送优先"模式形成对比。
+- **[反应式架构](flux-architecture.md)**：反应式架构的动态层依赖 WebSocket 推送，Nginx 的 WS 代理配置复杂性与反应式架构的"推送优先"模式形成对比。
 
 **统一的第一性原理**：不搞技术崇拜，不吃开源画的大饼，只看真实的硬件物理限制与团队生产力。

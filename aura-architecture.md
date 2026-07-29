@@ -2176,6 +2176,6 @@ Aura 的核心场景是高并发有状态流（游戏、IM、秒杀、AI 智能�
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Rune/Steel/Koto 的技术对比，本架构坚定选择 Steel Lisp。
 - **[编辑器选型](editor-selection-2026.md)**：Helix vs Neovim 的深度分析，本架构可在 Neovim 中使用 Fennel/Steel 元编程。
 - **[Nginx 批判](nginx-critique.md)**：Nginx 的遗留设计，本架构可选择 Envoy/Pingora 作为现代网关。
-- **[反应式架构](reactive-architecture.md)**：Aura §8 场域模型是反应式架构的进程内实现——Actor 写入 Fjall → emit 事件 → 订阅者进程内收到，零网络跳数，不依赖外部流处理引擎。
+- **[反应式架构](flux-architecture.md)**：Aura §8 场域模型是反应式架构的进程内实现——Actor 写入 Fjall → emit 事件 → 订阅者进程内收到，零网络跳数，不依赖外部流处理引擎。
 - **[Wasm 统一运行时](wasm-unified-runtime.md)**：Rust → Wasm 现在已可用（不需要 wasm-gc），覆盖异步场景。wasm-gc 后 Kotlin/C# 涌入，语言选择进一步丰富。Steel 和 PyO3 保留。
 
