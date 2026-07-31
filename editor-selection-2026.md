@@ -17,7 +17,7 @@
 
 ---
 
-## 二、Neovim 0.12 + Neovide 架构：极简主义的集成帝国
+## 二、Neovim 0.12 + Neovide：全功能集成帝国
 
 ### 架构设计（解耦下沉）
 
@@ -27,159 +27,160 @@ Neovim 0.12 正在经历一场"去 Lua 膨胀化"的革命。它将过去必须�
 
 天花板级别。配合 Neovide 的亚像素级渲染、无边框悬浮和物理微动画，所有视觉元素全部统一在同一个 Grid 像素块中。通过关闭状态栏（`laststatus=0`），可以实现 100% 没有任何圆角、伪 GUI 边框、花哨图标污染的纯文本矩阵。
 
-### 集成能力
+### 集成方式：编辑器吞噬一切
 
-极强。内置的 `:terminal` 和原生的进程缓冲区管理，可以直接在右侧分屏拉出一个纯净的 PTY 终端来跑 AI 审计工具或原生 Git。配合 Fugitive 这种纯文本 Buffer 流的 Git 插件，所有操作全键盘盲打，信息密度和效率拉满。
+Neovim 的集成方向是**向内**：`:terminal` 内嵌 PTY，Fugitive 内嵌 Git，Telescope 内嵌文件搜索。编辑器本身是集成平台，外部工具被拉进 buffer 里运行。RPC（`nvim --remote`）也能被外部控制，但社区重心在"内部扩展"。
+
+代价是配置复杂度——Lua 回调地狱、插件冲突、启动优化，都需要用户自己扛。
 
 ---
 
-## 三、Helix（当前稳定版）：现代纯粹的"无服务器"编辑刺客
+## 三、Kakoune：Unix 哲学的纯编辑组件
+
+### 架构设计（client-server）
+
+Kakoune 的设计起点和 Neovim 完全相反：编辑器不是平台，是**被集成的组件**。
+
+- **client-server 架构**：`kak` 命令启动 server 进程管理 buffer 和 undo 历史，`kak -c <session>` 连接已有实例，`echo 'buffer README.md' | kak -p <session>` 往运行中的实例注入命令
+- **不做终端**：没有 `:terminal`，终端由 zellij/tmux 管理
+- **不做文件管理**：没有内置文件树，yazi/lf 在另一个 pane 跑
+- **不做 Git 集成**：没有 fugitive，lazygit 在另一个 pane 跑
+
+### 外部交互：命令接口 > 内嵌
+
+Kakoune 暴露了一个干净的命令接口，外部工具可以**主动操控**编辑器：
+
+```
+# 从 shell 脚本控制 kak 实例
+echo 'select All; exec d' | kak -p my_session    # 清空当前 buffer
+echo 'buffer src/main.rs' | kak -p my_session     # 切换文件
+
+# zellij 中：kak 占一个 pane，nushell 在另一个 pane 跑命令
+# 两者通过终端 PTY 粘合，零耦合
+```
+
+### 理念：Unix 组合 > 编辑器大一统
+
+Kakoune 的正确用法是**三件套组合**：
+
+```
+┌─────────────────────┬──────────────────────┐
+│   zellij            │   kak                │
+│   （窗口/session/   │   （纯文本编辑）      │
+│    终端管理）        │                      │
+├─────────────────────┼──────────────────────┤
+│   nushell           │   lazygit            │
+│   （任务/脚本）      │   （Git 操作）        │
+└─────────────────────┴──────────────────────┘
+```
+
+三者各自独立，通过终端 PTY 粘合。这是 Unix 哲学的组合方式——每个工具做好一件事，通过管道和终端协作，不是编辑器的大一统。
+
+**AI 时代的优势**：编辑器退化成审计界面后，Kakoune 的"我只管编辑"反而更诚实。不需要在编辑器里嵌入 Git/终端/AI 工具链，这些全部在 zellij 的其他 pane 里运行，各自保持独立的进程生命周期。
+
+### 局限
+
+- 配置语言是 Kakscript（类 Vimscript），生态小
+- 没有 LSP/Treesitter 内置支持（需要外部 wrapper 如 kak-lsp）
+- 插件生态远小于 Neovim
+- 对于需要深度集成 AI 补全、LSP 诊断面板的场景，不如 Neovim
+
+---
+
+## 四、Helix：现代纯粹的无服务器编辑刺客
 
 ### 架构设计（无状态/无服务器）
 
-基于 Rust 编写，开箱即用，拒绝任何插件。但它的致命缺陷在于 **"没有 Central Server 进程"**。它是一个 Serverless 架构，在同一个目录下重复敲 `hx` 会无情地新开独立进程，导致 Buffer 和 Undo 历史完全割裂。
+基于 Rust 编写，开箱即用，拒绝任何插件。**没有 Central Server 进程**——同一个目录下重复敲 `hx` 会新开独立进程，Buffer 和 Undo 历史完全割裂。
 
-### 集成能力
+### 集成方式：拒绝集成
 
-极弱。Helix 团队秉承极简和安全的理念，官方既没有内置终端，也没有提供任何允许外部命令行通过 Socket 远程控制运行中实例的 IPC 机制。如果想把它当成一个"全功能审计平台"，必须把多任务、Git 和目录树能力全部外包给外部工具（如 Zellij）。
-
----
-
-## 四、Zed / 传统现代 GUI 流派：降维打击后的"审计冗余"
-
-### 架构设计（大一统 IDE 视角）
-
-基于 Rust、利用 GPU 渲染，Zed 或 VS Code 追求的是提供一个全自动、全内置的现代化协作开发环境。
-
-### 痛点
-
-在 AI 编程崛起的时代，亲自动手写代码的比例大幅减少，编辑器实际上退化成了"审计平台"。只需要直接使用类似 Hermes 的编程技能去生成和处理逻辑，而 Zed 那些沉重的项目管理、复杂的 UI 交互、以及各种图形化的多分支对比面板，反而变成了视觉和思维上的"噪点"。
-
----
-
-## 五、Emacs：40 年积累的可编程操作系统
-
-### 架构设计（Emacs Lisp 运行时）
-
-Emacs 不是编辑器——它是一个用 Elisp 编写的计算平台，编辑器只是其中一个应用。Elisp 是图灵完备的语言，Emacs 本身就是它的 REPL。这个架构决定了 Emacs 的上限远超任何"编辑器+插件"模型。
-
-### Emacs 29+ 的关键跃迁
-
-2023 年发布的 Emacs 29 是分水岭——内置 tree-sitter（treesit）和 LSP（eglot），加上原生编译，让 Emacs 终于具备了现代编辑器的基础设施，不再需要依赖第三方包就能获得基础体验：
-
-| 能力 | 旧版（<29） | 29+ |
-|------|------------|-----|
-| 语法高亮 | 正则（font-lock） | tree-sitter（精确 AST） |
-| LSP | 需装 lsp-mode/eglot | 内置 eglot |
-| 编译速度 | 纯解释执行 | 原生编译（速度提升 5-10x） |
-| Wayland | 需补丁 | 原生支持 |
-
-### 独一无二的生态
-
-Emacs 的生态不是"编辑器插件"，而是"用 Elisp 重写了一切"：
-- **magit**：公认最强 Git 客户端，纯文本 Buffer 流操作
-- **org-mode**：从笔记到项目管理到文学编程的统一系统
-- **tramp**：透明远程编辑（SSH/FTP/容器内文件）
-- **dired**：文件管理器，全键盘盲打
-
-### Boon 模态编辑：绕过 hjkl 的正解
-
-对于认同模态编辑理念但拒绝 Vim 历史包袱的用户，[Boon](https://github.com/jyp/boon) 是 Emacs 原生的解决方案——空间优先键位分配（右手=移动，左手=操作，类游戏手柄），彻底绕过 hjkl 的助记逻辑。
-
-→ 详细分析见 [Vim 移动逻辑批判](vim-movement-critique.md) §六
-
-### 体积与代价
-
-Emacs 的代价是体积——NixOS closure 925MB，是 Neovim 的 3.7 倍、Helix 的 3.6 倍。换来的是零外部依赖：LSP、Git、终端、包管理全部内置。
-
-### 适用场景
-
-| 需求 | 适合 Emacs | 不适合 |
-|------|-----------|--------|
-| 深度定制工作流 | ✅ Elisp 无限制 | — |
-| 科研/文档/项目管理 | ✅ org-mode 无出其右 | — |
-| 极速启动（<100ms） | ❌ 启动慢（2-5s） | Helix/Neovim |
-| 轻量 SSH 编辑 | ❌ 体积大 | Helix/Vim |
-
----
-
-## 五-二、三者横向对比
+官方既没有内置终端，也没有 IPC 机制。多任务、Git、目录树能力全部外包给外部工具（如 Zellij）。但与 Kakoune 不同的是，Helix 没有命令接口供外部控制——它是一个**封闭的纯编辑器**。
 
 ### 定位
 
-| 维度 | Neovim | Emacs | Helix |
-|------|--------|-------|-------|
-| 语言 | C + Lua | C + Elisp（45 年） | Rust |
-| 定位 | Vim 的现代化分支 | 可扩展计算平台 | 现代无配置编辑器 |
-| 哲学 | 折中：Vim 兼容 + 现代扩展 | 极端：一切可编程 | 极端：开箱即用，拒绝插件 |
-| 首次发布 | 2014（fork 自 Vim 7） | 1984（GNU 项目） | 2020 |
-| 许可证 | Apache 2.0 | GPL v3 | MPL 2.0 |
+适合短命的一次性编辑任务（SSH 上去改个配置文件）。不适合需要 session 持久化、多文件导航、外部工具协作的日常工作流。
+
+---
+
+## 五、Emacs：可编程操作系统的缩减存在
+
+### 定位
+
+Elisp 图灵完备、Emacs 本身就是 Lisp 运行时，理论上能力上限最高。但体积代价（NixOS closure 925MB，Neovim 的 3.7 倍）和启动速度（2-5s）在 AI 审计时代成为硬伤——编辑器已经退化成审查界面，不需要一个操作系统级别的运行时。
+
+magit（Git）和 org-mode（文档）仍然是同类最强，但这两个能力在 Zellij + Neovim/Kakoune 的组合中可以被替代（lazygit + markdown 渲染）。对于不需要 org-mode 深度工作流的场景，Emacs 的额外体积不产生等量价值。
+
+---
+
+## 六、Zed / 传统现代 GUI 流派：审计冗余
+
+基于 Rust、GPU 渲染，追求全自动协作开发环境。但 AI 时代编辑器退化成"审计平台"，Zed 沉重的项目管理和复杂 UI 交互反而变成视觉和思维噪点。
+
+---
+
+## 七、四者横向对比
+
+### 定位
+
+| 维度 | Neovim | Kakoune | Helix | Emacs |
+|------|--------|---------|-------|-------|
+| 语言 | C + Lua | C（原生） | Rust | C + Elisp |
+| 定位 | 全功能集成平台 | 纯编辑组件 | 无配置编辑器 | 可扩展计算平台 |
+| 哲学 | 编辑器吞噬一切 | Unix 组合 | 只做编辑 | 一切可编程 |
+| 首次发布 | 2014（fork 自 Vim 7） | 2004（fork 自 Vim） | 2020 | 1984（GNU 项目） |
+
+### 集成方式
+
+| 维度 | Neovim | Kakoune | Helix | Emacs |
+|------|--------|---------|-------|-------|
+| 终端 | `:terminal`（内嵌） | 外部 zellij/tmux | 无 | `eshell`/`vterm` |
+| Git | fugitive/neogit（内嵌） | 外部 lazygit | 内置 gutter | magit（内嵌） |
+| 文件管理 | telescope/nvim-tree | 外部 yazi/lf | 无 | dired |
+| 外部→编辑器 | RPC（可被控制） | 命令接口（强） | 无 | ELisp RPC |
+| 编辑器→外部 | 内嵌一切 | 不做（纯组件） | 无 | 内嵌一切 |
+
+### 扩展能力
+
+| 维度 | Neovim | Kakoune | Helix | Emacs |
+|------|--------|---------|-------|-------|
+| 扩展语言 | Lua / Vimscript | Kakscript（小） | 无 | **Elisp**（图灵完备） |
+| LSP | 内置（0.10+） | 外部 kak-lsp | 内置 | 内置 eglot |
+| Treesitter | 内置（0.10+） | 外部 | 内置（Rust 原生） | 内置 treesit |
 
 ### 安装体积（NixOS 实测）
 
-| 编辑器 | 版本 | 二进制 | Store Path | Store Closure |
-|--------|------|--------|-----------|---------------|
-| Helix | 25.07.1 | ~16 KB（动态链接） | 28 MB | **259 MB** |
-| Neovim | 0.12.3 | 6.8 MB | 38 MB | **250 MB** |
-| Emacs-nox | 30.2 | 8.7 MB | 319 MB | **925 MB** |
-
-Helix 和 Neovim 最轻量（~250MB closure），Emacs 的体积换来零外部依赖。
+| 编辑器 | 二进制 | Store Closure |
+|--------|--------|---------------|
+| Helix | ~16 KB | **259 MB** |
+| Neovim | 6.8 MB | **250 MB** |
+| Kakoune | ~2 MB | **~180 MB** |
+| Emacs-nox | 8.7 MB | **925 MB** |
 
 ### 演进速度（GitHub 近一年）
 
 | 编辑器 | 年提交数 | 贡献者数 | 发布节奏 |
 |--------|---------|---------|---------|
 | Neovim | ~5200 | ~439 | 每月 nightly |
-| Emacs | ~3420 | ~329 | 每年大版本 |
+| Kakoune | ~800 | ~150 | 按需发布 |
 | Helix | ~920 | ~414 | 每季度 |
-
-Helix 贡献者密度高（414 人产出 920 提交），人均产出高但总量有限。
-
-### 扩展能力
-
-| 维度 | Neovim | Emacs | Helix |
-|------|--------|-------|-------|
-| 扩展语言 | Lua / Vimscript | **Elisp**（图灵完备） | 无（设计上拒绝） |
-| LSP | 内置（0.10+） | 内置 eglot（29+） | 内置 |
-| Treesitter | 内置（0.10+） | 内置 treesit（29+） | 内置（Rust 原生） |
-| Git 集成 | fugitive / neogit | **magit**（公认最强） | 内置 gutter |
-| 终端 | `:terminal` | `eshell` / `vterm` | 无内置终端 |
-
-### 生态
-
-| 维度 | Neovim | Emacs | Helix |
-|------|--------|-------|-------|
-| 包仓库 | MPA（mason） | **MELPA**（7000+ 包） | N/A |
-| 社区规模 | 大（Vim 生态溢出） | 极大（40 年积累） | 小（2020 年起步） |
-| 企业采用 | 高（Vim 兼容性） | 中（科研/运维/法律） | 低（新兴） |
-
-### 关键差异总结
-
-- **扩展能力**：Emacs 维度级碾压——Elisp 是图灵完备语言，Emacs 本身就是 Lisp 运行时，"插件"是用 Elisp 重写了一切
-- **轻量便携**：Helix/Neovim ~250MB closure，Emacs 925MB——三倍差距
-- **上手成本**：Helix 零配置开箱即用；Neovim 需要配置但生态成熟；Emacs 学习曲线最陡但上限最高
-
-→ 详细对比见 [Emacs 调研](emacs-research.md)
+| Emacs | ~3420 | ~329 | 每年大版本 |
 
 ---
 
-## 六、决策链
+## 八、决策链
 
 ```
 [编辑器选型决策]
 │
-┌────────────────────┼────────────────────┐
-[主导商业/全团队协作]        [个人极客深度定制]
-│                            │
-(需要成熟 LSP + 插件生态)      (追求极简操作手感 / 无配置)
-│                            │
-┌────────┴────────┐          [Helix + Steel 分支]
-│                 │          (等待 main 合并后
-[Neovim 0.12]     [Emacs 29+] 享受纯键盘流盲打)
-│                 │
-(C/Lua 底座，      (Elisp 图灵完备，
-Fennel 兼容        magit/org-mode/eglot
-"括号情怀")        无出其右)
+┌──────────────────┼──────────────────┼──────────────────┐
+│                  │                  │                  │
+[全功能集成]        [Unix 组合]        [极简一次性]        [深度定制]
+│                  │                  │                  │
+Neovim + Neovide    Kakoune + Zellij   Helix              Emacs
+│                  │                  │                  │
+LSP/Git/AI 全内嵌   编辑器只管编辑      零配置 SSH 快编     Elisp 无限可能
+配置复杂但上限高     启动快、职责清晰    无 session 持久化   体积大、启动慢
 ```
 
 > 嵌入式脚本语言的选型（Rune vs Steel）见 [嵌入式脚本语言选型](embedded-script-languages.md)
@@ -188,11 +189,13 @@ Fennel 兼容        magit/org-mode/eglot
 
 1. **编辑器侧**：放弃在现阶段继续死守 Helix + Steel 的空中楼阁，果断全面切回 Neovim 生产力阵营。在 Neovim 生态下，成熟的 Fennel (Lisp-to-Lua) 编译器或 conjure 插件能在享受现代编辑器最顶尖、最庞大的生态基础设施（LSP 补全、Git 协同、AI 结对编程）的同时，继续用 Lisp 小括号和宏来编写所有配置。
 
-2. **长线观望**：保持对 Helix main 分支的增量追踪。鉴于 Helix 社区极端的严苛审核，未来他们一旦将 Steel 稳定合并发布，其产出的必然是一个工艺品级别的高性能编辑器。到了那一天，Lisp 本能可以支撑在一分钟内重返战场、降维接管。
+2. **轻量场景**：Kakoune + Zellij 组合覆盖需要快速启动、干净分屏、外部工具协作的场景。Kakoune 不试图替代 Neovim 的全功能集成，而是在 Unix 组合哲学下提供纯粹的编辑体验。
+
+3. **长线观望**：保持对 Helix main 分支的增量追踪。鉴于 Helix 社区极端的严苛审核，未来他们一旦将 Steel 稳定合并发布，其产出的必然是一个工艺品级别的高性能编辑器。到了那一天，Lisp 本能可以支撑在一分钟内重返战场、降维接管。
 
 ---
 
-## 七、核心洞察
+## 九、核心洞察
 
 ### 设计哲学：反"TUI 模仿 GUI"
 
@@ -207,7 +210,8 @@ Fennel 兼容        magit/org-mode/eglot
 
 ### 编辑器的本质矛盾
 
-- **集成 vs 纯净**：Neovim 提供全功能但配置复杂，Helix 极简但需要外包能力
+- **集成 vs 纯净**：Neovim 全功能但配置复杂；Kakoune 干净但依赖外部工具链；Helix 极简但拒绝集成
+- **平台 vs 组件**：Neovim 是平台（吞噬外部工具），Kakoune 是组件（被外部工具组合），Helix 是孤岛
 - **现代化 vs 实用性**：Zed/VS Code 功能强大但在审计场景下变成冗余负担
 - **稳定 vs 前沿**：Helix + Steel 是理想方案但尚未成熟
 
@@ -215,8 +219,8 @@ Fennel 兼容        magit/org-mode/eglot
 
 不是"写代码"，而是"审计 AI 生成的代码"。这意味着：
 - 需要快速浏览大量文件（目录树 + 分屏）
-- 需要实时运行命令（内置终端）
-- 需要查看 Git 历史（Fugitive 或原生 Git）
+- 需要实时运行命令（内置终端或外部 zellij）
+- 需要查看 Git 历史（Fugitive/lazygit 或原生 Git）
 - **需要视觉纯净**（拒绝 TUI 圆角污染，追求 100% 风格统一）
 
 ---
@@ -226,6 +230,5 @@ Fennel 兼容        magit/org-mode/eglot
 | 文档 | 关联论点 |
 |------|---------|
 | [Vim 移动逻辑批判](vim-movement-critique.md) | hjkl 历史缺陷、生物力学分析、Boon 模态编辑方案 |
-| [Emacs 调研](emacs-research.md) | Neovim/Emacs/Helix 三者深度对比、安装体积实测 |
 | [嵌入式脚本语言选型](embedded-script-languages.md) | Helix Steel vs Neovim Rune 技术对比 |
 | [编程语言选型](language-selection.md) | Rust/Lisp/Python/Nushell 四象限定位与淘汰语言批判 |
