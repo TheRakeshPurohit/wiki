@@ -444,19 +444,95 @@ def handle(ctx, user_message=None):
 
 ### 5.1 存储引擎抽象：Trait 分离
 
-Aura 的存储层通过两个 trait 实现引擎可插拔——存储引擎（KV 读写）和分发层（多节点协调）正交组合：
+Aura 的存储层通过两个 trait 实现引擎可插拔——存储引擎（KV 读写）和分发层（多节点协调）正交组合。
+
+#### AuraStorage：统一二进制存储接口
 
 ```rust
-// 存储引擎 trait — Fjall 和 SlateDB 各自实现
-trait AuraStorage: Send + Sync {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    async fn delete(&self, key: &[u8]) -> Result<()>;
-    async fn prefix_scan(&self, prefix: &[u8]) -> BoxStream<'_, (Vec<u8>, Vec<u8>)>;
-    async fn batch(&self, ops: Vec<BatchOp>) -> Result<()>;
+use async_trait::async_trait;
+
+#[derive(Debug)]
+pub enum StorageOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
 }
 
-// 分发层 trait — 决定多节点如何协调
+/// 统一二进制存储抽象，抹平 Fjall（同步）与 SlateDB（异步）的差异
+#[async_trait]
+pub trait AuraStorage: Send + Sync {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError>;
+    async fn write_batch(&self, ops: Vec<StorageOp>) -> Result<(), StorageError>;
+    async fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
+}
+```
+
+#### 双轨实现
+
+| 实现 | 引擎 | 包装方式 | 适用场景 |
+|:--|:--|:--|:--|
+| `FjallEngine` | Fjall → 本地 NVMe | `tokio::task::spawn_blocking` 包裹同步 I/O | 私有部署，亚毫秒延迟 |
+| `SlateEngine` | SlateDB → S3 | 天生 `async/await`，直接对接 Tokio | 云原生，无状态计算 |
+
+```rust
+// FjallEngine：同步阻塞 → spawn_blocking 异步包装
+pub struct FjallEngine { keyspace: fjall::Keyspace }
+
+#[async_trait]
+impl AuraStorage for FjallEngine {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let ks = self.keyspace.clone();
+        let key = key.to_vec();
+        tokio::task::spawn_blocking(move || {
+            ks.get(&key).map_err(|e| StorageError::Fjall(e.to_string()))
+        }).await.map_err(|e| StorageError::TaskJoin(e.to_string()))?
+    }
+    // write_batch / prefix_scan 类似，均用 spawn_blocking 包裹
+}
+
+// SlateDB：原生异步，直接对接
+pub struct SlateEngine { db: Arc<slatedb::Db> }
+
+#[async_trait]
+impl AuraStorage for SlateEngine {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.db.get(key).await.map_err(|e| StorageError::Slate(e.to_string()))
+    }
+    // write_batch / prefix_scan 直接调用 SlateDB async API
+}
+```
+
+#### AuraCollection：OKM 与存储引擎的绑定容器
+
+OKM 的 `TypedCollection` 通过 `Arc<dyn AuraStorage>` 绑定到具体引擎。上层业务代码通过 `#[derive(KvEncode)]` 声明实体，宏在编译期生成 Key 编码，AuraCollection 负责与底层引擎的读写交互：
+
+```rust
+pub struct AuraCollection<T> {
+    pub storage: Arc<dyn AuraStorage>,  // FjallEngine 或 SlateEngine，运行时切换
+    _marker: PhantomData<T>,
+}
+
+impl<T> AuraCollection<T> where T: Serialize + DeserializeOwned + EntityKeyGenerator {
+    pub async fn save(&self, entity: &T) -> Result<(), StorageError> {
+        let key = entity.generate_compiled_key();
+        let value = bincode::serialize(entity).unwrap();
+        self.storage.write_batch(vec![StorageOp::Put(key, value)]).await
+    }
+
+    pub async fn find(&self, key_spec: &T) -> Result<Option<T>, StorageError> {
+        let key = key_spec.generate_compiled_key();
+        match self.storage.get(&key).await? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes).unwrap())),
+            None => Ok(None),
+        }
+    }
+}
+```
+
+→ OKM 的完整 proc macro 实现和 TypedCollection 设计见 [OKM 文档](object-keyspace-mapping.md)。
+
+#### 分发层 trait
+
+```rust
 trait Distribution: Send + Sync {
     async fn propose(&self, cmd: Command) -> Result<()>;
 }
@@ -529,105 +605,7 @@ distribution = "raft" # 或 "s3"
 
 ### 5.5 核心源码实现：Openraft 状态机挂载 Fjall
 
-```rust
-// src/store.rs
-use std::sync::Arc;
-use openraft::{RaftStateMachine, StateMachineData, StateMachineError, LogId};
-use fjall::{Config, Keyspace, PartitionHandle};
-use serde::{Serialize, Deserialize};
-
-// 1. 定义具备确定性、可全网广播的状态转换指令
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum RaftCommand {
-    UpdateActorState {
-        agent_id: String,
-        serialized_context: Vec<u8>, // CBOR 编码的 Actor 状态快照
-    },
-    TerminateActor {
-        agent_id: String,
-    },
-}
-
-// 2. 核心分布式状态机结构体（内嵌包装 Fjall 物理分区）
-pub struct FjallStateMachine {
-    pub keyspace: Keyspace,
-    pub actor_partition: PartitionHandle, // 专门存放智能体状态的分区
-    pub meta_partition: PartitionHandle,  // 专门存放 Raft 元数据（如最后执行的 Log ID）的分区
-}
-
-impl FjallStateMachine {
-    pub fn new(path: &str) -> Self {
-        // 打开/创建纯 Rust 的 LSM-Tree 物理存储区
-        let keyspace = Keyspace::open_default(path).expect("无法初始化 Fjall 物理存储区");
-        let actor_partition = keyspace.open_partition("actors", Config::default())
-            .expect("无法开辟智能体物理状态分区");
-        let meta_partition = keyspace.open_partition("meta", Config::default())
-            .expect("无法开辟集群元数据分区");
-        Self { keyspace, actor_partition, meta_partition }
-    }
-}
-
-// 3. 实现 Openraft 要求的相关核心数据 Trait
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StateMachineResponse {
-    pub success: bool,
-}
-
-impl StateMachineData for FjallStateMachine {}
-
-// 4. 结合：将 Openraft 的日志应用钩子直接写入本地 Fjall 物理磁盘中
-impl RaftStateMachine<openraft::TypeConfig> for Arc<FjallStateMachine> {
-    async fn applied_state_id(
-        &self,
-    ) -> Result<Option<LogId<u32>>, StateMachineError<openraft::TypeConfig>> {
-        // 从本地 Fjall 元数据分区中读取上一次成功执行的 Raft 日志 ID，防止状态漂移
-        if let Ok(Some(bytes)) = self.meta_partition.get("last_log_id") {
-            let log_id = postcard::from_bytes(&bytes).unwrap();
-            Ok(Some(log_id))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn apply<I>(
-        &self,
-        entries: I,
-    ) -> Result<Vec<StateMachineResponse>, StateMachineError<openraft::TypeConfig>>
-    where
-        I: IntoIterator<Item = openraft::Entry<openraft::TypeConfig>> + Send,
-    {
-        let mut responses = Vec::new();
-
-        // 顺序遍历由分布式共识网络推流过来的、已达多数派确认的日志实体
-        for entry in entries {
-            let log_id = entry.log_id;
-            if let openraft::EntryPayload::Normal(cmd) = entry.payload {
-                match cmd {
-                    RaftCommand::UpdateActorState { agent_id, serialized_context } => {
-                        // 触发 Fjall 的单次写入，自带崩溃保护
-                        self.actor_partition.insert(agent_id.as_bytes(), serialized_context)
-                            .expect("Fjall 本地物理写入异常，触发系统级错误保护");
-                        responses.push(StateMachineResponse { success: true });
-                    }
-                    RaftCommand::TerminateActor { agent_id } => {
-                        self.actor_partition.remove(agent_id.as_bytes())
-                            .expect("Fjall 本地擦除异常，触发系统级错误保护");
-                        responses.push(StateMachineResponse { success: true });
-                    }
-                }
-            }
-
-            // 实时将当前最新执行成功的 LogId 固化落盘
-            let log_bytes = postcard::to_stdvec(&log_id).unwrap();
-            self.meta_partition.insert("last_log_id", log_bytes).unwrap();
-        }
-
-        // 命令 Fjall 执行一次物理持久化刷盘 (Sync to NVMe)
-        self.keyspace.persist().unwrap();
-        Ok(responses)
-    }
-}
-```
+→ 完整源码见 [OKM 文档 §Openraft 状态机集成](object-keyspace-mapping.md#openraft-状态机集成)。AuraStorage trait 和双轨实现见本节 §5.1。
 
 ### 5.6 SlateDB + S3 模式
 
