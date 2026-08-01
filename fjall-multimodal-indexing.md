@@ -10,7 +10,7 @@
 
 LSM-Tree 的底层核心优势是"极速的单键 KV 查找"和"按字节序排序的范围扫描（Ordered Range Scan）"。我们需要通过巧妙地设计 Key 的前缀与字节拼接（Prefix Byte Design），将复杂的图拓扑、多维向量空间和文本倒排索引，全部映射为物理磁盘上高效的顺序排序键值对。
 
-→ 详见 [Fjall + Openraft 设计](fjall-openraft-design.md)、[Redis 批判](redis-critique.md)
+→ 详见 [KV 存储引擎架构](kv-storage-engine.md)、[Redis 批判](redis-critique.md)
 
 ---
 
@@ -209,7 +209,7 @@ impl SearchEngine {
 
 本文档是多模态索引的无外部依赖实现方案，与以下详细分析形成完整的决策闭环：
 
-- **[Fjall + Openraft 设计](fjall-openraft-design.md)**：Fjall LSM-Tree 引擎与 Openraft Raft 共识的分布式存算一体架构。
+- **[KV 存储引擎架构](kv-storage-engine.md)**：Fjall LSM-Tree 引擎与 Openraft Raft 共识的分布式存算一体架构。
 - **[Redis 批判](redis-critique.md)**：详细论证为何 Redis 是"网络 RAM 陷阱"，本方案彻底排除 Redis。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Rune/Steel/PyO3/Wasm 的技术对比与用户驱动路由协议。
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，含反证章节（换成 Redis 的架构退化分析）。

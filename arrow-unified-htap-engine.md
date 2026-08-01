@@ -144,7 +144,7 @@ Arrow 是全宇宙统一的内存列式布局标准。它不关心磁盘，它�
 
 坚定选择 Protocol Buffers (PB) 或最紧凑的 Bincode。因为它们属于纯控制流（OLTP），单次网络传输只有几十个字节，不存在任何"批量列分析"。用 PB 的 Varint 压缩和强契约，能让整个 Raft 的多机心跳网络轻如鸿毛，物理刷盘速度达到极限。
 
-→ 详见 [Fjall + Openraft 设计](fjall-openraft-design.md)、[Bincode vs CBOR 分析](bincode-cbor.md)
+→ 详见 [KV 存储引擎架构](kv-storage-engine.md)、[Bincode vs CBOR 分析](bincode-cbor.md)
 
 #### 本地工作记忆层（Fjall → Arrow）
 
@@ -495,7 +495,7 @@ Steel Lisp 策略层（DataFrame 作为一等公民函数参数）
 - **[LanceDB vs Fjall 终极裁判](lancedb-vs-fjall.md)**：两种存储范式的详细对比与选型决策树。
 - **[常规 Web 适用性](aura-architecture.md)**：本架构在常规 Web 场景的适用性分析（Ad-hoc 查询痛点已被本文档治愈）。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Steel Lisp 作为策略层的确定性优势。
-- **[Fjall + Openraft 设计](fjall-openraft-design.md)**：工作记忆的分布式强一致实现。
+- **[KV 存储引擎架构](kv-storage-engine.md)**：工作记忆的分布式强一致实现。
 - **[Bincode vs CBOR 分析](bincode-cbor.md)**：行式序列化的极致轻量与动态灵活性的对比。
 - **[反应式架构](flux-architecture.md)**：Arrow 列式格式是反应式架构静态层的推送载体——预计算聚合结果以列式切片推送到 CDN，数据变更触发重新物化。
 

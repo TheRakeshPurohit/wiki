@@ -57,7 +57,7 @@
 *   **总结**：PHP-FPM 无状态的权宜之计。网络 RTT 主导查询时间。分布式集群只是弱一致性的分片。
 
 ### 首选替代方案
-*   **Fjall + Openraft**：嵌入式 KV + Raft 共识——具体实现。详见 [Aura 架构 §5](aura-architecture.md) 和 [设计文档](./fjall-openraft-design.md)。
+*   **KV 存储引擎（Fjall + Raft）**：嵌入式 KV + Raft 共识——具体实现。详见 [Aura 架构 §5](aura-architecture.md) 和 [设计文档](./kv-storage-engine.md)。
 *   **SpaceTimeDB**：逻辑在数据库内运行（Wasm），完全消除 RPC/序列化开销。
 *   **Aerospike**：高性能，混合内存/SSD，但需要特定硬件。
 *   **本地 KV**：Fjall、Redb、RocksDB。"如果跳过网络，0.1ms 查询就很好"。

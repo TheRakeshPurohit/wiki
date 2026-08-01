@@ -95,7 +95,7 @@ LanceDB 放弃了传统数据库那种"时刻守着物理磁盘"的沉重做法�
 
 **结论**：在这种高频随机写状态的场景下，Fjall + Openraft 依然是不可动摇的刚性防线。
 
-→ 详见 [Fjall + Openraft 设计](fjall-openraft-design.md)
+→ 详见 [KV 存储引擎架构](kv-storage-engine.md)
 
 ### 3.2 ✅ 场景二：长时记忆 + 大规模检索（果断用 LanceDB + S3）
 
@@ -310,7 +310,7 @@ storage_options = {
 
 本文档是存储引擎选型的终极裁判，与以下详细分析形成完整的决策闭环：
 
-- **[Fjall + Openraft 设计](fjall-openraft-design.md)**：高频状态变动的存算一体架构。
+- **[KV 存储引擎架构](kv-storage-engine.md)**：高频状态变动的存算一体架构。
 - **[Fjall 多模态索引](fjall-multimodal-indexing.md)**：图、向量、文本索引的本地实现方案。
 - **[Redis 批判](redis-critique.md)**：详细论证为何 Redis 是"网络 RAM 陷阱"，本方案彻底排除 Redis。
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，含反证章节（换成 Redis 的架构退化分析）。

@@ -147,4 +147,4 @@
 | [知识库](projects/knowledge-base.md) | | SurrealDB RAG 架构 |
 | [部署 CI](projects/deployment-ci.md) | | Helm 部署与 CI 数据配置 |
 | [RisingWave CDC](projects/risingwave-cdc.md) | | RisingWave CDC 方案 |
-| [Fjall Openraft 设计](projects/fjall-openraft-design.md) | | 原生分布式系统设计 |
+| [KV 存储引擎架构](kv-storage-engine.md) | | 嵌入式 KV 架构设计、复合键编码与用例 |

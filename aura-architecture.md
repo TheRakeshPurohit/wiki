@@ -440,15 +440,58 @@ def handle(ctx, user_message=None):
 
 用 Rust 搭了外骨骼，用 Lisp 锁定了边界，用 Python 接入了生态，用 Wasm 隔离了黑盒，持久化层在 PostgreSQL（单体模式）和 Fjall + Openraft（分布式模式）之间按需选择。
 
-## 5. 架构终极演进：分布式存算一体（Fjall + Openraft）
+## 5. 架构终极演进：分布式存算一体（双引擎模式）
 
-### 5.1 从单体 PostgreSQL 到分布式存算一体的逻辑跃迁
+### 5.1 存储引擎抽象：Trait 分离
+
+Aura 的存储层通过两个 trait 实现引擎可插拔——存储引擎（KV 读写）和分发层（多节点协调）正交组合：
+
+```rust
+// 存储引擎 trait — Fjall 和 SlateDB 各自实现
+trait AuraStorage: Send + Sync {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    async fn delete(&self, key: &[u8]) -> Result<()>;
+    async fn prefix_scan(&self, prefix: &[u8]) -> BoxStream<'_, (Vec<u8>, Vec<u8>)>;
+    async fn batch(&self, ops: Vec<BatchOp>) -> Result<()>;
+}
+
+// 分发层 trait — 决定多节点如何协调
+trait Distribution: Send + Sync {
+    async fn propose(&self, cmd: Command) -> Result<()>;
+}
+```
+
+**两种模式的组合**：
+
+| 模式 | 存储引擎 | 分发层 | 真理源 | 适用场景 |
+|:--|:--|:--|:--|:--|
+| **Fjall + Raft** | Fjall → 本地 NVMe | Raft 共识复制 | 本地磁盘 | 私有部署，亚毫秒延迟，强一致 |
+| **SlateDB + S3** | SlateDB → S3 | 无操作（S3 自身 HA） | S3 桶 | 云原生，无状态计算，无限容量 |
+
+**互斥约束**（配置加载时校验）：
+
+```toml
+[storage]
+engine = "fjall"    # 或 "slate"
+distribution = "raft" # 或 "s3"
+
+# engine=fjall  → distribution=raft ✓
+# engine=slate  → distribution=s3   ✓
+# 其他组合     → 启动报错
+```
+
+**Actor 完全不感知底层引擎**——`ctx.state.get("history")` 的调用方式不变，底层是 Fjall 同步返回还是 SlateDB 从 Block Cache 命中，对 Actor 透明。
+
+→ 两条架构路径的完整对比见 [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3)。
+
+### 5.2 从单体 PostgreSQL 到分布式存算一体的逻辑跃迁
 
 虽然 PostgreSQL 的 JSONB 聚合已经替代了外部缓存，但在某些极端场景下（如智能体状态高度 KV 化、需要多节点强一致性复制），继续背负 PostgreSQL 的 SQL 解析器、查询优化器、连接池和 MVCC 仍然是"大炮轰蚊子"。
 
 **终极方案**：将 Fjall（纯 Rust LSM-Tree KV 引擎）+ Openraft（纯 Rust Raft 共识协议）绑定，在主程序内部直接构建出一个高可用、可复制、存算一体的"分布式智能体主权操作系统"。
 
-### 5.2 分布式存算一体架构拓扑
+### 5.3 分布式存算一体架构拓扑
 
 ```
 [ 客户端网络请求 ]
@@ -474,7 +517,7 @@ def handle(ctx, user_message=None):
 └───────────────────────┘
 ```
 
-### 5.3 为什么 Fjall + Openraft 是黄金组合？
+### 5.4 为什么 Fjall + Openraft 是黄金组合？
 
 - **Fjall 击败 RocksDB**：传统 RocksDB 是 C++ 写的，在 Rust 项目中带来跨平台编译地狱、臃肿内存开销和厚重 FFI 桥接。Fjall 是纯 Rust LSM-Tree 存储引擎，内存占用极小、自带布隆过滤器实现微秒级查找，且天生与 Tokio 异步生态 100% 融合。
 
@@ -484,7 +527,7 @@ def handle(ctx, user_message=None):
 
 → 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#8-resp-协议-vs-二进制序列化嵌入式架构的物理优势)
 
-### 5.4 核心源码实现：Openraft 状态机挂载 Fjall
+### 5.5 核心源码实现：Openraft 状态机挂载 Fjall
 
 ```rust
 // src/store.rs
@@ -586,7 +629,58 @@ impl RaftStateMachine<openraft::TypeConfig> for Arc<FjallStateMachine> {
 }
 ```
 
-### 5.5 用户意志主导的多模态路由机制（User-Driven Polyglot Routing）
+### 5.6 SlateDB + S3 模式
+
+云原生替代路径：去掉 Raft，计算节点无状态，S3 为真理源。
+
+```
+[Client] → [无状态 gRPC Pod] → [SlateDB] → [S3 桶]
+                ↑
+          任意 Pod 可服务（S3 是真理源）
+```
+
+**与 Fjall + Raft 模式的差异**：
+
+| 维度 | Fjall + Raft | SlateDB + S3 |
+|:--|:--|:--|
+| 真理源 | 本地 NVMe（Raft 多数派确认） | S3 桶（11 个 9 可靠性） |
+| 写延迟 | μs 级（本地 I/O） | μs（本地 WAL）→ ms（S3 flush 异步） |
+| Scale-to-Zero | 需保护本地磁盘 | 销毁 Pod 即可，S3 持久 |
+| 跨区域复制 | Raft 跨机房（复杂） | S3 CRR（配置项） |
+| ACID 批处理 | 成熟（WriteBatch） | 快速演进中 |
+| 私有化部署 | 原生支持 | 需 MinIO/Ceph 替代 S3 |
+
+**SlateDB 模式下的 AuraActor 状态读写**：§4.3 的 `ctx.state` 接口不变。SlateDB 的 Block Cache 命中时延迟仍在 μs 级（热数据），未命中时退化为 ms（S3 Range Get）。Agent 场景的热数据（最近对话）天然驻留 Block Cache，冷数据（历史记录）的 ms 级延迟可接受。
+
+**Durability 差异**：Fjall 的 WAL 在本地磁盘，崩溃后可恢复。SlateDB 的 WAL 也在本地磁盘，但节点磁盘丢失时需等 S3 flush 完成才能恢复——flush 前的窗口期存在数据丢失风险。对于 Agent 场景（对话数据可重建），这个风险通常可接受。
+
+### 5.7 配置与工作量评估
+
+**配置示例**：
+
+```toml
+[storage]
+engine = "fjall"    # "fjall" 或 "slate"
+distribution = "raft" # "raft" 或 "s3"
+# 互斥：fjall+raft ✓，slate+s3 ✓，其他组合启动报错
+```
+
+**实现工作量**：
+
+| 任务 | 工作量 | 说明 |
+|:--|:--|:--|
+| `AuraStorage` trait 定义 | 1 天 | 抽象接口 |
+| FjallEngine 实现 | 0.5 天 | 包装现有 Fjall 调用 |
+| SlateEngine 实现 | 1-2 天 | SlateDB API 适配 + async 包装 |
+| `Distribution` trait 定义 | 0.5 天 | 抽象接口 |
+| RaftDist 实现 | 0（已有） | 现有 Openraft 代码直接套 |
+| S3Dist 实现 | 0.5 天 | 无操作桩（S3 自己管 HA） |
+| 配置加载 + 互斥校验 | 0.5 天 | TOML 解析 + 校验 |
+| Actor 层适配 | 0 | ctx.state 接口不变 |
+| 测试（两种模式） | 2-3 天 | Fjall+Raft 现有测试 + SlateDB+S3 新测试 |
+| **总计** | **6-8 天** | |
+
+### 5.8 用户意志主导的多模态路由机制（User-Driven Polyglot Routing）
 
 在传统的 FaaS（如 Windmill）或重型智能体框架中，通常是由"系统架构或框架"死板地规定："这个步骤必须用 Python 跑，那个步骤必须用 JS 跑"。这本质上是对 AI 自由度和人类开发意志的束缚。
 
@@ -638,7 +732,7 @@ pub enum RaftCommand {
 
 **框架不再是法官，框架只提供执行能力；用户和 AI 的动态意志决定哪种语言在这一毫秒登上多模态内存舞台。**
 
-### 5.6 为什么不用 Redis
+### 5.9 为什么不用 Redis
 
 通过将 Fjall + Openraft + 多模态嵌入式运行时揉进同一个单体二进制文件中，消除了现代架构中常见的冗余和嵌套。如果把这套架构里的 Fjall + Openraft 剔除换成 Redis，整个系统将发生严重的**底层架构退化（Structural Regression）**：
 
