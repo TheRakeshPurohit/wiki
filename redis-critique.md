@@ -412,6 +412,12 @@ Martin Kleppmann（《Designing Data-Intensive Applications》作者）撰文 **
 - **现实**：Redis pub/sub 无持久化、无消费者组、无反压。Streams 是对真正消息队列的拙劣模仿。
 - **替代方案**：NATS（pub/sub）、Kafka（streams）、RabbitMQ（queues）。这些是为正确持久性、排序保证和消费者管理而构建的专用系统。
 
+#### 事务（MULTI/EXEC）
+- **声称**："Redis 事务保证原子性。"
+- **现实**：Redis 的 MULTI/EXEC 是一个**不支持回滚的伪事务**。命令在 EXEC 时按顺序执行，如果中间某条命令失败（如类型错误、OOM），已成功执行的命令**不会回滚**，在应用层留下永久脏数据。这与关系数据库的 ACID 事务有本质区别。
+- **Lua 脚本的 Hash Slot 限制**：Redis Cluster 中，Lua 脚本要求事务内所有 Key 路由到同一个物理 Hash Slot（通常通过 `{tag}` 强制），跨节点操作直接报错。对于分布式 ZSET 双写（更新分数涉及数据主表 + 排行索引，两个 Key 可能落在不同 Slot），这个限制使得跨 Key 原子操作在集群模式下不可行。
+- **替代方案**：嵌入式 KV 引擎（Fjall/SurrealKV）的 `Batch` API 提供真正的原子写入——所有操作在 WAL 中一次原子提交，失败时物理回滚。配合 Raft 共识，Batch 的原子性从单机延伸到集群多数派。Fjall 还支持 MVCC 和乐观锁重试，对并发冲突提供确定性控制。
+
 #### Lua 脚本
 - **声称**："Redis Lua 脚本提供原子多步操作，很方便。"
 - **现实**：Lua 作为嵌入式脚本语言有显著的工程摩擦：
@@ -419,6 +425,7 @@ Martin Kleppmann（《Designing Data-Intensive Applications》作者）撰文 **
   - **标准库匮乏**：没有内置 JSON、正则、日期/时间处理。任何非平凡逻辑都需要外部 C 库绑定。
   - **生态断层**：Lua 的类型系统、工具链和测试框架与主技术栈（Rust/Go/Python）完全脱节，丧失了强类型保护、Linter 静态检查、成熟的单元测试能力和 IDE 智能感知。
   - **单线程阻塞风险**：Redis 核心是单线程的。如果 Lua 脚本包含复杂逻辑或较长循环，整个 Redis 服务器会阻塞所有其他客户端的请求，直到脚本执行完毕。这种工程妥协的代价是显著的生产力损失。
+  - **Hash Slot 锁定**：在 Redis Cluster 中，Lua 脚本内的所有 Key 必须落在同一个 Hash Slot。跨 Slot 的原子操作被强制禁止——这不是设计缺陷，是 Redis 分片架构的物理约束。需要跨 Key 联动的业务逻辑被迫退化为应用层补偿。
 
 **SurrealDB 的对比**：SurrealDB 采取了相反的方法——不是嵌入一个糟糕的通用脚本语言（Lua），而是设计了一种**专用查询语言（SurQL）**，在单一连贯语法中处理数据建模、查询、权限和业务逻辑。在 AI 时代，DSL 的学习成本可以忽略不计——AI 助手能瞬间写出完美的 SurQL。设计良好的 DSL 消除了"嵌入式语言税"——在应用代码和数据库脚本之间无需上下文切换。
 
@@ -436,9 +443,95 @@ Redis 的每个"优势"在审视下都溶解了：
 | 地理空间 | GEO 命令 | 数据太大无法放内存；PostGIS 更优 |
 | HLL | 内置 | 很少使用；作为库更好 |
 | 消息传递 | Pub/sub、streams | 无持久化、无消费者组；NATS/Kafka 是正确工具 |
-| Lua 脚本 | 原子多步操作 | Lua 对开发者不友好（从 1 开始、无标准库、阻塞单线程）；使用真正的数据库事务 |
+| Lua 脚本 | 原子多步操作 | Lua 对开发者不友好（从 1 开始、无标准库、阻塞单线程）；Hash Slot 限制跨节点原子操作 |
+| 事务 | MULTI/EXEC 原子性 | 不支持回滚，失败命令不撤销；嵌入式 KV 的 Batch API 提供真正的 ACID 原子批处理 |
 
 Redis 的"数据结构丰富性"不是优势——它是一个**设计异味**。它表明 Redis 试图成为所有东西（缓存、锁服务、消息队列、数据库），但没有一样做得好。现代架构应该为**专用任务使用专用工具**：缓存用进程内内存或本地 KV（Redb/RocksDB），分布式协调用基于 Raft 的存储（etcd、Consul），复杂数据结构用 PostgreSQL/SurrealDB，消息传递用 NATS/Kafka，地理空间用 PostGIS。
+
+## 6.5 Redis 数据结构 API 的虚假护城河
+
+### API 层级分类
+
+数据操作 API 存在三个层级。Redis 停留在中间层——比裸 KV 多了结构化原语，但比真正的查询语言少了关系表达力：
+
+| 层级 | 代表 | 核心能力 | 缺失 |
+|:---|:---|:---|:---|
+| **低层** | 裸 KV（get/put/scan） | 字节读写，无语义 | 一切上层抽象 |
+| **中层** | Redis（Hash/ZSET/Set） | 固定数据结构，无关系查询 | JOIN、声明式逻辑、事务回滚 |
+| **高层** | SQL/SurQL（JOIN/聚合/子查询） | 声明式关系查询，图灵完备 | 无（完备） |
+
+Redis 的数据结构常被视为核心竞争力——"Redis 的 API 比裸 KV 高级"。这个论点在 Composite Key Encoding 的审视下不成立。
+
+### Composite Key Encoding 消解中层抽象
+
+当开发者掌握 Key 空间设计后，Redis 的中层抽象可以被纯 KV + 编码完全模拟（详见 [Fjall 复合 Key 编码](projects/fjall-openraft-design.md#physical-encoding-composite-key-排布细节)）：
+
+| Redis 原语 | KV 模拟方案 | 关键操作 |
+|:---|:---|:---|
+| Hash | `hash:{id}:{field}` 前缀编码 | 前缀扫描批量读写；Tombstone 批量删除 O(1) |
+| ZSET | `zset:{id}:{score_big_endian}:{member}` Score 前缀 | LSM-Tree 字节序自动排序，Seek 迭代器取 Top-N |
+| Set | `set:{id}:{member}` → `""` | 存在性检查，前缀扫描枚举 |
+| List | `list:{id}:{seq}` 单调递增序列号 | Range 扫描，Raft 单调计数器保证序列唯一 |
+
+模拟之后得到相同语义能力的 API，但底层运行在多线程、磁盘优先、支持原子 Batch 的 KV 引擎上。中层抽象的价值——"不用自己设计数据结构"——在编码方案确定后就消失了。
+
+### Redis 缺失的真正高层能力
+
+Key 编码能模拟的只是 Redis 自身提供的原语。Redis 无法提供、也无法通过编码弥补的，是真正的高层查询能力：
+
+- **关系查询**：JOIN、子查询、条件聚合——Redis 退化为应用层 N+1 网络往返（§7 详述）
+- **声明式逻辑**：SQL/SurQL 在存储层直接执行业务逻辑，Redis 被迫依赖 Lua 脚本（单线程阻塞 + Hash Slot 限制，§6 Lua 脚本）
+- **事务回滚**：MULTI/EXEC 失败不回滚，KV 的 Batch API 提供真正的 ACID 原子性（§6 事务）
+
+### 判定
+
+Redis 的数据结构 API 是一个**中层幻觉**——它看起来比 KV 高级，但在复合键编码（Composite Key Encoding）下护城河为零；它看起来接近数据库，但缺少真正的高层能力。
+
+**中层便利的条件性**：Redis 的数据结构便利只在特定组合下成立——Redis 做缓存、数据库存真实数据、且 Redis 恰好覆盖的功能（排行榜、会话等）。一旦纯 Redis 承担业务逻辑，开发者照样要设计复合键（前缀分离、静态/动态路径、精准匹配），所谓"不用设计 Key 空间"的便利在实践中并不存在。
+
+**OpenResty + Redis 网关：从不成熟到成熟的复合键设计**
+
+不成熟的典型设计：每个路由路径一个 Key，静态/动态不分，缓存和限流混用前缀，Cluster 模式下 Key 散落在不同槽位。成熟的方案需要在五个维度做精细化 Key 编排：
+
+| 域 | Key 编码 | 数据结构 | 原子操作 |
+|:--|:--|:--|:--|
+| **限流** | `rl:{client_id}:{window_ts}` | String (i64) | Lua: GET → 判断 → INCR → EXPIRE |
+| **响应缓存** | `{cache}:{method}:{path_hash}` | String (序列化响应体) | SET + TTL，失效用独立索引 Key |
+| **会话** | `ss:{user_id}` | Hash（所有字段在一个 Key 内） | HGET/HSET 单字段读写 |
+| **熔断** | `cb:{upstream_id}` | Hash `{state, failures, last_ts}` | Lua: 检查 state → INCR failures → 判断阈值 → 翻转 state |
+| **路由表** | `rt:{method}` | String (JSON 数组，按 priority 排序) | SET 整体重写，Lua 不需要 |
+
+**关键优化技术**：
+
+**Hash Tag 同槽**：Redis Cluster 按 Key 的 CRC16 分槽。`{}` 内的字符串决定槽位。`{cache}:GET:/api/v1/users` 和 `{cache}:GET:/api/v1/orders` 落在同一槽——批量失效时可以用 Lua 脚本原子操作，不触发 CROSSSLOT 错误。不成熟的方案不用 Hash Tag，同一前缀的 Key 散落在不同节点，批量操作不可能。
+
+**Hash 替代多 Key**：会话数据用单个 Hash Key `ss:1001` 存储所有字段（`{name, token, role, last_active}`），而非每个字段一个 Key。Redis Hash 在字段数 < 128 时用 ziplist 编码（连续内存，零指针开销），比等量的 String Key 节省 60-70% 内存（省掉了每个 Key 的 SDS 头 + DictEntry）。
+
+**Lua 脚本做复合判断**：限流的「读-判断-写」三步必须原子——两个请求同时读到 count=99，都判断通过，都 INCR，结果 count=101 超限但已经放行了。Lua 脚本在 Redis 单线程中原子执行：
+```lua
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', key) or "0")
+if current >= limit then return 0 end
+redis.call('INCR', key)
+redis.call('EXPIRE', key, ARGV[2])
+return 1
+```
+
+**缓存失效用索引 Key 而非 SCAN**：`SCAN` 游标遍历在 Key 数量大时性能退化（每次 SCAN 返回固定数量，游标状态有状态）。成熟做法是维护一个索引 Key `ci:{method}:{prefix_hash}` → Set 存放所有匹配该前缀的缓存 Key 哈希值。失效时 `SMEMBERS` 取出所有 Key，逐个 DEL。写缓存时同时 `SADD` 到索引。代价是每次缓存写入多一次 Redis 操作，但失效从 O(N) SCAN 降为 O(M) 精确删除（M = 匹配数量，远小于 N）。
+
+**这个成熟方案仍然存在的物理限制**：
+
+| 维度 | 成熟 Redis 方案 | 物理天花板 |
+|:--|:--|:--|
+| 限流 Lua | 原子但单线程串行 | 10 万 QPS 上限（单核），多实例分片增加复杂度 |
+| 缓存索引 | 避免了 SCAN | 索引 Key 本身有内存开销，大前缀下 Set 可能膨胀 |
+| 会话 Hash | 单 Key 省内存 | 纯内存，数据量大时 RAM 成本线性增长 |
+| 熔断 Lua | 原子状态翻转 | 单线程瓶颈，高并发上游时 Lua 排队 |
+
+成熟方案榨干了 Redis 的每一滴能力——Hash Tag、Hash ziplist、Lua 原子脚本、索引 Key 规避 SCAN。但它在物理上无法突破单线程和纯内存的硬限制。→ KV Sidecar 方案保留同样的 Key 编排思想，底层引擎从单线程网络 RAM 变为多线程磁盘优先 LSM-Tree，消除上述全部天花板。→ 完整设计见 [用例：OpenResty + KV 网关](projects/fjall-openraft-design.md#12-用例openresty--kv-网关)
+
+**判定**：选择 Redis 而非嵌入式 KV 的理由缩减为两个——(1) 作为缓存层配合数据库使用，且不需要事务回滚；(2) 需要开箱即用的排行榜（ZSET）而不想写编码逻辑。这两个理由在现代架构下都越来越站不住：缓存可用 CDN/L1 就绪集合替代（§5），排行榜可用 200 行 KV 编码实现且支持磁盘持久化和多线程并发。
 
 ## 7. 计算下沉 vs 数据搬运：Redis 的根本性架构缺陷
 
