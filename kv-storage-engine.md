@@ -98,14 +98,26 @@ fn score_key(prefix: &[u8], score: i64, member: &[u8]) -> Vec<u8> {
 
 所有 Score 共享同一字节长度（8 bytes），高位补零由硬件指令自动完成，字典序 = 数值序。
 
-#### 负数与浮点数的字节编码
+#### 补码反转编码（Complement Encoding）：物理层面的倒序排列
 
-正整数的大端序可以直接嵌入 Key。负数和浮点数需要额外的翻转处理：
+KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
 
-- **负数**（i64）：补码表示下，`-1` 的最高位为 1（`0xFFFFFFFFFFFFFFFF`），直接比较会排在所有正数之后——与数学序相反。解法：异或符号位翻转（`score ^ 0x8000000000000000`），使负数的字节序反转，保证全局单调。
-- **浮点数**（f64）：IEEE 754 的阶码和符号位排列使得字典序与数值序不一致。解法：`f64::to_bits()` 后对所有位做符号扩展翻转（正数翻转符号位，负数翻转全部位）。这是 LevelDB/RocksDB 的标准做法（`BytewiseComparator`）。
+```rust
+// 标准正序 Key：老数据在最上面，新数据在最底下
+let key_ascending = format!("log:{}:{}:", session_id, timestamp).into_bytes();
 
-纯整数场景（排行榜分数、时间戳）无需翻转，直接 `to_be_bytes()`。
+// 倒序 Key：最新写入的数据天然排在最前面！
+// u64::MAX - timestamp：时间戳越大（越新），减出来越小
+// 越小 → LSM-Tree 字典序越靠前 → 物理层面「最新优先」
+let inverted_time = u64::MAX - timestamp;
+let mut key_descending = Vec::new();
+key_descending.extend_from_slice(format!("log:{}:", session_id).as_bytes());
+key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保证按位对比正确
+```
+
+**物理含义**：`u64::MAX - 1722500000` = `18446744072007051616`，`u64::MAX - 1722500001` = `18446744072007051615`。后者更小，在 LSM-Tree 中排在更前面——时间戳越大（越新），Key 字典序越小，迭代器正向扫描自然得到倒序结果。
+
+**应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
 
 #### 双写原子性：ZSET 更新分数
 
@@ -122,6 +134,197 @@ keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
 如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。Fjall 的 `Batch` API 保证底层 WAL 一次原子提交。
 
 在分布式模式下，这个 Batch 作为单条 Raft 指令提交——Leader 写入本地 Fjall 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
+
+#### 二级索引末尾必须追加主键 ID
+
+设计二级索引（如通过时间戳反查对话消息）时，必须将全局唯一的实体主键 ID 拼接到索引 Key 的最末尾。
+
+**原因**：高并发场景下，两个用户操作可能在同一微秒产生完全相同的时间戳。如果索引 Key 仅为 `idx:time:{timestamp}`，后一个写入会无声覆盖前一个（数据丢失）。末尾追加 `{message_id}` 既保证 Key 绝对唯一，又利用字典序维护时间线规整。
+
+```
+# 错误：同时间戳覆盖
+idx:time:1722500000 → msg_abc  (被覆盖)
+idx:time:1722500000 → msg_def
+
+# 正确：主键 ID 保证唯一
+idx:time:1722500000:msg_abc → ""
+idx:time:1722500000:msg_def → ""
+```
+
+#### 哈希前缀打散：避开自增序列的写放大灾难
+
+当输入源严格自增递增（高频事件流水号、日志 tick），所有写操作集中撞击 LSM-Tree 末尾（Hotspot），后台 compaction 产生严重的磁盘写放大，IOPS 出现毛刺。
+
+解法：在 Key 最前端注入哈希盐值，将连续写入打散到多个分区：
+
+```rust
+use murmur3::murmur3_32;
+
+// 对 Key 核心内容生成 32 位哈希值，取模分入 16 个桶
+let hash_prefix = (murmur3_32(&mut cursor, 0).unwrap() % 16) as u8;
+
+let mut sharded_key = Vec::new();
+sharded_key.push(hash_prefix);  // 1 字节哈希盐
+sharded_key.extend_from_slice(b"metrics:ts:");
+sharded_key.extend_from_slice(&timestamp.to_be_bytes());
+```
+
+物理效果：连续递增的写入压力被均匀分散到 16 个独立的内存树（MemTable）中，多线程并发刷盘（Flush）并行处理，避开局部块锁竞争，写入吞吐量翻倍。代价是前缀扫描需要遍历所有桶——适合写密集、读按精确 Key 点查的场景。
+
+#### 长度前缀编码：消除低效的字符串分割扫描
+
+Key 中拼接多个字符串属性时，冒号分隔（`table:app_name:user_id`）要求读取时写循环 `split` 查找分隔符——O(N) 字符串扫描。改用固定 2 字节长度前缀：
+
+```rust
+pub fn pack_string_component(buf: &mut Vec<u8>, component: &str) {
+    let bytes = component.as_bytes();
+    let len = bytes.len() as u16;  // 2 字节存储字符串物理长度
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+```
+
+反序列化时，CPU 读取前 2 字节得知长度，直接跳过对应偏移量提取目标字段——从 O(N) 字符串扫描变为 O(1) 内存地址偏移计算。
+
+**与冒号分隔的对比**：
+
+| 维度 | 冒号分隔 `a:b:c` | 长度前缀 `[2]a[1]b[1]c` |
+|:--|:--|:--|
+| 反序列化 | 循环 split + 字符串比较 | 2 字节读长度 + 指针偏移 |
+| 二进制安全性 | 字段内不能包含 `:` | 任意字节均可 |
+| 固定宽度 | 否（依赖分隔符） | 是（每段 = 2 字节长度 + N 字节数据） |
+| 适用场景 | 人类可读调试 | 生产环境高频读写 |
+
+#### 多租户复合键编解码器：工业级实现
+
+生产级组件——零堆分配（Zero-heap Allocation）的多租户复合键序列化/反序列化：
+
+```rust
+use std::convert::TryInto;
+
+pub struct AgentMemoryKey {
+    pub tenant_id: u32,        // 4 字节（租户隔离）
+    pub session_id: [u8; 16],  // 16 字节（UUID 原始二进制）
+    pub timestamp: u64,        // 8 字节（倒序时间戳）
+}
+
+impl AgentMemoryKey {
+    /// 序列化：领域模型 → 固定 30 字节二进制流（无堆分配）
+    pub fn serialize_to_bytes(&self) -> Vec<u8> {
+        // 4(tenant) + 1(/) + 16(session) + 1(/) + 8(time) = 30 字节
+        let mut buf = Vec::with_capacity(30);
+
+        // 租户 ID（大端序）
+        buf.extend_from_slice(&self.tenant_id.to_be_bytes());
+        buf.extend_from_slice(b"/");
+
+        // 会话 UUID（固定 16 字节，无需编码）
+        buf.extend_from_slice(&self.session_id);
+        buf.extend_from_slice(b"/");
+
+        // 倒序时间戳（补码反转，最新优先）
+        let inverted_time = u64::MAX - self.timestamp;
+        buf.extend_from_slice(&inverted_time.to_be_bytes());
+
+        buf
+    }
+
+    /// 反序列化：二进制切片 → 领域模型（零拷贝，纳秒级）
+    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+        if bytes.len() != 30 {
+            return Err("非法的物理 Key 长度约束违规");
+        }
+
+        let tenant_id = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let mut session_id = [0u8; 16];
+        session_id.copy_from_slice(&bytes[5..21]);
+        let inverted_time = u64::from_be_bytes(bytes[22..30].try_into().unwrap());
+        let timestamp = u64::MAX - inverted_time;  // 反转还原
+
+        Ok(Self { tenant_id, session_id, timestamp })
+    }
+}
+```
+
+**设计要点**：所有字段固定宽度（4+16+8=28 字节 + 2 分隔符 = 30 字节），反序列化无需解析、无需堆分配，纯指针切片操作。倒序时间戳内嵌在 Key 中，正向迭代器扫描即得「最新优先」结果。
+
+## 设计模式：纯 KV 底座上的系统级范式
+
+在纯 KV 世界里，算法不再是游离在数据库外面的胶水代码——Key 编码格式本身就是索引层、缓存层和隔离层。
+
+### 模式一：Index-Only Scan（索引即数据）
+
+二级索引的 Value 留空，entity_id 编码在 Key 末尾。查询时仅遍历 Key 序列即可获取所有匹配的主键 ID，无需回表读取 Value——零磁盘 I/O。
+
+```
+数据主表：
+  d:{tenant}:{type}:{id}  →  [完整业务实体]
+
+属性索引表：
+  i:{tenant}:{type}:{attr}:{value}:{id}  →  ""  (Value 留空)
+
+查询「状态为 active 的所有用户」：
+  Scan("i:1:user:status:active:") → 遍历 Key 序列 → 提取末尾 id
+  无需读取任何 Value，零回表
+```
+
+**物理效果**：前缀扫描只触碰 LSM-Tree 的 MemTable + 索引层 SSTable（极小），不碰数据层的大 Value 文件。适合高频属性筛选（网关路由匹配、Agent 状态过滤）。
+
+### 模式二：Bitmap 前置拦截（热路径零 KV 调用）
+
+网关高频检查「IP 是否在黑名单」「Token 是否合法」。每次请求都 `kv.get()` 即便命中缓存也有哈希查找开销。解法：在应用层内存常驻 Roaring Bitmap 或布隆过滤器。
+
+```
+写路径（新 IP 封禁时）：
+  1. kv.put("blacklist:ip:1.1.1.1", "")   ← 持久化落盘
+  2. bitmap.set(hash("1.1.1.1"))           ← 内存标记
+
+读路径（网关拦截，零 KV 调用）：
+  网关收到请求
+    → bitmap.check(hash(ip))
+    → 未命中 → 直接放行（QPS 百万级，纯 CPU 位判断）
+    → 可能命中 → kv.get() 最终权威判定
+```
+
+**物理效果**：热路径（99%+ 的正常请求）完全在 CPU L1 Cache 内完成，不触发任何 KV 引擎调用。只有极少数命中 Bitmap 的请求才下沉到存储层。适合网关黑名单/白名单、限流计数器、Token 校验。
+
+**与布隆过滤器的区别**：Bitmap 支持精确删除（`bitmap.unset()`），布隆过滤器只增不删。高频变更的黑名单用 Bitmap；只增不减的 Token 白名单用布隆过滤器更省内存。
+
+### 模式三：应用层 MVCC（无原生 MVCC 引擎的时间旅行）
+
+Fjall/SlateDB 不支持原生 MVCC。框架团队通过将版本号编排进 Key 骨架，实现应用层多版本控制：
+
+```
+Key: data:agent:101:v:[u64::MAX - 1001]  →  记忆状态 v1001
+Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
+```
+
+- **常规读取**：`Scan("data:agent:101:v:").next()` → 补码反转后最新版本排最前，亚微秒拿到最新状态
+- **时间旅行**：将前缀指针定位到目标版本号之后，正向扫描即得历史版本链。无需数据库快照锁，纯 Key 设计实现无锁历史回滚
+
+**与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
+
+### 模式四：WiscKey 键值分离（大 Value 场景的写放大解药）
+
+典型场景：Key 几十字节，Value 几 MB（对话历史、3D 资产二进制、多模态特征向量、日志原始载荷）。传统 LSM-Tree 在 Compaction 时将 Key+Value 捆绑重写，写放大几十倍。
+
+WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，大 Value 追加写入独立日志文件。
+
+```
+【内存 + SSTable 索引层】
+ Key: "asset:mesh:uuid_abc" → [File_ID : Offset : Length]  ← 十几字节指针
+                                    │
+                                    ▼ 磁盘随机点查
+【独立 Value Log（顺序追加）】
+ offset_3402 → [大体积二进制资产：3D模型 / 对话历史 / 多模态特征]
+```
+
+**物理效果**：
+- **Compaction**：只搬动小指针 Key（几字节），不碰大 Value 文件。写放大从几十倍降为接近 1
+- **读取**：索引定位指针后，一次磁盘随机点查（NVMe 上 ~10μs）抓取大 Value
+- **适用场景**：任何 Key 小 Value 大的模式——Agent 对话历史、3D 资产、多模态特征、日志载荷
+
+Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
 
 ### 网络层：gRPC 微包装突破单线程限制
 
@@ -304,23 +507,22 @@ SQL 定义表结构，Rust Struct 定义 Key 编码。编译器保证格式一�
 ```rust
 /// UserSessionKey 就是你的 DDL。
 /// 跨整个框架强制约束 Key 的合法性。
-pub struct UserSessionKey<'a> {
-    pub org_id: uuid::Uuid,
-    pub user_id: &'a str,
-    pub session_id: &'a str,
+pub struct UserSessionKey {
+    pub org_id: [u8; 16],     // 固定 16 字节 UUID 二进制
+    pub user_id: [u8; 16],    // 固定 16 字节 UUID 二进制
+    pub session_id: [u8; 16], // 固定 16 字节 UUID 二进制
 }
 
-impl<'a> UserSessionKey<'a> {
+impl UserSessionKey {
     /// 编码器 = 物理 Schema 的序列化引擎。
-    /// 保证该命名空间下所有 Key 永远遵循一致的字节排布。
+    /// 所有字段固定宽度，无分隔符，无动态解析。
+    /// Key 布局：sess: (5) + org (16) + user (16) + session (16) = 53 字节
     pub fn encode(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(64);
-        key.extend_from_slice(b"sess:");            // 空间标记（等价于表名）
-        key.extend_from_slice(self.org_id.as_bytes()); // 固定长度 UUID 二进制
-        key.extend_from_slice(b":");
-        key.extend_from_slice(self.user_id.as_bytes());
-        key.extend_from_slice(b":");
-        key.extend_from_slice(self.session_id.as_bytes());
+        let mut key = Vec::with_capacity(53);
+        key.extend_from_slice(b"sess:");           // 5 字节命名空间前缀
+        key.extend_from_slice(&self.org_id);       // 16 字节固定宽度
+        key.extend_from_slice(&self.user_id);      // 16 字节固定宽度
+        key.extend_from_slice(&self.session_id);   // 16 字节固定宽度
         key
     }
 }
@@ -355,18 +557,28 @@ SQL 的外键关系在 KV 中通过显式的正向+反向双写 Key 维护：
 ```rust
 /// Session → Messages 的 1:N 外键关系
 pub struct SessionToMessageEdge {
-    pub session_id: String,
-    pub message_id: String,
+    pub session_id: [u8; 16],  // 固定 16 字节 UUID 二进制
+    pub message_id: [u8; 16],  // 固定 16 字节 UUID 二进制
 }
 
 impl SessionToMessageEdge {
     /// 正向：从会话找消息
+    /// Key 布局：edge:s2m: (9) + session (16) + message (16) = 41 字节
     pub fn forward_key(&self) -> Vec<u8> {
-        format!("edge:sess_to_msg:{}:{}", self.session_id, self.message_id).into_bytes()
+        let mut key = Vec::with_capacity(41);
+        key.extend_from_slice(b"edge:s2m:");
+        key.extend_from_slice(&self.session_id);
+        key.extend_from_slice(&self.message_id);
+        key
     }
     /// 反向：从消息反查会话（等价于 SQL Foreign Key 联合索引）
+    /// Key 布局：edge:m2s: (9) + message (16) + session (16) = 41 字节
     pub fn reverse_key(&self) -> Vec<u8> {
-        format!("edge:msg_to_sess:{}:{}", self.message_id, self.session_id).into_bytes()
+        let mut key = Vec::with_capacity(41);
+        key.extend_from_slice(b"edge:m2s:");
+        key.extend_from_slice(&self.message_id);
+        key.extend_from_slice(&self.session_id);
+        key
     }
 }
 ```
@@ -401,9 +613,117 @@ impl<K, V> TypedTable<K, V> where
 
 `TypedTable<UserSessionKey, SessionData>` 在编译期锁死了 Key 和 Value 的类型。传错类型直接编译失败，不需要运行时调试。
 
+### 过程宏自动化：从手写 encode 到 derive 宏
+
+上述 `UserSessionKey::encode()` 和 `SessionToMessageEdge::forward_key()` 是演示用的手写实现。生产中可通过 Rust 过程宏（Proc Macro）自动生成：
+
+```rust
+#[derive(KvEncode)]  // 自定义 derive 宏
+#[kv_prefix(b"sess:")]
+pub struct UserSessionKey {
+    // syn 从 [u8; 16] 自动推导固定宽度 16 字节，无需额外标注
+    pub org_id: [u8; 16],
+    pub user_id: [u8; 16],
+    pub session_id: [u8; 16],
+}
+// 宏自动生成 encode() / decode() / forward_key() / reverse_key()
+// 开发者只声明结构体，不写任何序列化代码
+```
+
+`#[derive(KvEncode)]` 在编译期通过 syn 解析结构体字段类型：`[u8; N]` → 固定宽度 N 字节，`String` → 长度前缀编码，`u64` → 大端序 8 字节。开发者只需要标注 `#[kv_prefix]` 定义命名空间前缀，字段的序列化逻辑完全由类型推导，不需要手动指定字节长度。hex 硬编码单元测试（§DDL 稳定性）仍然有效——宏生成的代码产出与手写完全一致的字节序列。
+
+### SurrealDB/Mongo 的 DDL 缺陷
+
+无模式（Schema-less）是项目 0→1 阶段的「致幻剂」——开发速度极快，但到 1→10 的工业级阶段会成为数据脏乱差的万恶之源。
+
+**弱约束导致应用层逻辑爆炸**。PostgreSQL 的 DDL 具备刚性物理约束——`NOT NULL`、`CHECK`、类型定义在撞击数据库外壳的瞬间就拦截非法数据。无模式数据库是「来者不拒的垃圾桶」：数字字段可以写成字符串 `"25"` 甚至数组 `[25]`。代价是所有消费端代码（微服务、Agent 工具）必须写满防御性类型判断和解析重试。数据库偷的懒，全部变成应用层的代码债务。
+
+**查询优化器形同虚设**。PG 的优化器之所以强大，因为有刚性 DDL、确定的数据类型和索引元数据——优化器执行前就能精确计算磁盘步长和统计分布。无模式数据库不知道下一行 JSON 会冒出什么结构，查询引擎必须在运行时做大量动态类型断言和反射，CPU 算力被白白浪费在类型解析上。
+
+**「代码即 DDL」如何反超**：Rust 强类型结构体把约束从运行时（DB 级）提到编译期（Rust 级）——脏数据在 `cargo check` 阶段就被熔断，连生成的资格都没有。同时不需要 PG 的运行时 DDL 锁开销和 SQL 字符串解析税。既消灭了无模式的脏数据风险，又白嫖了 KV 引擎的硬件响应速度。
+
+### DDL 稳定性单元测试：硬编码 hex 字节防漂移
+
+KV 系统最怕的风险：某次代码迭代改动了 Key 的前缀字符串（如 `"cfg:app:"` 错打成 `"config:app:"`），导致线上老数据永远读不出来。解决方案：编写自动化 Schema 偏移检测单元测试，用硬编码的历史 hex 字节锁定 Key 编码：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_key_ddl_stability_protection() {
+        // 1. 构造确定性的业务测试数据
+        let test_key = UserSessionKey {
+            org_id: uuid::Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap(),
+            user_id: "user_88",
+            session_id: "sess_99",
+        };
+
+        // 2. 硬编码历史版本生成的真实物理二进制（hex 16 进制）
+        // 任何改动前缀或字段顺序的行为都会导致编码不匹配，CI/CD 立刻报错
+        let expected = hex::decode(
+            "736573733a67e5504410b1426f9247bb680e5fe0c83a757365725f38383a736573735f3939"
+        ).unwrap();
+
+        assert_eq!(
+            test_key.encode(), expected,
+            "DDL 物理 Key 编码发生非预期漂移！将导致线上老数据失联！"
+        );
+    }
+}
+```
+
+这段测试的物理含义：`hex::decode("736573733a...")` 是 `sess:67e55044...:user_88:sess_99` 的 UTF-8 字节序列。任何人改动 `UserSessionKey` 的 `encode()` 方法（改前缀、调字段顺序、换序列化格式），测试立刻失败，阻止合入主分支。这是 KV 系统替代 DDL 约束的最终防线——编译期类型安全 + 运行时 hex 校验，双保险。
+
 ### 判定
 
-SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + TypedTable 泛型抽象」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）。
+SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + TypedTable 泛型抽象 + hex 硬编码单元测试」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）+ 编码漂移防护（hex 单元测试）。在 Schema 安全性上完成对 SurrealDB（无模式）和 PostgreSQL（运行时 DDL 锁）的双向反超。
+
+## KV 框架 vs 自研数据库：演化边界
+
+纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
+
+```
+客户端文本查询 ("SELECT * FROM users WHERE age = 25")
+        │
+        ▼
+┌─ Parser ──────────────────────┐  文本 → AST（抽象语法树）
+└───────────────┬───────────────┘
+                ▼
+┌─ Optimizer ───────────────────┐  AST → 最优物理执行路径
+└───────────────┬───────────────┘
+                ▼
+kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
+        │
+        ▼
+┌─ KV Engine (Fjall/SlateDB) ──┐  二进制字节落盘
+└───────────────────────────────┘
+```
+
+### 工业界的真实路径
+
+| 数据库 | 查询层 | 存储内核 | 本质 |
+|:--|:--|:--|:--|
+| **TiDB** | MySQL 语法解析器 + 分布式执行计划优化 | TiKV（Rust KV） | SQL 翻译器 + KV |
+| **CockroachDB** | PostgreSQL 语法兼容 + 代价优化器 | Pebble（Go KV） | SQL 翻译器 + KV |
+| **SurrealDB** | SurrealQL 函数式解析器 + 图遍历优化 | SurrealKV（Rust KV） | DSL 翻译器 + KV |
+
+它们没有发明新的磁盘驱动器，只是在 KV 之上盖了一层解析器和优化器外壳。
+
+### 坚守纯 KV 的理由（框架团队的正确选择）
+
+当查询模式在设计期就已 100% 固定时，Parser + Optimizer 是多余的运行时开销：
+
+- **零解析损耗**：编译期直接写死 `kv_engine.scan(&prefix)`，不需要运行时解析 SQL 字符串
+- **100% 确定性响应**：无优化器「抽风」变慢的风险，P99 延迟雷打不动
+- **单一二进制体积**：不引入 SQL 解析器、优化器、类型系统的代码膨胀
+
+### 什么时候必须蜕变为数据库
+
+只有当系统需要开放给外部第三方开发者、允许最终用户通过低代码/动态插件自由写出不可预测的复杂查询时——为了防止他们写出全表扫描的垃圾查询把底层存储扫爆，才必须在最前面加一层 Parser + Optimizer 做查询门禁。
+
+**判定**：框架平台的正确姿态是坚守纯 KV + 复合键编码。数据库是 KV 的上层封装，不是 KV 的替代。如果你的查询模式是固定的， Parser + Optimizer 就是用运行时 CPU 开销去解决一个编译期就能消灭的问题。
 
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 

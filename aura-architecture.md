@@ -483,7 +483,7 @@ distribution = "raft" # 或 "s3"
 
 **Actor 完全不感知底层引擎**——`ctx.state.get("history")` 的调用方式不变，底层是 Fjall 同步返回还是 SlateDB 从 Block Cache 命中，对 Actor 透明。
 
-→ 两条架构路径的完整对比见 [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3)。
+→ 两条架构路径的完整对比见 [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3)。三引擎（Fjall/SlateDB/SurrealKV）的 API 差异和选型指南见 [KV 存储引擎架构 §三引擎 API 对比](kv-storage-engine.md#三引擎-api-对比fjall--slatedb--surrealkv)。
 
 ### 5.2 从单体 PostgreSQL 到分布式存算一体的逻辑跃迁
 
@@ -525,7 +525,7 @@ distribution = "raft" # 或 "s3"
 
 - **"零网络序列化损耗"**：底层数据库只是内嵌在 Rust 进程里的一行代码库（`struct Keyspace`），智能体读写状态是彻底的**进程内调用（In-Process Call）**。数据在物理磁盘到 Steel 虚拟机之间传递，走的是内存指针，速度直逼硬件物理极限。
 
-→ 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#8-resp-协议-vs-二进制序列化嵌入式架构的物理优势)
+→ 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#8-resp-协议-vs-二进制序列化嵌入式架构的物理优势)。Fjall 的 API 设计和与其他引擎的对比见 [KV 存储引擎架构 §三引擎 API 对比](kv-storage-engine.md#三引擎-api-对比fjall--slatedb--surrealkv)。
 
 ### 5.5 核心源码实现：Openraft 状态机挂载 Fjall
 
