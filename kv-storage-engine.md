@@ -198,7 +198,212 @@ Business Coordination (locks, scheduling, election)
 **批判文档的具体引用：**
 - 批判 §分布式锁：说「自己构建很简单」→ 本文展示如何实现（Raft 状态机 + Fjall 锁分区）
 - 批判 §集群神话：说 Redis 缺乏强一致性 → Openraft 用经过验证的 Raft 填补这个空缺
+
+→ SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [代码即 DDL](#代码即-ddlkv-的开发者体验保障)
 - Critique §"Network Latency Paradox": memory ~100ns vs network ~20μs → Fjall operates at the ns level (in-process function call)
+
+
+## SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
+
+对于框架平台（API 网关、Agent 执行器、3D 流水线），数据访问路径在设计期就已固化。去掉 SQL 不是为了省事，而是消灭数据库优化器（Query Planner）这个运行时黑盒，获得 100% 的物理性能确定性。
+
+### 实际对比：拉取最近 10 条对话记忆
+
+**SQL 方式**（PostgreSQL / SurrealDB）：
+
+```sql
+SELECT message_id, content FROM agent_memories
+WHERE session_id = 'session_456'
+ORDER BY timestamp DESC LIMIT 10;
+```
+
+底层物理代价：词法语法分析 → AST 树生成 → 逻辑执行计划 → 优化器猜测索引扫描还是全表扫描 → B-Tree 节点间频繁跳转。
+
+**KV 方式**（Rust + 嵌入式 KV）：
+
+写入时 Key 已编排为倒序物理格式：`m:{session_id}:{u64_max - timestamp}:{message_id}`。查询只需一行 Rust 管道链：
+
+```rust
+// 前缀定位 → 向后走 10 步，搞定
+let prefix = format!("m:session_456:").into_bytes();
+let top_10 = kv_engine
+    .scan(&prefix)         // 定位起始区间（O(log N) 内存二分）
+    .take(10)              // 顺序读 10 条（O(1) 磁盘/内存顺序 I/O）
+    .collect::<Vec<_>>();
+```
+
+**为什么 KV 胜出**：Rust 方法链比 SQL 声明式样板（SELECT/FROM/WHERE/ORDER BY/LIMIT）更精炼。没有黑盒优化器自作聪明——代码就是执行路径。数据从 10MB 到 10TB，执行效率不变，亚毫秒响应雷打不动。
+
+### 生产级组件：原子双写 + 时间线索引
+
+展示如何用一个原子 Batch 在写入主数据的同时，自动构建时间线倒序二级索引，确保主表与索引表不会数据漂移：
+
+```rust
+use bytes::Bytes;
+use std::sync::Arc;
+
+/// 原子批处理（等价于 Fjall WriteBatch / SlateDB 的 batch API）
+pub struct TransactionBatch {
+    pub actions: Vec<(Vec<u8>, Option<Bytes>)>,
+}
+
+impl TransactionBatch {
+    pub fn put(&mut self, k: &[u8], v: &[u8]) {
+        self.actions.push((k.to_vec(), Some(Bytes::copy_from_slice(v))));
+    }
+    pub fn delete(&mut self, k: &[u8]) {
+        self.actions.push((k.to_vec(), None));
+    }
+}
+
+pub struct FrameworkStorage {
+    /// 跨 Tokio 多线程共享的全局嵌入式存储引擎
+    /// 生产中替换为 Arc<fjall::Keyspace> 或 Arc<slatedb::Db>
+    pub engine: Arc<String>,
+}
+
+impl FrameworkStorage {
+    /// 原子双写：保存 Agent 记忆 + 自动构建时间线倒序索引
+    pub fn save_agent_memory(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) -> TransactionBatch {
+        let mut batch = TransactionBatch { actions: Vec::new() };
+
+        // 1. 主表：完整数据
+        let data_key = format!("data:session:{}:msg:{}", session_id, message_id).into_bytes();
+        batch.put(&data_key, payload);
+
+        // 2. 时间线索引：倒序排列（u64::MAX - timestamp）
+        let inverted_time = u64::MAX - timestamp;
+        let mut index_key = Vec::new();
+        index_key.extend_from_slice(format!("idx:time:session:{}:", session_id).as_bytes());
+        index_key.extend_from_slice(&inverted_time.to_be_bytes());
+        index_key.extend_from_slice(format!(":{}", message_id).as_bytes());
+
+        // Value 为空——实体 ID 已编码在 Key 的字典序中
+        batch.put(&index_key, &[]);
+
+        batch
+    }
+}
+```
+
+主表存完整数据，索引表只存空 Value（实体 ID 已通过二分序编码在 Key 中）。一次原子提交，两个 Key 同时成功或同时失败。SQL 的 `INSERT INTO` 无法在一个语句中同时写入两张表并保证原子性——需要额外的事务包裹。
+## 代码即 DDL：KV 的开发者体验保障
+
+SQL 的核心价值不是执行性能，而是关系模型交付的可读性、建模规整度和团队协作确定性。裸露的二进制字节 Key 会退化为面条代码——团队无法理解 Key 的排列规则。解决方案：用 Rust 类型系统替代 SQL DDL，把 Schema 正确性从运行时数据库引擎上提到编译期编译器。
+
+### 强类型 Key 编码：Struct 即 DDL
+
+SQL 定义表结构，Rust Struct 定义 Key 编码。编译器保证格式一致：
+
+```rust
+/// UserSessionKey 就是你的 DDL。
+/// 跨整个框架强制约束 Key 的合法性。
+pub struct UserSessionKey<'a> {
+    pub org_id: uuid::Uuid,
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+}
+
+impl<'a> UserSessionKey<'a> {
+    /// 编码器 = 物理 Schema 的序列化引擎。
+    /// 保证该命名空间下所有 Key 永远遵循一致的字节排布。
+    pub fn encode(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(b"sess:");            // 空间标记（等价于表名）
+        key.extend_from_slice(self.org_id.as_bytes()); // 固定长度 UUID 二进制
+        key.extend_from_slice(b":");
+        key.extend_from_slice(self.user_id.as_bytes());
+        key.extend_from_slice(b":");
+        key.extend_from_slice(self.session_id.as_bytes());
+        key
+    }
+}
+```
+
+任何试图写入错误格式的代码在编译期直接报错。不需要运行时校验。
+
+### 版本化 Enum 懒迁移：零停机 Schema 演进
+
+SQL 靠 `ALTER TABLE` 做迁移，需要锁表。KV 靠版本化 Enum 做懒迁移——读取时按版本自动升级，无停机：
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub enum MemoryValuePayload {
+    V1(AgentMemoryV1),
+    V2(AgentMemoryV2),  // 新增字段：多模态、特征标签
+}
+
+// 读取时按版本匹配，老数据在内存中无感升级
+match database.get(&key) {
+    MemoryValuePayload::V1(old) => upgrade_v1_to_v2(old),
+    MemoryValuePayload::V2(current) => current,
+}
+```
+
+只有被读到的老记录才升级。未读到的继续以旧格式存储，不浪费写入带宽。这是 SQL `ALTER TABLE` 无法做到的——PG 的迁移必须遍历全表重写所有行。
+
+### 指针契约：Edge Struct 模拟外键
+
+SQL 的外键关系在 KV 中通过显式的正向+反向双写 Key 维护：
+
+```rust
+/// Session → Messages 的 1:N 外键关系
+pub struct SessionToMessageEdge {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+impl SessionToMessageEdge {
+    /// 正向：从会话找消息
+    pub fn forward_key(&self) -> Vec<u8> {
+        format!("edge:sess_to_msg:{}:{}", self.session_id, self.message_id).into_bytes()
+    }
+    /// 反向：从消息反查会话（等价于 SQL Foreign Key 联合索引）
+    pub fn reverse_key(&self) -> Vec<u8> {
+        format!("edge:msg_to_sess:{}:{}", self.message_id, self.session_id).into_bytes()
+    }
+}
+```
+
+写入时同时 `put` 正向和反向 Key。删除时同时 `delete` 两侧。Edge Struct 的代码注释就是 E-R 图的文档化——比 SQL DDL 更显式，因为关系编码逻辑和 Key 生成逻辑在同一处。
+
+### TypedTable：泛型类型安全抽象
+
+在裸字节 KV 引擎之上封装一层声明式泛型表，交付 ORM 级别的开发体验：
+
+```rust
+use std::marker::PhantomData;
+
+/// 通用泛型表空间——PhantomData 编译期类型检查，运行时零开销
+pub struct TypedTable<K, V> {
+    _key_type: PhantomData<K>,
+    _val_type: PhantomData<V>,
+}
+
+impl<K, V> TypedTable<K, V> where
+    K: serde::Serialize,
+    V: serde::Serialize + serde::de::DeserializeOwned
+{
+    /// 类型化写入——编译器保证 Key 和 Value 类型匹配
+    pub fn put_record(&self, batch: &mut Vec<(Vec<u8>, Vec<u8>)>, key: K, value: V) {
+        let serialized_key = bincode::serialize(&key).unwrap();
+        let serialized_val = bincode::serialize(&value).unwrap();
+        batch.push((serialized_key, serialized_val));
+    }
+}
+```
+
+`TypedTable<UserSessionKey, SessionData>` 在编译期锁死了 Key 和 Value 的类型。传错类型直接编译失败，不需要运行时调试。
+
+### 判定
+
+SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + TypedTable 泛型抽象」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）。
 
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 
@@ -601,115 +806,3 @@ PG 退化为**元数据安全闸**——只管用户账户、组织权限、购�
 | 现代 KV 引擎已可信任（§11） | OpenAI 正在迁移，2026 年生态已成熟 |
 
 **判定**：OpenAI 用 PG 撑了 3 年是因为 2023 年没有成熟的轻量 Rust KV 轮子。2026 年如果还盲目复制 PG 路线，就是刻舟求剑。直接用 Fjall+Raft 或 SlateDB+S3，把分布式边缘 Case 委托给成熟的 Rust 基础设施，才是最小人力成本的现代路径。
-
-## 15. 代码即 DDL：KV 的开发者体验保障
-
-SQL 的核心价值不是执行性能，而是关系模型交付的可读性、建模规整度和团队协作确定性。裸露的二进制字节 Key 会退化为面条代码——团队无法理解 Key 的排列规则。解决方案：用 Rust 类型系统替代 SQL DDL，把 Schema 正确性从运行时数据库引擎上提到编译期编译器。
-
-### 强类型 Key 编码：Struct 即 DDL
-
-SQL 定义表结构，Rust Struct 定义 Key 编码。编译器保证格式一致：
-
-```rust
-/// UserSessionKey 就是你的 DDL。
-/// 跨整个框架强制约束 Key 的合法性。
-pub struct UserSessionKey<'a> {
-    pub org_id: uuid::Uuid,
-    pub user_id: &'a str,
-    pub session_id: &'a str,
-}
-
-impl<'a> UserSessionKey<'a> {
-    /// 编码器 = 物理 Schema 的序列化引擎。
-    /// 保证该命名空间下所有 Key 永远遵循一致的字节排布。
-    pub fn encode(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(64);
-        key.extend_from_slice(b"sess:");            // 空间标记（等价于表名）
-        key.extend_from_slice(self.org_id.as_bytes()); // 固定长度 UUID 二进制
-        key.extend_from_slice(b":");
-        key.extend_from_slice(self.user_id.as_bytes());
-        key.extend_from_slice(b":");
-        key.extend_from_slice(self.session_id.as_bytes());
-        key
-    }
-}
-```
-
-任何试图写入错误格式的代码在编译期直接报错。不需要运行时校验。
-
-### 版本化 Enum 懒迁移：零停机 Schema 演进
-
-SQL 靠 `ALTER TABLE` 做迁移，需要锁表。KV 靠版本化 Enum 做懒迁移——读取时按版本自动升级，无停机：
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub enum MemoryValuePayload {
-    V1(AgentMemoryV1),
-    V2(AgentMemoryV2),  // 新增字段：多模态、特征标签
-}
-
-// 读取时按版本匹配，老数据在内存中无感升级
-match database.get(&key) {
-    MemoryValuePayload::V1(old) => upgrade_v1_to_v2(old),
-    MemoryValuePayload::V2(current) => current,
-}
-```
-
-只有被读到的老记录才升级。未读到的继续以旧格式存储，不浪费写入带宽。这是 SQL `ALTER TABLE` 无法做到的——PG 的迁移必须遍历全表重写所有行。
-
-### 指针契约：Edge Struct 模拟外键
-
-SQL 的外键关系在 KV 中通过显式的正向+反向双写 Key 维护：
-
-```rust
-/// Session → Messages 的 1:N 外键关系
-pub struct SessionToMessageEdge {
-    pub session_id: String,
-    pub message_id: String,
-}
-
-impl SessionToMessageEdge {
-    /// 正向：从会话找消息
-    pub fn forward_key(&self) -> Vec<u8> {
-        format!("edge:sess_to_msg:{}:{}", self.session_id, self.message_id).into_bytes()
-    }
-    /// 反向：从消息反查会话（等价于 SQL Foreign Key 联合索引）
-    pub fn reverse_key(&self) -> Vec<u8> {
-        format!("edge:msg_to_sess:{}:{}", self.message_id, self.session_id).into_bytes()
-    }
-}
-```
-
-写入时同时 `put` 正向和反向 Key。删除时同时 `delete` 两侧。Edge Struct 的代码注释就是 E-R 图的文档化——比 SQL DDL 更显式，因为关系编码逻辑和 Key 生成逻辑在同一处。
-
-### TypedTable：泛型类型安全抽象
-
-在裸字节 KV 引擎之上封装一层声明式泛型表，交付 ORM 级别的开发体验：
-
-```rust
-use std::marker::PhantomData;
-
-/// 通用泛型表空间——PhantomData 编译期类型检查，运行时零开销
-pub struct TypedTable<K, V> {
-    _key_type: PhantomData<K>,
-    _val_type: PhantomData<V>,
-}
-
-impl<K, V> TypedTable<K, V> where
-    K: serde::Serialize,
-    V: serde::Serialize + serde::de::DeserializeOwned
-{
-    /// 类型化写入——编译器保证 Key 和 Value 类型匹配
-    pub fn put_record(&self, batch: &mut Vec<(Vec<u8>, Vec<u8>)>, key: K, value: V) {
-        let serialized_key = bincode::serialize(&key).unwrap();
-        let serialized_val = bincode::serialize(&value).unwrap();
-        batch.push((serialized_key, serialized_val));
-    }
-}
-```
-
-`TypedTable<UserSessionKey, SessionData>` 在编译期锁死了 Key 和 Value 的类型。传错类型直接编译失败，不需要运行时调试。
-
-### 判定
-
-SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + TypedTable 泛型抽象」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）。
