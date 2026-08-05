@@ -328,6 +328,202 @@ WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，�
 
 Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
 
+### 模式五：倒排索引交集（多维查询的 KV 实现）
+
+SQL 的多条件组合查询：
+
+```sql
+SELECT * FROM orders WHERE status = 'shipped' AND region = 'east' AND amount > 1000;
+```
+
+KV 只有点查和前缀扫描两种原语。多维查询通过**倒排索引 + 内存交集**实现，与 Elasticsearch/Lucene 的 Posting List 交集算法同源。
+
+#### 写入路径：每个维度独立建索引
+
+```
+数据主表：
+  data:order:{order_id}  →  [完整记录]
+
+维度索引（每个维度一个 Key 前缀）：
+  idx:status:shipped:{order_id}  →  ""    ← Value 留空，ID 在 Key 末尾
+  idx:region:east:{order_id}     →  ""
+  idx:user:u7:{order_id}         →  ""
+```
+
+**Entity ID 编码在 Key 末尾**（§「二级索引末尾必须追加主键 ID」），保证扫描结果天然有序。Value 留空——Index-Only Scan，不碰数据层的大 Value。
+
+每条数据写入时原子 Batch 同时提交主表 + 所有索引条目：
+
+```rust
+let mut batch = kv.batch();
+batch.put(&order_key, &order_data);
+batch.put(b"idx:status:shipped:00123", b"");
+batch.put(b"idx:region:east:00123", b"");
+batch.put(b"idx:user:u7:00123", b"");
+batch.commit()?;
+```
+
+#### 读取路径：扫描 → 交集 → 回表
+
+```rust
+// 1. 两次前缀扫描（并行）
+let a = kv.scan(b"idx:status:shipped:").map(extract_id).collect::<Vec<_>>();
+let b = kv.scan(b"idx:region:east:").map(extract_id).collect::<Vec<_>>();
+
+// 2. 归并交集（排序数组双指针 O(N+M)，CPU L1 Cache，纳秒级）
+let common = intersect_sorted(&a, &b);
+
+// 3. 回表点查（每个 ID 一次 get，~1μs/NVMe）
+let results: Vec<_> = common.iter()
+    .map(|id| kv.get(&data_key(id)))
+    .collect();
+```
+
+`intersect_sorted` 实现：双指针归并，与 Lucene Posting List 交集算法同源。
+
+#### 性能分析
+
+```
+设：status 命中 1000 条，region 命中 500 条，交集 200 条
+
+Step 1: 两次顺序扫描 → 1500 次迭代器 Next（顺序 I/O，~μs 级）
+Step 2: 归并交集 → 1500 次比较（CPU，纳秒级）
+Step 3: 200 次点查 → ~200μs（NVMe 随机读）
+
+总计：~1ms
+```
+
+与 SQL B-Tree 索引扫描做同样的事：两次索引定位 + 归并 + 回表，也是 ~1ms 级别。**数学上等价，I/O 模式不同**：B-Tree 每次定位一个节点 = 随机读，LSM-Tree 前缀扫描 = 顺序读。NVMe 上顺序读比随机读快 5-10 倍。
+
+**排序零成本是 KV 的结构性优势**。SQL 做 Merge Join 有一个隐含前提：两表必须在 JOIN 列上已排序。如果没建索引，数据库必须先跑一次 O(N log N) 排序才能启动双指针。KV 的前缀扫描天然返回排序结果——LSM-Tree 的字典序就是排序，MemTable + SSTable 的迭代器输出严格按 Key 有序。省掉排序步骤后，倒排索引交集直接进入 O(N+M) 归并阶段，比 SQL Merge Join 少一轮全量排序。
+
+#### 写放大：维度数的代价
+
+每多一个索引维度，每条数据写入多一次 put。3 个维度 = 4 次写（1 主表 + 3 索引），10 个维度 = 11 次写。这是所有索引系统的物理代价——SQL 维护 B-Tree 索引的开销本质相同。
+
+#### 三策略对比
+
+| 策略 | 维度组合 | 读延迟 | 适用场景 |
+|:--|:--|:--|:--|
+| **前缀编码**（模式一思想） | 设计期固定，≤3 维度 | 1 次扫描 | 维度少、组合固定 |
+| **倒排索引交集** | 任意组合 | 2+ 次扫描 + 交集 + 回表 | 维度多、组合不可预测 |
+| **Bitmap 拦截**（模式二） | 设计期固定，维度值有限 | 0 次 KV（纯 CPU） | 高并发热路径 |
+
+### 模式六：去范式化 vs 应用层 JOIN
+
+SQL JOIN 的本质是「根据关联键合并两个实体」。KV 没有关联表概念——核心决策只有一个：**在写入时合并，还是在读取时合并**。
+
+#### 写时去范式化（读密集场景）
+
+将关联实体的常用字段在写入时冗余嵌入主记录。读取时一次 get 拿全部信息，零 JOIN：
+
+```rust
+let mut batch = kv.batch();
+// 主表：只存自己的数据
+batch.put(&order_key, &order_data);
+// 去范式化视图：嵌入关联实体的常用字段
+batch.put(&full_key, &denormalized_data);  // {amount, status, user_name, user_email}
+batch.commit()?;
+```
+
+**代价**：数据冗余 + 写放大（每份冗余数据一次额外 put）。**适用**：关联字段小（name、email）、读远多于写。
+
+#### 读时应用层 JOIN（写密集 / 大关联字段场景）
+
+保留实体独立存储，读取时两次查询 + 应用层合并：
+
+```
+订单表：data:order:{order_id}  →  {user_id, amount, timestamp}
+用户表：data:user:{user_id}    →  {name, email, phone, avatar, settings}
+```
+
+```rust
+let order = kv.get(&order_key)?;                          // 点查，~μs
+let user = kv.get(&data_user_key(order.user_id))?;       // 点查，~μs
+let result = merge(order, user);                           // 应用层合并
+```
+
+**代价**：2 次 KV 点查（各 ~μs），无冗余。**适用**：关联实体大（完整用户 Profile）或频繁更新（写入时不需要同步更新去范式化视图）。
+
+#### 多对多关系：指针索引
+
+当关联关系本身是查询维度（标签、分类、多对多），用二级索引存储关联 ID：
+
+```
+订单的关联索引：
+  rel:order:{order_id}:user  →  "user_abc"              (单值)
+  rel:order:{order_id}:items →  [item_1, item_2, ...]   (多值，长度前缀编码)
+```
+
+本质上是把关系型数据库的外键索引搬到 KV 层。关联关系可以独立于实体数据演进。
+
+#### JOIN 策略选择
+
+| 场景 | 推荐 | 理由 |
+|:--|:--|:--|
+| 订单 + 用户名（小字段，读多） | 写时去范式化 | 一次 get 拿全部，延迟最低 |
+| 订单 + 完整用户 Profile（大字段） | 读时 JOIN | 避免冗余存储大对象 |
+| 多对多关系（标签、分类） | 指针索引 | 关联关系独立演进 |
+| 固定 2-3 张表的关系 | 复合实体编码 | 直接拍平成一个大 Key |
+
+### 模式七：预聚合计数器（GROUP BY 的 KV 实现）
+
+SQL 的 `SELECT region, COUNT(*), SUM(amount) FROM orders GROUP BY region` 是查询时按需计算。KV 没有聚合原语，两个解法各有代价：
+
+#### 写入时维护预聚合
+
+每次写入主数据时，同步更新所有 GROUP BY 组合的计数器：
+
+```rust
+let mut batch = kv.batch();
+// 主表
+batch.put(&order_key, &order_data);
+// 按天 + 按状态 + 按区域的聚合
+let date = timestamp_to_date(order.timestamp);
+batch.put(&count_key(b"agg:daily:", date, &order.status, &order.region), &increment(1));
+batch.put(&sum_key(b"agg:daily:", date, &order.status, &order.region, "amount"), &add(order.amount));
+batch.commit()?;
+```
+
+读取一次点查：`get("agg:daily:2026-08-05:shipped:east:count")` → 亚微秒返回。
+
+**代价**：写放大随 GROUP BY 维度数指数增长。按天 × 状态 × 区域 × 类别 = 每笔订单写入时更新数十个计数器。适合维度少（2-3 个）、查询极频繁的场景（实时仪表板）。
+
+#### 全量扫描 + 应用层聚合
+
+适合数据量小或查询极不频繁的场景：
+
+```rust
+let results = kv.scan(b"idx:time:2026-08:")
+    .filter(|r| r.status == "shipped")
+    .group_by(|r| r.region)           // 应用层 GROUP BY
+    .map(|(region, orders)| (region, orders.len(), orders.sum(|o| o.amount)))
+    .collect();
+```
+
+**代价**：全量扫描 + 内存聚合，数据量大时 OOM。与 SQL 的全表扫描 GROUP BY 物理代价相同——SQL 也不会对没有索引的 GROUP BY 字段做任何优化。
+
+### 模式八：SQL 查询层 vs 纯 KV 的定位
+
+SQL 不是 KV 的对立面。SurrealDB、TiDB、CockroachDB 的底层存储全是 KV 引擎（SurrealKV、TiKV/RocksDB、Pebble）。SQL 的动态查询灵活性是 **Parser + Optimizer 层**的能力，不是存储引擎的属性。
+
+```
+纯 KV 读路径：
+  代码 → kv.scan(prefix) → 结果
+  （编译期确定，零解析开销）
+
+KV + 查询层读路径：
+  SQL 字符串 → 词法分析 → AST → 逻辑计划 → 代价优化 → 物理计划 → kv.scan → 结果
+  （每步都是运行时 CPU 开销）
+```
+
+判断标准不是「KV 还是 SQL」，而是「查询模式是否在设计期固定」：
+
+- **固定** → 纯 KV，省掉 Parser + Optimizer 的运行时开销
+- **不固定** → KV + 查询层（SurrealDB / TiDB / 自建查询引擎）
+
+纯 KV 不是「没有 SQL 的能力」，而是「把复杂度从运行时转移到了设计期」——Key 编码格式就是执行计划，代码就是最高效的查询解析器。当查询模式 100% 可预测时，运行时解析器只是在用 CPU 去解决编译期就能消灭的问题。
+
 ### 网络层：gRPC 微包装突破单线程限制
 
 Redis 的单线程模型是 2009 年硬件条件下的最优解。在多核服务器上，Redis 的命令执行被锁死在单核——多实例分片引入客户端路由复杂性（§10.3 选型表）。
