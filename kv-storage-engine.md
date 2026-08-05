@@ -328,6 +328,10 @@ WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，�
 
 Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
 
+## SQL 操作的 KV 实现
+
+设计模式章节的模式一~四是 KV 引擎的物理特性利用（LSM-Tree 字典序、补码反转、WiscKey 分离）。本章节从 SQL 的视角出发：多维查询、JOIN、聚合这些关系型数据库的核心操作，在纯 KV 底座上如何实现。
+
 ### 模式五：倒排索引交集（多维查询的 KV 实现）
 
 SQL 的多条件组合查询：
@@ -366,7 +370,7 @@ batch.commit()?;
 #### 读取路径：扫描 → 交集 → 回表
 
 ```rust
-// 1. 两次前缀扫描（并行）
+// 1. 两次前缀扫描
 let a = kv.scan(b"idx:status:shipped:").map(extract_id).collect::<Vec<_>>();
 let b = kv.scan(b"idx:region:east:").map(extract_id).collect::<Vec<_>>();
 
@@ -396,6 +400,8 @@ Step 3: 200 次点查 → ~200μs（NVMe 随机读）
 与 SQL B-Tree 索引扫描做同样的事：两次索引定位 + 归并 + 回表，也是 ~1ms 级别。**数学上等价，I/O 模式不同**：B-Tree 每次定位一个节点 = 随机读，LSM-Tree 前缀扫描 = 顺序读。NVMe 上顺序读比随机读快 5-10 倍。
 
 **排序零成本是 KV 的结构性优势**。SQL 做 Merge Join 有一个隐含前提：两表必须在 JOIN 列上已排序。如果没建索引，数据库必须先跑一次 O(N log N) 排序才能启动双指针。KV 的前缀扫描天然返回排序结果——LSM-Tree 的字典序就是排序，MemTable + SSTable 的迭代器输出严格按 Key 有序。省掉排序步骤后，倒排索引交集直接进入 O(N+M) 归并阶段，比 SQL Merge Join 少一轮全量排序。
+
+需注意：SQL 在 JOIN 列上建了索引时，B-Tree 叶子链表天然有序，排序同样免费。KV 的优势不是"SQL 做不到有序"，而是**前缀扫描在任何场景下都保证有序，不依赖索引选择**——设计期编码 Key 前缀时排序就已内嵌，运行时无需判断是否该走索引。
 
 #### 写放大：维度数的代价
 
@@ -503,28 +509,7 @@ let results = kv.scan(b"idx:time:2026-08:")
 
 **代价**：全量扫描 + 内存聚合，数据量大时 OOM。与 SQL 的全表扫描 GROUP BY 物理代价相同——SQL 也不会对没有索引的 GROUP BY 字段做任何优化。
 
-### 模式八：SQL 查询层 vs 纯 KV 的定位
-
-SQL 不是 KV 的对立面。SurrealDB、TiDB、CockroachDB 的底层存储全是 KV 引擎（SurrealKV、TiKV/RocksDB、Pebble）。SQL 的动态查询灵活性是 **Parser + Optimizer 层**的能力，不是存储引擎的属性。
-
-```
-纯 KV 读路径：
-  代码 → kv.scan(prefix) → 结果
-  （编译期确定，零解析开销）
-
-KV + 查询层读路径：
-  SQL 字符串 → 词法分析 → AST → 逻辑计划 → 代价优化 → 物理计划 → kv.scan → 结果
-  （每步都是运行时 CPU 开销）
-```
-
-判断标准不是「KV 还是 SQL」，而是「查询模式是否在设计期固定」：
-
-- **固定** → 纯 KV，省掉 Parser + Optimizer 的运行时开销
-- **不固定** → KV + 查询层（SurrealDB / TiDB / 自建查询引擎）
-
-纯 KV 不是「没有 SQL 的能力」，而是「把复杂度从运行时转移到了设计期」——Key 编码格式就是执行计划，代码就是最高效的查询解析器。当查询模式 100% 可预测时，运行时解析器只是在用 CPU 去解决编译期就能消灭的问题。
-
-### 网络层：gRPC 微包装突破单线程限制
+## 网络层：gRPC 微包装突破单线程限制
 
 Redis 的单线程模型是 2009 年硬件条件下的最优解。在多核服务器上，Redis 的命令执行被锁死在单核——多实例分片引入客户端路由复杂性（§10.3 选型表）。
 
@@ -587,22 +572,6 @@ Business Coordination (locks, scheduling, election)
 | 序列化 | AI | derive 宏 + 样板代码 |
 | 集成测试 | AI + 人类验证 | AI 生成，人类补充边界情况 |
 | 生产运维 | 人类 | 环境特定判断 |
-
-## 交叉引用
-
-[Redis 批判](../redis-critique.md) 论证了 **Redis 在每个层面为何失败**：
-- L0（进程内）：Redis 比本地内存慢 200-50,000 倍 → **Fjall 就是带持久化的 L0 实现**
-- L3（分布式协调）：Redis 没有共识 → **Openraft 提供批判文档所说的 Raft 共识**
-
-本文档是 **建设性对应物**：不只是「Redis 不好」，而是「这就是替代它的精确架构」。批判文档的「推荐替代方案」一节建议「基于 Raft 的存储（强一致性）」——这就是实现。
-
-**批判文档的具体引用：**
-- 批判 §分布式锁：说「自己构建很简单」→ 本文展示如何实现（Raft 状态机 + Fjall 锁分区）
-- 批判 §集群神话：说 Redis 缺乏强一致性 → Openraft 用经过验证的 Raft 填补这个空缺
-
-→ SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [代码即 DDL](#代码即-ddlkv-的开发者体验保障)
-- Critique §"Network Latency Paradox": memory ~100ns vs network ~20μs → Fjall operates at the ns level (in-process function call)
-
 
 ## SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
 
@@ -1144,3 +1113,18 @@ PG 退化为**元数据安全闸**——只管用户账户、组织权限、购�
 | 现代 KV 引擎已可信任（§11） | OpenAI 正在迁移，2026 年生态已成熟 |
 
 **判定**：OpenAI 用 PG 撑了 3 年是因为 2023 年没有成熟的轻量 Rust KV 轮子。2026 年如果还盲目复制 PG 路线，就是刻舟求剑。直接用 Fjall+Raft 或 SlateDB+S3，把分布式边缘 Case 委托给成熟的 Rust 基础设施，才是最小人力成本的现代路径。
+
+## 交叉引用
+
+[Redis 批判](../redis-critique.md) 论证了 **Redis 在每个层面为何失败**：
+- L0（进程内）：Redis 比本地内存慢 200-50,000 倍 → **Fjall 就是带持久化的 L0 实现**
+- L3（分布式协调）：Redis 没有共识 → **Openraft 提供批判文档所说的 Raft 共识**
+
+本文档是 **建设性对应物**：不只是「Redis 不好」，而是「这就是替代它的精确架构」。批判文档的「推荐替代方案」一节建议「基于 Raft 的存储（强一致性）」——这就是实现。
+
+**批判文档的具体引用：**
+- 批判 §分布式锁：说「自己构建很简单」→ 本文展示如何实现（Raft 状态机 + Fjall 锁分区）
+- 批判 §集群神话：说 Redis 缺乏强一致性 → Openraft 用经过验证的 Raft 填补这个空缺
+
+→ SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [代码即 DDL](#代码即-ddlkv-的开发者体验保障)
+- Critique §"Network Latency Paradox": memory ~100ns vs network ~20μs → Fjall operates at the ns level (in-process function call)
