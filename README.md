@@ -89,6 +89,7 @@
 | [NL2SQL 架构](nl2sql-architecture.md) | | OLTP 上做分析是架构设计错误：批判性分析 + 技能实现 |
 | [Nushell 介绍](nushell-introduction.md) | | Nushell 入门 |
 | [Loop 工程分析](loop-engineering-analysis.md) | | Loop 工程方法论框架 |
+| [迭代闭环](iteration-closed-loop.md) | | 行动、复盘、转向：迭代闭环的结构骨架、心理阻塞与元能力 |
 
 ## AI 时代思考
 
