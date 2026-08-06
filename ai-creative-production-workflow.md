@@ -119,27 +119,28 @@ AI 生成视频（Sora 等）是紧耦合的——人物、行进路线、光影
 
 ```json
 {
-  "scene": { "type": "indoor", "style": "dim地下酒吧", "assets": ["bar_counter", "neon_sign"] },
+  "scene": { "type": "outdoor_night", "style": "深夜白垩纪丛林边缘的现代县城街道", "assets": ["cretaceous_fern", "street_light", "asphalt_road", "security_fence"] },
   "characters": [
-    { "id": "bartender", "age": 0.4, "gender": 0.7, "height": 1.80, "clothes": "black_vest", "position": [0, 0, 0] },
-    { "id": "guest_01", "age": 0.3, "gender": 0.5, "height": 1.75, "clothes": "casual_jacket", "position": [2, 1, 0] }
+    { "id": "zhang_xiaozhou", "age": 0.3, "gender": 0.9, "height": 1.78, "clothes": "casual_jacket", "position": [0, 0, 0] },
+    { "id": "companion_01", "age": 0.35, "gender": 0.7, "height": 1.72, "clothes": "workwear", "position": [2, 0.5, 0] }
   ],
   "actions": [
-    { "character": "bartender", "motion": "pour_drink", "start_frame": 1, "end_frame": 60 },
-    { "character": "guest_01", "motion": "walk_to_bar", "start_frame": 30, "end_frame": 90 }
+    { "character": "zhang_xiaozhou", "motion": "cautious_walk", "start_frame": 1, "end_frame": 60 },
+    { "character": "companion_01", "motion": "flashlight_scan", "start_frame": 20, "end_frame": 80 }
   ],
   "camera": {
-    "type": "dolly_arc",
-    "target": "bar_counter",
-    "radius": 3.5,
-    "start_angle": 0,
-    "end_angle": 180,
+    "type": "handheld_track",
+    "target": "zhang_xiaozhou",
+    "distance": 3.0,
+    "start_frame": 1,
+    "end_frame": 90,
     "shake": true,
-    "shake_intensity": 0.02
+    "shake_intensity": 0.03
   },
   "lighting": {
-    "key_target": "bartender",
-    "sky": { "altitude": 15, "clouds": 0.3 }
+    "key_target": "zhang_xiaozhou",
+    "sky": { "time_of_day": "02:00", "fog_density": 0.15 },
+    "practical": ["flickering_street_light"]
   }
 }
 ```
@@ -207,7 +208,7 @@ class Asset3D(LanceModel):
     tags: list[str]               # 语义标签
 ```
 
-**检索流程**：LLM 拆解剧本（"昏暗的地下酒吧"）→ 文本 + 参考图同时向量化（jina-embeddings-v5-omni）→ 资产库语义匹配 + 结构化过滤 → 返回包含文件路径、骨骼类型、版权信息的结构化结果 → Python 脚本直接导入到 3D 坐标系。
+**检索流程**：LLM 拆解剧本（"深夜白垩纪丛林边缘的县城街道"）→ 文本 + 参考图同时向量化（jina-embeddings-v5-omni）→ 资产库语义匹配 + 结构化过滤 → 返回包含文件路径、骨骼类型、版权信息的结构化结果 → Python 脚本直接导入到 3D 坐标系。
 
 ```python
 # 混合检索：语义 + 结构化过滤
@@ -227,10 +228,10 @@ AI 在这条管线中的工位：**非确定性但重复的劳动**。这类劳�
 
 | 劳动 | 非确定性（需要理解） | 重复性（反复出现） | AI 的处理 |
 |:--|:--|:--|:--|
-| 剧本→分镜 | "昏暗的酒吧"→资产标签 | 每部剧本都要拆解 | LLM 语义解构为 JSON |
-| 资产检索 | 语义匹配"低矮木质吧台" | 每场戏都要检索 | 向量 + 结构化混合查询 |
+| 剧本→分镜 | "深夜白垩纪丛林边缘的县城街道"→资产标签 | 每部剧本都要拆解 | LLM 语义解构为 JSON |
+| 资产检索 | 语义匹配"断裂的水泥路面与桫椤树冠" | 每场戏都要检索 | 向量 + 结构化混合查询 |
 | 动作匹配 | "惊恐后退"→对应 .bvh | 每个角色每个场景 | LLM 从动作库智能挑选 |
-| 场景布局 | "人物 A 站在吧台后方" | 每场戏都要摆放 | LLM 翻译为 3D 坐标 |
+| 场景布局 | "张晓舟站在县政府大楼废墟前" | 每场戏都要摆放 | LLM 翻译为 3D 坐标 |
 
 **AI 的真正价值不在于最终画笔，而在于高效执行者**——把人类的模糊叙事意图翻译成引擎能精确执行的确定性参数。传统流程中这一步需要动画师对照分镜表逐帧调参，一个 15 秒片段往往耗时半日；AI 翻译 + Blender 确定性执行，秒级完成，且每帧的光影衰减、骨骼旋转角度由物理引擎硬性保证，不会出现纯 AI 视频的概率性崩塌。
 
@@ -504,67 +505,65 @@ USD 是系统的升级包——当场景大到 Blender 频繁内存溢出、或�
 
 对本管线的意义：当前阶段 JSON → Blender API 足够；未来引入外部工具（UE 渲染大场面、Maya 做精细表情）时，Python 转换器只需将 `bpy` 调用替换为 `pxr.Usd` 库调用，生成中立的 scene.usd，即可在任意工具间无缝流转。这是好莱坞的解耦哲学：数据（USD）归数据，工具（Blender/UE/Maya）归工具。
 
-### MVP 验证：搭环境 + 跑通三件事
+### MVP 验证：搭环境 + 跑通链路
 
-重点不是做出好看的效果，是验证技术链路可行。MVP 的产出是流水线本身，不是任何一次渲染结果——方块人搬箱子恰恰证明链路跑通了，资产质量是插件替换的问题（换 MPFB2 角色、SpeedTree 植被），不是管线的结构性问题。如同验证编译器不需要生成 optimized binary——能编译通过即可。分两步：
+重点不是做出好看的效果，是验证 AI 拆解 + Blender 插件整合的链路可行。MVP 的产出是流水线本身，不是任何一次渲染结果——方块人搬箱子恰恰证明链路跑通了，资产质量是插件替换的问题（换 MPFB2 角色、SpeedTree 植被），不是管线的结构性问题。如同验证编译器不需要生成 optimized binary——能编译通过即可。分两步：
 
 **第一步：搭环境（半天）**
 
-- 装 LanceDB + jina-embeddings-v5-omni embedding 模型
-- 准备 5-10 个免费 .glb/.gltf 模型（Sketchfab / Poly Pizza / Mixamo），每个写一条结构化记录（文件路径、缩略图、风格标签、分类）
-- 用 jina-embeddings-v5-omni 对资产的文字描述 + 缩略图生成 embedding，灌入 LanceDB
-- 资产库建完，后续验证就在这个库里跑
+- 安装 Blender + 启用 MPFB2、Rigify、Camera Rigs、Camera Shakify、Dynamic Sky 插件
+- 安装 Python 依赖（`bpy` 通过 Blender 内置 Python 调用，外部仅需 LLM API SDK）
+- 准备 1 个空白 Blender 场景作为底座
 
-**第二步：验证三件事**
+**第二步：验证两件事**
 
 | 检查点 | 验证内容 | 通过标准 |
 |:--|:--|:--|
-| **LLM 拆解质量** | 输入"昏暗的酒吧，调酒师站在吧台后面"，LLM 输出 JSON 含合理的资产标签（`bar_counter`, `bottle`, `character_bartender`） | 输出标签与资产库中的 category/tags 对得上 |
-| **检索准确率** | 用拆解出的标签做向量 + 结构化混合检索，能否命中正确的资产 | Top-5 结果中包含目标资产 |
-| **Blender 放置** | 检索结果的 `file_path` 能否通过 `bpy.ops.import_scene.gltf()` 导入并放到指定坐标 | 资产出现在场景中正确位置，`blender -b` 渲染出静态图 |
+| **LLM 拆解质量** | 输入第一章场景描述，LLM 输出包含 scene/characters/actions/camera/lighting 五个顶层字段的结构化 JSON | JSON 格式合法，字段完整，参数值在物理合理范围内 |
+| **插件整合链路** | Python 总控脚本读取 JSON → 调用 MPFB2 生成角色 → Rigify 绑定骨骼 → Camera Rigs 设定运镜 → Shakify 叠加手持抖动 → `blender -b` 命令行渲染 | 每个插件被 Python 脚本正确调用，`blender -b` 输出静态渲染图，无报错 |
 
-**执行命令**：
+**执行流程**：
 
-```bash
-# 装依赖
-pip install lancedb jina
-
-# 资产入库 (build_db.py)
-# 扫描 ./assets/ 目录，对每个 .glb 用 jina-embeddings-v5-omni 生成 embedding，写入 LanceDB
-
-# 全链路 (pipeline.py)
-# 读取剧本 → LLM API 拆解 → LanceDB 检索 → 生成 Blender Python 脚本 → blender -b 执行
-python pipeline.py --script "昏暗的地下酒吧，调酒师站在吧台后面，一个客人坐在角落"
-# 输出: render_output.png
+```
+输入剧本（自然语言）
+     ↓
+LLM API（System Prompt 强制输出结构化 JSON）
+     ↓
+Python 总控脚本解析 JSON
+  ├── MPFB2 Python API → 参数化生成角色网格
+  ├── Rigify 一键生成 IK/FK 控制器
+  ├── Camera Rigs → 拉出运镜轨道 + 绑定目标
+  ├── Camera Shakify → 叠加手持摄影抖动层
+  └── Dynamic Sky → 设定环境光氛围
+     ↓
+blender -b 后台模式静默渲染 → 输出静态图 / 短片段
 ```
 
-验证标准：输入任意 3 句以内的剧本描述 → 60 秒内输出包含正确资产的 3D 场景静态渲染图。三项验证通过，流水线技术可行性确认。
+验证标准：输入任意 3 句以内的剧本描述 → 60 秒内输出包含角色和场景的 3D 渲染图。两项验证通过，流水线技术可行性确认。
 
 场景图谱化（场景元素之间的空间关系建模）是后期的事，MVP 不涉及。
 
-**硬件要求**：渲染之前不需要高配置。LanceDB + jina-embeddings-v5-omni + LLM API 调用都是轻量操作，普通机器即可。渲染阶段用独立显卡就够了——无独显亦可运行，CPU 渲染虽慢但能出结果，一天渲染一分钟宣传片完全可行。验证效果后再购置显卡。
+**硬件要求**：LLM API 调用是轻量操作，普通机器即可。渲染阶段用独立显卡就够了——无独显亦可运行，CPU 渲染虽慢但能出结果，一天渲染一分钟宣传片完全可行。验证效果后再购置显卡。
 
-### 具体案例：15 秒废土救援片段
+### 具体案例：15 秒深夜探索片段
 
-以一段 AI 视频工具生成的分镜脚本为例，展示流水线如何将叙事语言翻译为 Blender 可执行参数。
+以《迷失在白垩纪》第一章的一段分镜脚本为例，展示流水线如何将叙事语言翻译为 Blender 可执行参数。
 
 **原始分镜脚本**（节选）：
 
-> 废土城市边缘的废弃车站残区，坍塌站台、断裂铁轨、半埋车厢。昏黄风沙持续横扫，灰烬与金属碎屑在逆光中漂浮。
+> 【深夜穿越】凌晨两点，现代县城的一角突兀地出现在白垩纪荒野。路灯在浓雾中闪烁，照亮断裂的水泥路面和半埋在桫椤丛中的五菱宏光。远处丛林深处传来低沉的恐龙吼声，树冠剧烈晃动。
 >
-> 【抓取将至】极近景慢动作，电视机少女的 CRT 屏幕占据前景，红色警报急促闪烁。绷带人的巨大手掌从侧后方伸入中前景，指尖几乎贴到屏幕玻璃。
+> 【探索街道】张晓舟手持手电筒，沿着现代街道缓步前行。前景是倾斜的防盗窗和爬满苔藓的路灯杆，中景是张晓舟的背影，远景是漆黑的白垩纪丛林轮廓。手电光束在雾气中散射成锥形光柱。
 >
-> 【提灯强光爆开】暖色强光突然从画面侧后方刺入，横切手掌与屏幕之间。镜头被强光带动快速甩向废墟阴影，提灯人从倾倒车厢后方冲出，手中提灯爆发刺眼光束。风沙被照成橙黄色颗粒流。
->
-> 【穿过车站残骸】低位侧向跟拍，提灯人带少女从半埋车厢旁疾跑。前景铁片、破布、栏杆高速掠过，强动态模糊增强逃离速度。
+> 【丛林边缘】镜头从街道地面缓慢抬起，穿过桫椤树叶的缝隙，对准远处一棵巨型鳞木的树冠。树冠突然剧烈摇晃——某只大型恐龙正在穿过。张晓舟停下脚步，手电光束指向树冠方向。
 
 **第一步：RAG 资产调用与锁定**
 
 导演 Skill（LLM）看到分镜标签后，去 LanceDB 资产库里检索：
 
-- `{{Mixed 1}}`（电视机少女）→ 语义检索命中固定资产 `Mesh: TV_Girl_Lowpoly`，保证角色外观从头到尾绝对一致
-- `{{Mixed 4}}`（提灯道具）→ 检索命中 `Mesh: Lantern_Prop`（带 SpotLight 绑定的道具）
-- `废弃车站、坍塌站台` → 场景资产检索，Python 脚本直接在 3D 空间中完成"狭窄死角"布场
+- `zhang_xiaozhou`（张晓舟）→ 语义检索命中固定资产 `Mesh: ZhangXiaozhou_Adult`，保证角色外观从头到尾绝对一致
+- `flashlight_prop`（手电筒道具）→ 检索命中 `Mesh: Flashlight_Prop`（带 SpotLight 绑定的道具）
+- `cretaceous_fern`、`street_light`、`asphalt_road`、`security_fence` → 场景资产检索，Python 脚本直接在 3D 空间中完成"现代街道与远古丛林交界"布场
 
 **第二步：视听语言的参数化翻译**
 
@@ -572,9 +571,9 @@ python pipeline.py --script "昏暗的地下酒吧，调酒师站在吧台后面
 
 | 镜头 | 文学描述 | Blender 参数化指令 |
 |:--|:--|:--|
-| 镜 1 · 抓取将至 | 极近景慢动作，手掌逼近屏幕 | IK 手部控制器（`IK_Hand_L`）第 1-30 帧向 `TV_Girl` 头部坐标靠拢；物理世界 Time Stretch 模拟慢动作 |
-| 镜 2 · 提灯强光爆开 | 暖色强光突然刺入，镜头快速甩动 | `Lantern_Prop` 点光源 Energy `0→5000`；摄像机触发水平旋转（Pan）动画模拟甩镜头 |
-| 镜 4 · 穿过车站残骸 | 低位侧向跟拍，快速逃离 | 摄像机与角色坐标绑定同一运动路径（Path）；Camera Shakify 频率调高，模拟快速侧向跟拍的颠簸 |
+| 镜 1 · 深夜穿越 | 路灯在浓雾中闪烁，照亮现代街道与白垩纪丛林 | `street_light` 点光源 Energy 做 `300→50→300` 闪烁循环；`fog_density` 设为 0.15；Sun Light 角度模拟凌晨 2:00 天文方位 |
+| 镜 2 · 探索街道 | 手持跟拍，手电光束在雾气中散射 | 摄像机绑定 `zhang_xiaozhou` 背后 3 米（OTS），Camera Shakify 频率 0.8 模拟谨慎步行的呼吸起伏；`Flashlight_Prop` SpotLight Energy `0→2000` 渐亮 |
+| 镜 3 · 丛林边缘 | 镜头从地面缓慢抬起，对准远处树冠晃动 | 摄像机做垂直 Pan 动画（从 `-15°` 到 `+30°`）；远处鳞木组件设为 `visibility_mesh: hidden`，但其碰撞体仍激活——树冠晃动由 Rigid Body Physics 触发，不渲染恐龙本体 |
 
 ## "AI 味"的结构性成因
 
@@ -594,7 +593,7 @@ AI 生成模型的训练数据中此类文体占据显著比例，生成过程�
 
 **娱乐的反套路本质**：娱乐产品（电影、段子、视觉震撼）的核心是出其不意和强烈的情感共鸣。AI 擅长总结共性，但极不擅长创造"反直觉的惊喜"。
 
-**潜台词与叙事留白——悬疑氛围的结构性缺失**：悬疑的本质是间接暗示而非直接呈现——主角走在密林中，树顶的鸟突然受惊飞走（暗示巨型掠食者接近），光影在脸上剧烈晃动，最后镜头摇向惊恐的瞳孔。AI 作为概率模型天然是"显性直白"的：输入"悬疑恐怖氛围"大概率直接刷出霸王龙对屏幕咆哮，不会通过环境暗示、光影压抑和景深遮掩制造潜台词（Subtext）。3D 引擎中导演是绝对主宰——可以在角色身后放置隐藏光源，将怪兽模型的阴影拉得极长极扭曲，投射在废墟上。这种通过调光、调焦、控影对观众心理的精准操控，是概率抽卡的 AI 视频无法企及的。
+**潜台词与叙事留白——悬疑氛围的结构性缺失**：悬疑的本质是间接暗示而非直接呈现——张晓舟走在白垩纪密林中，树顶的鸟突然受惊飞走（暗示巨型掠食者接近），光影在脸上剧烈晃动，最后镜头摇向惊恐的瞳孔。AI 作为概率模型天然是"显性直白"的：输入"悬疑恐怖氛围"大概率直接刷出霸王龙对屏幕咆哮，不会通过环境暗示、光影压抑和景深遮掩制造潜台词（Subtext）。3D 引擎中导演是绝对主宰——可以在角色身后放置隐藏光源，将怪兽模型的阴影拉得极长极扭曲，投射在废墟上。这种通过调光、调焦、控影对观众心理的精准操控，是概率抽卡的 AI 视频无法企及的。
 
 **解决路径**：人类把 AI 当作高效的底层苦力——处理繁琐的 K 帧、打光、代码编写——而把核心创意、情感转折、独特审美（人类灵光）死死握在自己手里。用人类的深思熟虑去对冲 AI 的套路感。
 
@@ -751,7 +750,7 @@ AI 的"低成本"是单帧/短视频层面的错觉。进入电影工业管线�
 
 1. 给 LLM 写 System Prompt，强制输出结构化 JSON（场景风格、角色数量、动作标签、运镜轨迹）
 2. Python 总控脚本（Master Orchestrator）解析 JSON → Headless 启动 Blender → MPFB2 生成角色 → 挂载 Shakify 摄像机
-3. 输入"服务员递盘子，摄影师伸手遮挡镜头"，10 分钟内后台吐出逻辑无误、带手持晃动感的 3D 粗模分镜视频
+3. 输入"张晓舟沿着断裂的水泥路面前行，远处桫椤丛中传来恐龙低吼，树冠剧烈晃动"，10 分钟内后台吐出逻辑无误、带手持晃动感的 3D 粗模分镜视频
 
 跑通此测试即具备接活或拉投资的 Demo 能力。
 
