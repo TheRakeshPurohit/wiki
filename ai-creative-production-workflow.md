@@ -520,7 +520,7 @@ USD 是系统的升级包——当场景大到 Blender 频繁内存溢出、或�
 | 检查点 | 验证内容 | 通过标准 |
 |:--|:--|:--|
 | **LLM 拆解质量** | 输入第一章场景描述，LLM 输出包含 scene/characters/actions/camera/lighting 五个顶层字段的结构化 JSON | JSON 格式合法，字段完整，参数值在物理合理范围内 |
-| **插件整合链路** | Python 总控脚本读取 JSON → 调用 MPFB2 生成角色 → Rigify 绑定骨骼 → Camera Rigs 设定运镜 → Shakify 叠加手持抖动 → `blender -b` 命令行渲染 | 每个插件被 Python 脚本正确调用，`blender -b` 输出静态渲染图，无报错 |
+| **插件整合链路** | Python 总控脚本读取 JSON → 通过 HTTP RPC 发送到 Blender → MPFB2 生成角色 → Rigify 绑定骨骼 → Camera Rigs 设定运镜 → Shakify 叠加手持抖动 | 每个插件被 Python 脚本正确调用，Blender GUI 实时渲染出画面，无报错 |
 
 **执行流程**：
 
@@ -529,17 +529,101 @@ USD 是系统的升级包——当场景大到 Blender 频繁内存溢出、或�
      ↓
 LLM API（System Prompt 强制输出结构化 JSON）
      ↓
-Python 总控脚本解析 JSON
+Python 总控脚本解析 JSON → 通过 HTTP RPC 发送到 Blender
   ├── MPFB2 Python API → 参数化生成角色网格
   ├── Rigify 一键生成 IK/FK 控制器
   ├── Camera Rigs → 拉出运镜轨道 + 绑定目标
   ├── Camera Shakify → 叠加手持摄影抖动层
   └── Dynamic Sky → 设定环境光氛围
      ↓
-blender -b 后台模式静默渲染 → 输出静态图 / 短片段
+Blender GUI 实时渲染 → 人可观看 + AI 反复调整参数
 ```
 
-验证标准：输入任意 3 句以内的剧本描述 → 60 秒内输出包含角色和场景的 3D 渲染图。两项验证通过，流水线技术可行性确认。
+验证标准：输入任意 3 句以内的剧本描述 → Blender 画面实时更新，角色和场景出现在正确位置。两项验证通过，流水线技术可行性确认。
+
+### Blender RPC 服务端：GUI 常驻 + HTTP 驱动
+
+MVP 阶段不走 `blender -b` 无界面批处理，而是 Blender 以 GUI 模式常驻打开，AI 通过本地 HTTP RPC 驱动它。人可以实时看到画面变化，AI 可以反复调参、重渲染，形成交互式开发循环。
+
+**服务端**（Blender 内）—— `blender_server.py`：
+
+```bash
+blender -P blender_server.py   # 带 GUI 打开，同时起一个本地 HTTP 服务
+```
+
+脚本在 Blender 内开一个 HTTP 服务（端口 7788），后台线程收请求放进队列，由 `bpy.app.timers` 在主线程执行（Blender 线程安全要求）。核心操作：
+
+- `POST /run_file` → 执行整份生成的脚本（复用现有 generator 输出）
+
+fabricario 的管线定位是"剧本 → 确定性脚本 → 一次性执行"，不是 AI 逐步点算子。`run_file` 一次跑完整脚本，中间不给 AI 犯错的机会。纯 HTTP，不需要额外客户端，`curl` 就能调。
+
+**客户端**（AI / pipeline）—— 扩展 `pipeline.py` 加 `--connect`：
+
+```bash
+python pipeline.py --script "深夜白垩纪丛林边缘的现代县城街道" --connect 127.0.0.1:7788
+```
+
+不再 subprocess 起 blender，而是把生成的脚本发到已打开的 Blender 里执行，画面实时更新，可反复调整。
+
+**两条路径并存**：
+
+| 路径 | 命令 | 用途 |
+|:--|:--|:--|
+| GUI + RPC | `blender -P blender_server.py` + `pipeline.py --connect` | 开发迭代、交互式调试、实时预览 |
+| Batch 模式 | `blender -b scene.blend -P script.py` | 最终批量渲染、CI/CD 自动化 |
+
+**备选路线：Blender MCP**
+
+[Blender MCP](https://github.com/ahujasid/blender-mcp)（25k+ stars，MIT）提供标准 MCP 协议驱动 Blender，粒度是单个算子（建方体、设材质、加灯光），适合 AI 交互式探索场景。fabricario 当前是"确定性生成 → 一次性执行"的管线，`run_file` 粒度更匹配。MCP 可作为远期路线——若后续需要 AI 交互式微调场景（人在环中逐步调整），MCP 的单算子粒度更灵活。
+
+### 容器化部署：Ubuntu 兜底驱动，NixOS 锁定环境
+
+生产环境的容器化策略：host 用 Ubuntu 处理 GPU 驱动兼容性，容器用 NixOS 保证 Blender 环境与 workstation 一致。
+
+```
+┌─────────────────────────────────────┐
+│  NixOS 容器                          │
+│  Blender + 插件 + pipeline           │
+│  （声明式定义，和 workstation 一致）    │
+├─────────────────────────────────────┤
+│  nvidia-container-toolkit 透传       │
+│  （自动挂载 host 的 CUDA 库 + GPU 设备）│
+├─────────────────────────────────────┤
+│  Ubuntu 云服务器（host）              │
+│  nvidia-driver + CUDA toolkit        │
+│  （驱动兼容性由 Ubuntu 生态兜底）       │
+└─────────────────────────────────────┘
+```
+
+**分层逻辑**：
+
+| 层 | 选型 | 职责 |
+|:--|:--|:--|
+| **Host** | Ubuntu 22.04 + NVIDIA 驱动 | GPU 驱动安装、CUDA toolkit、硬件兼容性——Ubuntu 生态在这层最成熟，`apt install nvidia-driver-535` 一步到位 |
+| **Container** | NixOS（通过 `dockerTools.buildLayeredImage` 打包） | Blender、Python 依赖、pipeline 脚本——和 workstation 用同一套 Nix 表达式定义，版本锁定，不会漂移 |
+| **透传层** | `nvidia-container-toolkit` | 将 host 的 CUDA 库和 GPU 设备挂载进容器，容器内无需安装驱动 |
+
+**构建 OCI 镜像**（NixOS 端）：
+
+```nix
+pkgs.dockerTools.buildLayeredImage {
+  name = "blender-server";
+  tag = "latest";
+  contents = [ pkgs.blender pkgs.python3 /* 其他依赖 */ ];
+  config = {
+    Cmd = [ "${pkgs.blender}/bin/blender" "-P" "/app/server.py" ];
+    ExposedPorts = { "7788/tcp" = {}; };
+  };
+};
+```
+
+**运行**（Ubuntu host 端）：
+
+```bash
+docker run --gpus all -p 7788:7788 blender-server
+```
+
+**一致性链路**：workstation NixOS 定义 Blender 环境 → 同一份 Nix 表达式打包成 OCI 镜像 → 部署到任何 Ubuntu GPU 服务器。Blender 版本、插件、Python 依赖全部由 Nix 锁定，host 的 Ubuntu 只负责硬件兼容，两层职责清晰不交叉。
 
 场景图谱化（场景元素之间的空间关系建模）是后期的事，MVP 不涉及。
 
@@ -749,7 +833,7 @@ AI 的"低成本"是单帧/短视频层面的错觉。进入电影工业管线�
 不要一开始就拍大电影。用一个周末跑通"文字 → 3D 粗糙样片（Animatic）"闭环：
 
 1. 给 LLM 写 System Prompt，强制输出结构化 JSON（场景风格、角色数量、动作标签、运镜轨迹）
-2. Python 总控脚本（Master Orchestrator）解析 JSON → Headless 启动 Blender → MPFB2 生成角色 → 挂载 Shakify 摄像机
+2. Python 总控脚本（Master Orchestrator）解析 JSON → 通过 HTTP RPC 连接已打开的 Blender → MPFB2 生成角色 → 挂载 Shakify 摄像机
 3. 输入"张晓舟沿着断裂的水泥路面前行，远处桫椤丛中传来恐龙低吼，树冠剧烈晃动"，10 分钟内后台吐出逻辑无误、带手持晃动感的 3D 粗模分镜视频
 
 跑通此测试即具备接活或拉投资的 Demo 能力。
