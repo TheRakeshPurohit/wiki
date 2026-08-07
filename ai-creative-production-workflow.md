@@ -871,6 +871,7 @@ AI 的"低成本"是单帧/短视频层面的错觉。进入电影工业管线�
 
 本文档与以下分析形成互补：
 
+- **[风口的三种姿态](windfall-arbitrage.md)**：渠道控制者、有准备的人、投机者的对比
 - **[AI 时代商业模式](ai-era-business-models.md)**：AI 时代价值锚点从交付物移到判断力
 - **[3D 工具能否替代 2D 工具](blender-replace-2d-tools.md)**：3D 工具对 2D 工具的单向包含关系
 - **[LLM 基础认知框架](llm-fundamentals.md)**：LLM 的能力边界与涌现机制

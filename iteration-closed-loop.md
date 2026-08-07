@@ -268,5 +268,5 @@ J 的模式本质上是在别人的迭代周期里套利——等工具成熟后
 
 - **[Agent 复利](agent-compound-interest.md)**：持久化如何改变 AI 工具的本质——启动后的积累才是真正的杠杆
 - **[LLM 基础认知框架](llm-fundamentals.md)**：LLM 的能力边界与涌现机制
-- **[AI 时代商业模式](ai-era-business-models.md)**：风口套利与知识复利的对比
+- **[风口的三种姿态](windfall-arbitrage.md)**：渠道控制者、有准备的人、投机者的对比
 - **[AI 辅助视频制作工作流](ai-creative-production-workflow.md)**：案例中 O/J 的完整背景
