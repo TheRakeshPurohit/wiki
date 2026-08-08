@@ -630,7 +630,7 @@ ctx.metadata.get("global_counter")     // 获取全局唯一 ID
           任意 Pod 可服务（S3 是真理源）
 ```
 
-**为什么是默认推荐**：写入性能与 Fjall 相同（都是 MemTable 攒批），但 S3 处理复制（成本低 20 倍），计算节点无状态，运维最简单。Fjall 仅在不能用 S3 时（私有化、离线）考虑。
+**为什么是默认推荐**：写入性能与 Fjall 相同（都是 MemTable 攒批），但 S3 处理复制（成本低 20 倍），计算节点无状态，运维最简单。Fjall 仅在不能用 S3 时（私有化、离线）考虑，且在大 Value 场景（KV 分离）、复杂本地事务、极致本地性能方面有结构性优势。Fjall 官方无 S3 支持计划。
 
 **Actor 状态读写**：§2.3 的 `ctx.state` 接口不变。SlateDB 的 Block Cache 命中时延迟仍在 μs 级（热数据），未命中时退化为 ms（S3 Range Get）。Agent 场景的热数据（最近对话）天然驻留 Block Cache，冷数据（历史记录）的 ms 级延迟可接受。
 

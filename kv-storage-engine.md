@@ -1353,6 +1353,39 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 **判定**：SlateDB 是大部分场景的默认选择。Fjall 逐渐变成 niche 选择——只有在明确"不用 S3"的需求时（私有化、离线、成本敏感）才选它。两者的性能差距比通常认知的小：写入都是 MemTable 攒批，读取热数据都是本地缓存。真正的差距在部署模型和存储成本。
 
+### Fjall 的差异化优势（即使 SlateDB 支持本地存储）
+
+即使 SlateDB 未来完美支持本地存储，Fjall 在以下方面仍有结构性优势：
+
+**1. KV 分离（Value Log）**：Fjall 内置 `value-log` 组件（灵感来自 RocksDB 的 BlobDB/Titan）。写入大 Value（图片/文档/音频）时，Value 分离存储到单独文件，LSM-Tree 只保留 Key + 指针。极大降低写放大，大对象场景本地写入和 Compaction 性能远超 SlateDB。
+
+**2. 更成熟的事务支持**：Fjall 内置可串行化事务（Serializable Transactions）及乐观/单写者事务模型（`OptimisticTxDatabase` / `SingleWriterTxDatabase`）。多并发本地事务控制、多 Keyspace 跨空间原子提交方面，更接近成熟本地 RDBMS 核心。
+
+**3. 极致本地优化**：Fjall 3.0 对本地磁盘 Block 格式彻底重构——稀疏索引（Sparse Indexing）、前缀截断、布隆过滤器分区、可选哈希索引（Hash Index）。未命中缓存时，本地磁盘随机点查和范围扫描快 2-100 倍，内存开销极低。
+
+**4. 基因纯正**：SlateDB 的核心设计是 "Zero-Disk"（零本地盘依赖），并发锁、Fencing、Flush 策略都围绕网络对象存储延迟优化。即使支持本地写入，这些架构包袱（如因适配网络而做的激进 Batching 导致的即时持久化延迟）很难完全抹除。Fjall 100% 为本地 NVMe/SSD 吞吐量和 OS 文件系统设计。
+
+### Fjall 的 S3 计划
+
+**官方没有原生 S3 支持计划**。Fjall 定位为嵌入式单机存储引擎（纯 Rust 版 RocksDB/LevelDB），保持核心库轻量、确定性、100% Safe Rust。社区有间接方案：通过 VFS 对接 Apache OpenDAL 或 `s5_store_fjall` 将底层存储映射到 S3。
+
+### 选择标准（更新）
+
+```
+能用 S3 吗？
+│
+├── 能 → SlateDB（默认选择）
+│   无限存储，S3 处理复制，运维简单
+│
+└── 不能 → Fjall
+    私有化部署 / 离线环境 / 不接受 S3 成本
+    ↓
+    需要以下特性时 Fjall 优势明显：
+    • 大 Value 场景（KV 分离降低写放大）
+    • 复杂本地事务（可串行化/多 Keyspace 原子提交）
+    • 极致本地性能（稀疏索引/哈希索引/布隆过滤器）
+```
+
 ### 分布式场景：TiDB 的强一致选择
 
 TiDB 是第三条路径——不走 S3，用 Raft 在本地 KV 之上做强一致复制。它不是 Fjall + Raft 的简单组合，而是完整的分布式数据库架构：
