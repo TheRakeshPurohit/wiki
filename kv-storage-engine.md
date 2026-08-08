@@ -5,6 +5,82 @@
 **架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall+Raft / SlateDB+S3）
 **Cross-ref:** [Redis 批判](../redis-critique.md) — Redis 为何被 KV 替代
 
+## KV 的基本 API
+
+KV 存储引擎的接口极简，只有四个操作：
+
+```
+put(key, value)              ← 增/改（Key 不存在则创建，存在则覆盖）
+get(key)                     ← 查（点查，O(log N)）
+delete(key)                  ← 删（标记删除，Compaction 时回收）
+scan(prefix) / range(a, b)   ← 前缀扫描 / 范围扫描（有序迭代）
+```
+
+**Value 是不透明的字节 blob**。引擎不关心里面是什么格式、有哪些字段、如何序列化。所有 Value 内部的操作（取字段、修改字段、追加数据）都在应用层完成。
+
+与 SQL 的对应关系：
+
+| SQL | KV 等价操作 |
+|:---|:---|
+| `INSERT INTO t VALUES (...)` | `put(key, value)` |
+| `SELECT col FROM t WHERE id=1` | `get(key)` → 应用层反序列化 → 取字段 |
+| `DELETE FROM t WHERE id=1` | `delete(key)` |
+| `UPDATE t SET col=col+1 WHERE id=1` | `get` → 应用层修改 → `put`（**非原子**） |
+| `SELECT * FROM t WHERE name='alice'` | 没有等价操作（需要二级索引 Key） |
+| `JSON_SET(col, '$.field', val)` | 没有等价操作（Value 是字节，无内部结构感知） |
+
+**KV 没有 Value 内部操作**。SQL 有 `UPDATE SET col=col+1`、`JSON_SET`、`ARRAY_APPEND`——KV 全部没有。这是 KV 的极简哲学：引擎只负责存取字节，所有 Value 操作都在你的代码里。
+
+**唯一的原子性保障**：部分引擎提供 Key 级别的原子操作：
+
+| 引擎 | 原子操作 | 粒度 |
+|:---|:---|:---|
+| **Fjall** | Batch 原子写入 + 事务（MVCC 乐观锁） | 多 Key 一次提交 |
+| **RocksDB** | `merge`（自定义合并函数，如 counter 递增） | 单 Key |
+| **etcd** | `compare_and_swap`（CAS，条件更新） | 单 Key |
+
+这些是 **Key 级别的原子性**，不是 Value 内部的操作。"加字段"、"删字段"、"加索引"全部是应用层逻辑——KV 只负责存取字节。
+
+### 复杂度与物理 I/O
+
+#### get(key)：O(log N)，与 B-Tree 同阶，物理路径不同
+
+| | B-Tree | LSM-Tree |
+|:---|:---|:---|
+| 查找路径 | root → leaf，固定 3-4 层（B=256，N=10亿） | MemTable → L0 → L1 → ... → Ln |
+| 每层操作 | 二分查找页面内 key | 二分查找 SSTable 索引 + Bloom Filter 过滤 |
+| 磁盘 I/O | 3-4 次（每层一次页面读取） | 1-3 次（Bloom Filter 跳过大部分 SSTable） |
+| 确定性 | 高（路径固定） | 低（取决于 Bloom Filter 命中率） |
+
+B-Tree 的 O(log_B N) 是精确的——root 到 leaf 路径长度固定。LSM-Tree 的 O(log N) 是近似——取决于 levels 数量和 Bloom Filter 效果。正面查找（key 存在）时 LSM-Tree 通常更快，反面查找（key 不存在）时 B-Tree 更确定。都是 O(log N)，但 B-Tree 常数更可预测，LSM-Tree 常数通常更小（读场景）。
+
+#### scan(prefix)：O(log N + K)，先定位再顺序迭代
+
+```
+scan("inv:hello:")
+│
+├── 1. 定位起始位置：O(log N)
+│   在 MemTable + 各层 SSTable 中找到第一个 ≥ "inv:hello:" 的 key
+│   （每个 SSTable 的索引二分查找）
+│
+└── 2. 顺序迭代：O(K)
+    K = 匹配前缀的 key 数量
+    MergeIterator 合并多个 SSTable 的有序流，每次 advance 取最小 key
+    直到 key 不再匹配前缀
+```
+
+迭代是**顺序 I/O**，不是随机 I/O。SSTable 是有序的，scan 只是在有序流上向后移动指针。顺序读比随机读快 10-100 倍（HDD 上差距巨大，SSD 上也有数倍差距）。
+
+#### 操作复杂度汇总
+
+| 操作 | 复杂度 | 物理 I/O |
+|:---|:---|:---|
+| `get(key)` | O(log N) | 随机读 1-3 次 |
+| `scan(prefix)` 定位 | O(log N) | 随机读 1-3 次 |
+| `scan(prefix)` 迭代 | O(K) | 顺序读 K 条 |
+| `put(key, value)` | O(log N) | 写 MemTable（内存），flush 时顺序写 SSTable |
+| `delete(key)` | O(log N) | 写 tombstone 标记，Compaction 时回收 |
+
 ## 核心论点
 
 三个认知转变颠覆了 Redis 作为核心基础设施的范式：
@@ -803,6 +879,149 @@ fn decode(buf: &[u8]) -> Record {
 | 字段重命名 | `ALTER TABLE RENAME COLUMN` | 新 Version 编码（KV 里没有"列名"概念） |
 
 **判定**：KV 的 DDL 不存在于存储引擎层，而是应用层的编码约定 + 通用迁移工具。版本化编码让变更成本从"必须立即回填"降到"可以推迟"，迁移工具让回填成本从"手写脚本"降到"一行命令"。
+
+### KV 之上的多模型能力：向量搜索、全文检索、图查询
+
+三个能力都是 KV 之上的编码模式——用 Key 前缀模拟数据结构，用 Value 编码存储数据，用 scan 模拟遍历。算法库提供计算逻辑，KV 提供持久化和扫描。
+
+#### 1. 向量搜索（DiskANN / HNSW）
+
+**编码模式**：
+```
+vec:{id}              → [float32 × dims]       ← 向量本体
+graph:{id}            → [u32 × K]              ← 图邻接表（K 个邻居 ID）
+meta:entry_point      → [u32]                   ← 图入口节点
+```
+
+**查询流程**（贪心搜索）：
+1. 从 entry_point 出发
+2. `get(graph:{current})` 拿到 K 个邻居
+3. 批量 `batch.get([vec:{n1}, vec:{n2}, ...])` 取向量
+4. 计算距离，贪心跳转到最近邻
+5. 重复直到收敛
+
+**现有算法库**：
+
+| 库 | 算法 | 集成方式 |
+|:---|:---|:---|
+| **usearch** | HNSW + Vamana（DiskANN 同族） | FFI 链接，图存 KV |
+| **arroy** | HNSW（Meilisearch 内核） | 直接依赖 |
+
+库负责建图和距离计算，KV 负责持久化图结构。`usearch` 的 `add()` 和 `search()` 是纯算法，不绑定存储——可以把内部数据结构 dump 到 KV，加载时从 KV 读回。
+
+#### 2. 全文搜索（BM25）
+
+**编码模式**：
+```
+fwd:{doc_id}           → [{term₁, [0,2]}, {term₂, [1]}]     ← 正排索引
+inv:{term}:{doc_id}    → [tf, [positions]]                     ← 倒排索引
+meta:df:{term}         → [u32]                                  ← 文档频率
+meta:avg_dl            → [f32]                                  ← 平均文档长度
+meta:doc_count         → [u32]                                  ← 总文档数
+```
+
+**倒排索引的值**：`inv:hello:42 → [2, [0,2]]` 表示词 "hello" 在文档 42 中出现了 2 次（TF=2），分别在位置 0 和 2。BM25 打分需要 TF，位置列表用于短语查询和高亮定位。
+
+**一个文档拆 N 个 Key**：文档 "hello world hello"（doc_id=42）产生：
+```
+fwd:42          → [{hello, [0,2]}, {world, [1]}]
+inv:hello:42    → [2, [0,2]]
+inv:world:42    → [1, [1]]
+```
+
+一个含 100 个唯一词的文档 = 100 个倒排 Key。这是倒排索引的本质——按词拆分，不是按文档存储。插入时 Key 分散在 key 空间不同位置（"foo" 区域、"hello" 区域、"world" 区域），是天然乱序的。但 LSM-Tree 的 MemTable 是排序结构，无论写入顺序如何，flush 到 SSTable 时都是有序的——这是 LSM-Tree 相比 B-Tree 的核心优势。
+
+**查询流程**：
+1. 分词：`"hello world"` → `["hello", "world"]`
+2. 批量查倒排：`batch.get([inv:hello:*, inv:world:*])` → doc_id 列表
+3. BM25 打分：`score = Σ IDF(term) × (tf × (k1+1)) / (tf + k1 × (1 - b + b × dl/avg_dl))`
+4. 堆排序取 Top-K
+
+**BM25 打分**：核心公式十几行代码，不需要库。需要的是分词：
+
+| 库 | 用途 |
+|:---|:---|
+| **jieba-rs** | 中文分词（Rust 绑定 jieba） |
+| **tantivy** | 内置分词+BM25+高亮，可整体复用，也可只取 BM25 模块 |
+
+英文按空格分词，中文需要 jieba 分词或 n-gram（简单但准确度低）。停用词过滤是应用层逻辑——维护一个 HashSet，分词后过滤掉。搜索本身就是 KV 的能力：分词 → 查倒排 → BM25 打分 → 排序，不需要额外的搜索引擎。
+
+#### 3. 图数据存储与查询
+
+**编码模式（属性图，每边一个 Key）**：
+```
+node:{type}:{id}           → [properties msgpack]      ← 节点属性
+edge:{src}:{label}:{dst}   → [properties msgpack]      ← 边属性
+adj:{src}:{label}:{dst}    → []                         ← 正向邻接（值为空，Key 本身编码了关系）
+radj:{dst}:{label}:{src}   → []                         ← 反向邻接
+idx:{type}:{prop}:{val}    → [u32 × N]                  ← 二级索引
+```
+
+**为什么每边一个 Key，而不是邻接表合并在一个 Value**：
+
+```
+// ❌ 单 Key 邻接表
+adj:alice:knows → [bob, charlie]
+// 加边需要 read-modify-write：get → append → put，需事务
+
+// ✅ 每边一个 Key
+adj:alice:knows:bob     → []
+adj:alice:knows:charlie → []
+adj:alice:knows:dave    → []    ← 新增，直接 put，原子操作
+```
+
+| 操作 | 单 Key 邻接表 | 每边一个 Key |
+|:---|:---|:---|
+| 加边 | get → append → put（3 次，需事务） | put（1 次，原子） |
+| 删边 | get → remove item → put（3 次，需事务） | remove（1 次，原子） |
+| 查邻居 | get（1 次，O(1)） | scan prefix（O(K)，K=扇出） |
+| 并发安全 | 需要事务/锁 | 天然安全 |
+| Key 数量 | N 节点 = N Key | N 边 = N Key |
+
+每边一个 Key 是标准做法。Redis Graph 模块、Neo4j 存储层全是这个模式。单 Key 邻接表的唯一优势是"一次 get 拿全部邻居"，但代价是加边/删边需要事务，得不偿失。
+
+**查询示例**（"Alice 的朋友的朋友中住在北京的"）：
+```
+1. scan(adj:alice:knows:)                   → [bob, charlie]
+2. batch.get([adj:bob:knows:, adj:charlie:knows:])  → [[dave, eve], [frank]]
+3. batch.get([node:person:dave, node:person:eve, node:person:frank])
+4. filter where city == "北京"
+```
+
+多跳查询 = 多轮 scan/batch.get，每轮 O(K × log N)，K 是扇出。和 SurrealDB 的图遍历本质相同——没有查询语言包装，但物理路径一致。
+
+图查询本身就是 KV 的编码模式——`scan(adj:...) → batch.get(nodes) → filter → 递归`，不需要库。只有复杂图算法才需要依赖：
+
+| 库 | 用途 |
+|:---|:---|
+| **petgraph** | PageRank、社区发现、最短路径、连通分量等算法 |
+
+查询时从 KV 加载子图到 petgraph 跑算法，结果写回 KV。简单的 BFS/DFS/多跳穿透直接在 KV 层实现，不需要加载到内存图结构。
+
+#### 整体架构
+
+```
+┌─────────────────────────────────────────────────┐
+│  应用层                                         │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ 向量搜索  │ │ 全文搜索  │ │ 图查询    │        │
+│  │ usearch  │ │ tantivy  │ │ petgraph │        │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘        │
+│       │            │            │               │
+│  ┌────┴────────────┴────────────┴─────┐         │
+│  │  编码层（Key/Value Schema）         │         │
+│  │  vec: / graph: / fwd: / inv: / adj:│         │
+│  └────────────────┬───────────────────┘         │
+├───────────────────┼─────────────────────────────┤
+│  KV 存储层         │                             │
+│  ┌────────────────┴───────────────────┐         │
+│  │  Fjall / SlateDB / RocksDB         │         │
+│  │  scan / get / batch / remove       │         │
+│  └────────────────────────────────────┘         │
+└─────────────────────────────────────────────────┘
+```
+
+三个能力都是 KV 之上的编码模式，不是新存储引擎。组合起来就是一个多模型数据库——和 SurrealDB 的架构同源，只是没有查询语言层。
 
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 
