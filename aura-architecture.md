@@ -618,13 +618,7 @@ distribution = "raft" # 或 "s3"
 
 → 详见 [Redis 批判：RESP 协议 vs 二进制序列化](redis-critique.md#8-resp-协议-vs-二进制序列化嵌入式架构的物理优势)。Fjall 的 API 设计和与其他引擎的对比见 [KV 存储引擎架构 §三引擎 API 对比](kv-storage-engine.md#三引擎-api-对比fjall--slatedb--surrealkv)。
 
-### 5.5 核心源码实现：Openraft 状态机挂载 Fjall
-
-→ 完整源码见 [OKM 文档 §Openraft 状态机集成](object-keyspace-mapping.md#openraft-状态机集成)。AuraStorage trait 和双轨实现见本节 §5.1。
-
-### 5.6 SlateDB + S3 模式
-
-云原生替代路径：去掉 Raft，计算节点无状态，S3 为真理源。
+### 5.5 SlateDB + S3 模式（默认推荐）
 
 ```
 [Client] → [无状态 gRPC Pod] → [SlateDB] → [S3 桶]
@@ -632,20 +626,13 @@ distribution = "raft" # 或 "s3"
           任意 Pod 可服务（S3 是真理源）
 ```
 
-**与 Fjall + Raft 模式的差异**：
+**为什么是默认推荐**：写入性能与 Fjall 相同（都是 MemTable 攒批），但 S3 处理复制（成本低 20 倍），计算节点无状态，运维最简单。Fjall 仅在不能用 S3 时（私有化、离线）考虑。
 
-| 维度 | Fjall + Raft | SlateDB + S3 |
-|:--|:--|:--|
-| 真理源 | 本地 NVMe（Raft 多数派确认） | S3 桶（11 个 9 可靠性） |
-| 写延迟 | μs 级（本地 I/O） | μs（本地 WAL）→ ms（S3 flush 异步） |
-| Scale-to-Zero | 需保护本地磁盘 | 销毁 Pod 即可，S3 持久 |
-| 跨区域复制 | Raft 跨机房（复杂） | S3 CRR（配置项） |
-| ACID 批处理 | 成熟（WriteBatch） | 快速演进中 |
-| 私有化部署 | 原生支持 | 需 MinIO/Ceph 替代 S3 |
+**Actor 状态读写**：§4.3 的 `ctx.state` 接口不变。SlateDB 的 Block Cache 命中时延迟仍在 μs 级（热数据），未命中时退化为 ms（S3 Range Get）。Agent 场景的热数据（最近对话）天然驻留 Block Cache，冷数据（历史记录）的 ms 级延迟可接受。
 
-**SlateDB 模式下的 AuraActor 状态读写**：§4.3 的 `ctx.state` 接口不变。SlateDB 的 Block Cache 命中时延迟仍在 μs 级（热数据），未命中时退化为 ms（S3 Range Get）。Agent 场景的热数据（最近对话）天然驻留 Block Cache，冷数据（历史记录）的 ms 级延迟可接受。
+**Durability**：SlateDB 的 WAL 在本地磁盘，节点磁盘丢失时需等 S3 flush 完成才能恢复——flush 前的窗口期存在数据丢失风险。对于 Agent 场景（对话数据可重建），这个风险通常可接受。
 
-**Durability 差异**：Fjall 的 WAL 在本地磁盘，崩溃后可恢复。SlateDB 的 WAL 也在本地磁盘，但节点磁盘丢失时需等 S3 flush 完成才能恢复——flush 前的窗口期存在数据丢失风险。对于 Agent 场景（对话数据可重建），这个风险通常可接受。
+**Openraft 状态机集成**：当需要 Actor 状态强一致复制时（TiDB 模式），Openraft 状态机挂载 Fjall 的实现见 [OKM 文档 §Openraft 状态机集成](object-keyspace-mapping.md#openraft-状态机集成)。详见 [共识协议文档](consensus-protocol.md)。
 
 ### 5.7 配置与工作量评估
 

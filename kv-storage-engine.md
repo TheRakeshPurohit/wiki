@@ -1220,7 +1220,7 @@ tx.commit()?;
 
 ### 10.6 SQLite vs 嵌入式 KV：开源项目的隐形代价
 
-SQLite 是软件工程的奇迹，但大量开源项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。当查询模式固定时（配置映射、路由表、会话缓存、容器元数据），嵌入式 KV 在三个维度上产生系统性优势：
+SQLite 是软件工程的奇迹，但大量项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。当查询模式固定时，嵌入式 KV 在三个维度上产生系统性优势：
 
 **C 语言依赖与交叉编译**。SQLite 是 C 写的。Rust 项目引入 rusqlite 绑定后，用户机器必须安装 C 编译器（gcc/clang）。交叉编译（Mac → Linux ARM64）时 C 工具链是主要阻塞源。纯 Rust KV 引擎（Fjall）几秒内编译出静态链接的单一二进制，零外部依赖。
 
@@ -1228,7 +1228,26 @@ SQLite 是软件工程的奇迹，但大量开源项目引入它，仅仅是因�
 
 **写锁线程阻塞**。SQLite 使用数据库级排他锁写入。高并发多线程场景（网关、Agent 服务）频繁触发 `SQLITE_BUSY`，线程挂起等待。纯 Rust KV 引擎通过无锁 MemTable（跳表/基数树）吸收并发写，多核并行无阻塞。
 
-**现实案例**：
+#### CLI 工具场景：Fjall vs SQLite
+
+| | Fjall | SQLite |
+|:---|:---|:---|
+| 嵌入式 | ✅ 进程内，零配置 | ✅ 进程内，零配置 |
+| 单文件 | ❌ 目录（多个 SSTable） | ✅ 单个 .db 文件 |
+| ACID | ✅ WAL | ✅ WAL |
+| 写性能 | 更好（LSM-Tree，无写锁） | 较差（B-Tree，写锁竞争） |
+| 并发写 | 好（多线程无锁） | 差（单写者） |
+| SQL | ❌ 纯 KV | ✅ |
+| 跨语言 | Rust only | C/Python/Go/Node 所有语言 |
+| 备份 | 复制目录 | 单文件复制 |
+
+**选 Fjall 的场景**：纯 Rust CLI、数据是 key-value（缓存/索引/配置/状态）、写入密集。LSM-Tree 的写入性能比 SQLite 的 B-Tree + 写锁高一个数量级。
+
+**仍选 SQLite 的场景**：需要 SQL 查询（JOIN/聚合）、需要单文件（`.db` 拷贝即备份）、需要跨语言绑定、需要成熟生态（ORM/GUI 客户端/迁移工具）。
+
+**判定**：纯 Rust CLI 工具，Fjall 是 SQLite 的更好替代——零 C 依赖、无写锁、写入更快。如果不是纯 Rust、需要 SQL 或跨语言，SQLite 仍是更务实的选择。
+
+#### 开源基础设施案例
 
 | 项目 | 选择 | 理由 |
 |:--|:--|:--|
@@ -1244,7 +1263,7 @@ Key: cfg:{app_name}:{config_key}  →  Value: [原始二进制]
 
 `save_config` = 一次 `put`，无 SQL 解析。`get_all_app_configs` = 一次 `prefix_scan("cfg:{app_name}:")`，无查询计划生成。代码即最高效的执行计划——LSM-Tree 的字典序迭代器直接在 SSTable 上顺序扫描。
 
-**判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。当项目生命周期和功能边界在设计阶段就已高度固定时，SQL 翻译层只是在增加编译痛苦和 RAM 消耗。
+**判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。纯 Rust CLI 工具选 Fjall，跨语言/需要 SQL 选 SQLite。
 
 ## 11. 两条架构路径：Fjall vs SlateDB
 
@@ -1295,33 +1314,44 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 | | Fjall | SlateDB |
 |:---|:---|:---|
-| 写入目标 | 本地 NVMe（MemTable → WAL） | S3（MemTable → flush → S3 PUT） |
-| 写延迟 | < 1ms（本地 I/O） | 1-10ms（S3 PUT 延迟） |
-| 崩溃恢复 | WAL 回放 | S3 重放 WAL |
+| 写入目标 | 本地 NVMe（MemTable → WAL） | MemTable（内存）→ 异步 flush 到 S3 |
+| MemTable 写入 | μs（本地） | μs（本地，与 Fjall 相同） |
+| Flush | 后台写本地 SSTable | 后台写 S3 SSTable |
+| 写延迟（用户感知） | μs（MemTable） | μs（MemTable），flush 异步不阻塞 |
+
+**两者写入路径本质相同**：都是 MemTable 攒批 → 异步 flush 为 SSTable。区别只是 flush 目标（本地 vs S3），flush 是后台异步操作，不阻塞写入。写延迟差距比通常认知的小。
 
 **读取路径**：
 
 | | Fjall | SlateDB |
 |:---|:---|:---|
-| 热数据 | MemTable/SSTable → 本地 I/O → < 1ms | 本地缓存（block cache + SST cache） → < 1ms |
-| 冷数据 | 本地 SSTable（L2+ 仍在磁盘） → 本地 I/O | S3 GET → 10-100ms |
+| 热数据 | 本地 SSTable → μs | 本地缓存（block cache + SST cache） → μs |
+| 冷数据 | 本地磁盘 → μs | S3 GET → ms |
 | 数据量上限 | 本地磁盘大小 | 无限（S3） |
 
-**核心差异**：写延迟。Fjall 写本地 NVMe（<1ms），SlateDB 写 S3（1-10ms）。读路径两者相同——热数据都走本地缓存，冷数据 SlateDB 走 S3。Fjall 的冷数据仍在本地磁盘，所以不走网络，但容量受磁盘限制。
+**核心差异不在性能，在部署模型**：
+
+| | Fjall | SlateDB |
+|:---|:---|:---|
+| S3 依赖 | 无（离线可用） | 必需 |
+| S3 API 成本 | 无 | 有（PUT/GET/传输费） |
+| 存储上限 | 本地磁盘 | 无限 |
+| 复制 | 需自己处理（Raft/备份） | S3 内部处理 |
+| 运维 | 自管磁盘 | 无状态计算 + S3 |
 
 ### 选择标准
 
 ```
-需要 S3 / 无限存储 / 无状态计算？
+能用 S3 吗？
 │
-├── 是 → SlateDB
-│   写延迟可接受 1-10ms，运维简单
+├── 能 → SlateDB（默认选择）
+│   无限存储，S3 处理复制，运维简单
 │
-└── 否 → Fjall
-    写延迟 < 1ms，私有化部署，自管磁盘
+└── 不能 → Fjall
+    私有化部署 / 离线环境 / 不接受 S3 成本
 ```
 
-**判定**：两个引擎解决不同问题，不要混用。Fjall = 纯本地，低延迟，容量受磁盘限制。SlateDB = S3 原生，写延迟稍高，容量无限。需要 S3 时不要在 Fjall 上加冷数据卸载——那是在错误的引擎上做正确的功能。直接用 SlateDB。
+**判定**：SlateDB 是大部分场景的默认选择。Fjall 逐渐变成 niche 选择——只有在明确"不用 S3"的需求时（私有化、离线、成本敏感）才选它。两者的性能差距比通常认知的小：写入都是 MemTable 攒批，读取热数据都是本地缓存。真正的差距在部署模型和存储成本。
 
 ### 分布式场景：TiDB 的强一致选择
 

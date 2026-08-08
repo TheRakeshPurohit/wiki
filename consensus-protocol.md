@@ -317,6 +317,20 @@ TiKV 节点（每个节点存一部分 region）
 
 → 分布式 KV 架构选型详见 [KV 存储引擎](kv-storage-engine.md) §11。
 
+### 6.4 Fjall + Raft vs SlateDB + S3：存储架构对比
+
+| 维度 | Fjall + Raft | SlateDB + S3 |
+|:--|:--|:--|
+| 真理源 | 本地 NVMe（Raft 多数派确认） | S3 桶（11 个 9 可靠性） |
+| 写延迟 | μs 级（MemTable，与 SlateDB 相同） | μs 级（MemTable，与 Fjall 相同） |
+| 存储成本 | 3x（Raft 副本）+ 本地 SSD 单价 | 1x（S3 内部复制）+ S3 单价（低 20 倍） |
+| Scale-to-Zero | 需保护本地磁盘 | 销毁 Pod 即可，S3 持久 |
+| 跨区域复制 | Raft 跨机房（复杂） | S3 CRR（配置项） |
+| 运维复杂度 | 高（Raft 集群 + 分片） | 低（无状态计算 + S3） |
+| S3 依赖 | 无 | 必需 |
+
+**判定**：两者写入性能本质相同（都是 MemTable 攒批）。差距在部署模型和成本——SlateDB + S3 的存储成本低 20 倍，运维简单，是大部分场景的默认选择。Fjall + Raft 仅在不能用 S3 时（私有化、离线）考虑。
+
 ---
 
 ## 交叉引用
