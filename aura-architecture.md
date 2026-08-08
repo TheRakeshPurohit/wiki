@@ -559,13 +559,24 @@ distribution = "raft" # 或 "s3"
 
 **Actor 完全不感知底层引擎**——`ctx.state.get("history")` 的调用方式不变，底层是 Fjall 同步返回还是 SlateDB 从 Block Cache 命中，对 Actor 透明。
 
-→ 两条架构路径的完整对比见 [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3)。三引擎（Fjall/SlateDB/SurrealKV）的 API 差异和选型指南见 [KV 存储引擎架构 §三引擎 API 对比](kv-storage-engine.md#三引擎-api-对比fjall--slatedb--surrealkv)。
+→ 两条架构路径的完整对比见 [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall-vs-slatedb)。三引擎（Fjall/SlateDB/SurrealKV）的 API 差异和选型指南见 [KV 存储引擎架构 §三引擎 API 对比](kv-storage-engine.md#三引擎-api-对比fjall--slatedb--surrealkv)。
 
 ### 5.2 从单体 PostgreSQL 到分布式存算一体的逻辑跃迁
 
 虽然 PostgreSQL 的 JSONB 聚合已经替代了外部缓存，但在某些极端场景下（如智能体状态高度 KV 化、需要多节点强一致性复制），继续背负 PostgreSQL 的 SQL 解析器、查询优化器、连接池和 MVCC 仍然是"大炮轰蚊子"。
 
-**终极方案**：将 Fjall（纯 Rust LSM-Tree KV 引擎）+ Openraft（纯 Rust Raft 共识协议）绑定，在主程序内部直接构建出一个高可用、可复制、存算一体的"分布式智能体主权操作系统"。
+**分层选择**：
+
+| 数据类型 | 复制方案 | 理由 |
+|:---|:---|:---|
+| Actor 状态（用户数据） | SlateDB + S3（默认） | 成本低 20 倍，运维简单 |
+| Actor 状态（延迟敏感场景） | TiDB 模式（每个 Actor = 一个 Region） | 写放大 3x，不随 Actor 数量增长 |
+| 配置/元数据 | Raft（Openraft / etcd） | 小数据 + 强一致，Raft 的正确用途 |
+| 脚本/图片（静态资产） | 文件系统同步（git / S3） | 静态资产不是数据，不需要共识 |
+
+**Actor 状态的 TiDB 模式**：每个 Actor 天然是一个 shard 边界。Actor:user:alice 独立一个 Raft Group（3 副本），Actor:user:bob 独立另一个。写放大始终 3x，不随 Actor 数量增长。这和 TiDB 的 Region 模型一致——Actor 是天然的分片边界。
+
+**大部分场景用 SlateDB + S3**：除非真的需要 <1ms 写延迟 + 强一致，否则 SlateDB + S3 更简单。S3 处理复制，成本低 20 倍，运维无 Raft/PD/Region 调度。
 
 ### 5.3 分布式存算一体架构拓扑
 
@@ -593,11 +604,15 @@ distribution = "raft" # 或 "s3"
 └───────────────────────┘
 ```
 
-### 5.4 为什么 Fjall + Openraft 是黄金组合？
+### 5.4 Fjall + Openraft 的适用边界
 
-- **Fjall 击败 RocksDB**：传统 RocksDB 是 C++ 写的，在 Rust 项目中带来跨平台编译地狱、臃肿内存开销和厚重 FFI 桥接。Fjall 是纯 Rust LSM-Tree 存储引擎，内存占用极小、自带布隆过滤器实现微秒级查找，且天生与 Tokio 异步生态 100% 融合。
+- **Fjall 的定位**：纯 Rust LSM-Tree 存储引擎，进程内嵌入，零网络开销。适合单机或小规模部署。
 
-- **Openraft 击败外部多库集群**：Openraft 负责接管分布式日志与多机复制。当客户端要求某个智能体更新状态时，Openraft 会在多台服务器之间广播这个变动。一旦集群多数派（Quorum）确认收到，该指令就会被原子化地应用到本地的 Fjall 中。
+- **Openraft 的定位**：元数据共识协议（配置同步、Leader 选举），不是数据存储协议。Actor 状态复制不应使用"一个大 Raft 管所有 Actor"——写放大 = 节点数，存储成本线性增长。
+
+- **Actor 状态复制的正确方案**：
+  - 默认：SlateDB + S3（S3 处理复制，成本低 20 倍）
+  - 延迟敏感：TiDB 模式（每个 Actor = 一个 Raft Group，写放大固定 3x）
 
 - **"零网络序列化损耗"**：底层数据库只是内嵌在 Rust 进程里的一行代码库（`struct Keyspace`），智能体读写状态是彻底的**进程内调用（In-Process Call）**。数据在物理磁盘到 Steel 虚拟机之间传递，走的是内存指针，速度直逼硬件物理极限。
 
@@ -1835,7 +1850,7 @@ bounded mailbox 收到背压信号时，正确的反应是**触发水平扩展**
 
 #### 双轨互斥：Fjall 或 SlateDB，二选一
 
-**存储引擎本身也是二选一，不共存。** 与 [KV 存储引擎 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3) 的严格互斥一致：
+**存储引擎本身也是二选一，不共存。** 与 [KV 存储引擎 §11](kv-storage-engine.md#11-两条架构路径fjall-vs-slatedb) 的严格互斥一致：
 
 | 模式 | 存储引擎 | 分发层 | 真理源 | 归档职责 |
 |:--|:--|:--|:--|:--|
@@ -1860,7 +1875,7 @@ bounded mailbox 收到背压信号时，正确的反应是**触发水平扩展**
 
 **MQ 在 Aura 中整个消失**——被拆解为「容量→S3、吞吐→扩展、进度→KV」三个原生能力。存储引擎二选一，Fjall 方案自留归档职责（首版截断，后续上传 S3）。
 
-→ [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall--raft-vs-slatedb--s3) — 双轨互斥的完整论证
+→ [KV 存储引擎架构 §11](kv-storage-engine.md#11-两条架构路径fjall-vs-slatedb) — 双轨互斥的完整论证
 
 ## 7. 工业适用性诊断与通用场景
 

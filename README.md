@@ -151,4 +151,5 @@
 | [部署 CI](projects/deployment-ci.md) | | Helm 部署与 CI 数据配置 |
 | [RisingWave CDC](projects/risingwave-cdc.md) | | RisingWave CDC 方案 |
 | [KV 存储引擎架构](kv-storage-engine.md) | | 嵌入式 KV 架构设计、复合键编码与用例 |
+| [共识协议](consensus-protocol.md) | | Raft 共识协议的本质、边界与正确用途：元数据共识 vs 数据存储 |
 | [OKM：Object-Keyspace Mapping](object-keyspace-mapping.md) | | 对标 ORM 的 KV 键空间映射过程宏 |

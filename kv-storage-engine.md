@@ -1,8 +1,8 @@
 # KV 存储引擎：架构设计、复合键编码与用例
 
 **Status:** 持续演进
-**覆盖引擎：** Fjall（本地 NVMe + Raft）、SlateDB（S3 云原生）、SQLite 对比
-**架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall+Raft / SlateDB+S3）
+**覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、SQLite 对比
+**架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
 **Cross-ref:** [Redis 批判](../redis-critique.md) — Redis 为何被 KV 替代
 
 ## KV 的基本 API
@@ -86,8 +86,8 @@ scan("inv:hello:")
 三个认知转变颠覆了 Redis 作为核心基础设施的范式：
 
 1. **从跨网络到进程内**：Redis 是「网络 RAM」——为无状态语言（PHP）设计的变通方案。Rust 进程是持久状态容器。Fjall（嵌入式 LSM-Tree KV）彻底消除网络 RTT 和序列化开销。
-2. **从伪分布式到真共识**：Redis Cluster/Redlock 缺乏强一致性。Openraft 提供数学证明的 Raft 共识。Redlock 已被证明不安全（Kleppmann 2016：GC 停顿 + 时钟漂移）。
-3. **从专家专属到 AI 可用**：Fjall + Openraft 封装所有复杂性。AI 处理胶水代码（状态机 apply、Key 编码、序列化），人类负责架构设计和审查。
+2. **从伪分布式到真共识**：Redis Cluster/Redlock 缺乏强一致性。Kleppmann 2016 已证明 Redlock 不安全（GC 停顿 + 时钟漂移）。元数据共识方案见 [共识协议文档](consensus-protocol.md)。
+3. **从专家专属到 AI 可用**：Fjall 封装存储复杂性。AI 处理胶水代码（Key 编码、序列化），人类负责架构设计和审查。
 
 ## 架构
 
@@ -95,14 +95,14 @@ scan("inv:hello:")
 应用层（锁、调度、配置、会话）
         │
   状态机（Fjall 引擎 — 嵌入式持久化）
-        │ 应用已提交的日志条目
-  Openraft Raft 核心（共识 + 日志复制）
+        │
+  Fjall 引擎（LSM-Tree KV — 本地 NVMe）
         │
   ┌─────┼─────┐
-  节点1  节点2  节点3    （最少 3 节点，容忍 1 故障）
+  节点1  节点2  节点3    （单机或集群部署）
 ```
 
-**关键洞察**：状态机就是桥梁。Raft 提交日志条目 → 状态机应用到 Fjall。无需独立存储层，本地读取无网络跳数。
+**关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
 
 ## 复合键编码：Redis 数据结构 → KV
 
@@ -116,7 +116,7 @@ Fjall 是纯 KV 引擎。Redis 的数据结构通过 Key 编码 + 前缀/范围�
 | `SET` | `set:<key>:<member>` → `""` | existence check | `put` / `remove` |
 | `ZSET` | `zset:<key>:<score>:<member>` | `range` (score interval) | `put` / `remove` |
 
-关键细节：LIST 需要原子序列号生成 → Raft 状态机中的单调计数器。ZSET Score 编码使用零填充固定宽度格式，保证字典序正确。
+关键细节：LIST 需要原子序列号生成 → 引擎内部的单调计数器。ZSET Score 编码使用零填充固定宽度格式，保证字典序正确。
 
 ### Physical Encoding: Composite Key 排布细节
 
@@ -211,7 +211,7 @@ keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
 
 如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。Fjall 的 `Batch` API 保证底层 WAL 一次原子提交。
 
-在分布式模式下，这个 Batch 作为单条 Raft 指令提交——Leader 写入本地 Fjall 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
+在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 Fjall 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
 
 #### 二级索引末尾必须追加主键 ID
 
@@ -610,39 +610,41 @@ Fjall + Tokio + Tonic 的组合提供等价的网络接口，同时突破单线�
 
 **进程内读写路径**：当 gRPC 服务与 Fjall 嵌入同一进程时，热路径（Actor 状态读写）仍走进程内直接调用（ns 级），gRPC 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
 
-## 分布式锁：为什么 Raft 优于 Redlock
+## 分布式锁：Fjall 的实现
 
-| 维度 | Redlock | Raft 锁（Fjall+Openraft） |
+| 维度 | Redlock（Redis） | Raft 锁（Fjall + 共识层） |
 |:--|:--|:--|
 | 互斥性 | 不安全（GC 停顿时钟漂移） | 保证（Leader Lease + 多数派 ACK） |
 | 时钟依赖 | 物理时钟（TTL） | 逻辑时钟（term + index） |
 | 故障模式 | 静默丢失锁 | 显式 Leader 选举，无数据丢失 |
 
-锁状态存储在专用 Fjall 分区（`lock` CF）中，由状态机 `apply` 管理。TTL 过期通过逻辑时钟检查，不依赖物理时钟。
+单机场景下，Fjall 的 Batch 原子操作提供进程内互斥。分布式锁需要共识层保证跨节点一致性——锁状态存储在专用 Fjall 分区（`lock` CF）中，由状态机 `apply` 管理。TTL 过期通过逻辑时钟检查，不依赖物理时钟。详见 [共识协议文档](consensus-protocol.md)。
+
+> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现。Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
 
 ## 性能模型
 
 - **单次读写**：ns~μs（进程内）vs Redis 0.1~2ms（网络 RTT）
-- **吞吐量（异步批处理）**：Raft 随核心数线性扩展；Redis 上限 ~80K ops/s（单线程）
+- **吞吐量（异步批处理）**：Fjall 多线程并发随核心数扩展；Redis 上限 ~80K ops/s（单线程）
 - **资源**：无需独立进程，LZ4 压缩，无需专用 DRAM 分配
 
 ## 共识与协调层级
 
 ```
 Business Coordination (locks, scheduling, election)
-    └── Meta-Coordination (Raft consensus)
+    └── Meta-Coordination (consensus protocol)
          ├── Log ordering
          ├── State machine state
          └── Membership changes
 ```
 
-**Core principle**: Consensus is the foundation, not the ceiling. Coordination without consensus is sandcastle engineering. Redis has no consensus layer → Redlock is built on nothing.
+**Core principle**: 元数据共识是基础设施的基石，不是存储引擎的职责。Redis 没有共识层 → Redlock 建立在沙堡上。共识协议方案见 [共识协议文档](consensus-protocol.md)。
 
 ## 工程分工
 
 | 任务 | 执行者 | 理由 |
 |:--|:--|:--|
-| Raft 协议核心 | Openraft 库 | 永远不要重写共识算法 |
+| 元数据共识 | 独立共识层（Openraft / etcd） | 永远不要重写共识算法 |
 | 状态机 `apply` | AI + 人类审查 | 模式匹配代码 |
 | Key 编码工具 | AI | 纯映射逻辑 |
 | 序列化 | AI | derive 宏 + 样板代码 |
@@ -1132,8 +1134,8 @@ tx.commit()?;
 | **部署** | 独立进程 + 配置文件 + 持久化策略 | 嵌入应用，零配置 |
 | **持久化** | 需手动选择 RDB/AOF，配置 save 策略，处理 fork 阻塞 | 自动 WAL + SSTable，后台 compaction |
 | **监控** | 需监控内存使用率、大 Key、慢查询、连接数 | 无独立进程，应用级监控即可 |
-| **故障恢复** | RDB 恢复慢（分钟级），AOF 有数据丢失风险 | Raft 日志 + 快照，秒级恢复 |
-| **扩容** | 需手动 reshard，集群不稳定 | Raft 动态成员变更，自动数据同步 |
+| **故障恢复** | RDB 恢复慢（分钟级），AOF 有数据丢失风险 | WAL + SSTable 自动恢复，秒级 |
+| **扩容** | 需手动 reshard，集群不稳定 | 集群模式自动数据同步（需配合共识层） |
 | **大 Key 问题** | 单线程阻塞，需拆分或异步删除 | 多线程并发，无阻塞风险 |
 
 **运维负担量化**：
@@ -1148,7 +1150,7 @@ tx.commit()?;
 | **数据量 < 10GB，读多写少** | Fjall | 进程内零 RTT，内存占用可控 |
 | **数据量 > 100GB，需要持久化** | Fjall | LZ4 压缩，SSD 成本远低于 DRAM |
 | **高并发（>10K QPS）** | Fjall | 多线程并发，Redis 单线程瓶颈 |
-| **需要分布式锁** | Fjall + Openraft | Raft 强一致，Redlock 数学不安全 |
+| **需要分布式锁** | Fjall + 共识层 | 进程内原子操作 + 共识层强一致，Redlock 数学不安全 |
 | **跨进程共享状态（多语言）** | Redis 或 SurrealDB | Fjall 是嵌入式库，无法跨进程 |
 | **缓存场景（允许丢失）** | 应用内 HashMap / Caffeine | 比 Redis 更快，比 Fjall 更简单 |
 | **需要 Pub/Sub、Streams** | NATS / Kafka | Redis 消息功能弱，无持久化 |
@@ -1205,7 +1207,7 @@ tx.commit()?;
 | 状态机 `apply` 逻辑 | 2-3 天（AI 生成 + Review） | 中（需验证边界情况） |
 | 数据迁移脚本 | 1 天（Redis DUMP → Fjall import） | 低（一次性任务） |
 | 集成测试 | 2-3 天（AI 生成用例） | 中（需覆盖所有 Redis 命令） |
-| 生产部署 | 1 天（替换启动脚本） | 低（Raft 自动同步） |
+| 生产部署 | 1 天（替换启动脚本） | 低（嵌入式，零运维） |
 | **总计** | **7-10 天** | **可控** |
 
 **迁移收益（3 年 TCO）**：
@@ -1244,9 +1246,9 @@ Key: cfg:{app_name}:{config_key}  →  Value: [原始二进制]
 
 **判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。当项目生命周期和功能边界在设计阶段就已高度固定时，SQL 翻译层只是在增加编译痛苦和 RAM 消耗。
 
-## 11. 两条架构路径：Fjall + Raft vs SlateDB + S3
+## 11. 两条架构路径：Fjall vs SlateDB
 
-Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数学逻辑相似。但它们在真理源（Source of Truth）和网络拓扑上走向了相反的极端，对应两种完全不同的分布式架构模式。
+Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数学逻辑相似。但它们在真理源（Source of Truth）和网络拓扑上走向了相反的极端，对应两种完全不同的部署模式。
 
 ### 引擎定位对比
 
@@ -1259,21 +1261,23 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 | **ACID 事务** | 成熟（3.0+ WriteBatch/Transactions） | 快速演进中，高级事务控制补全中 |
 | **设计目标** | 单机 bare-metal，极致延迟 | 云原生，节点无状态化 |
 
-### 路径一：Fjall + Raft（本架构采用）
+### 路径一：Fjall（单机本地部署）
 
 ```
-[Raft 共识] → [Leader 本地状态机] → [Fjall 写入本地 NVMe] → 返回
-                                         ↓
-                                   WAL + SSTable
+[应用层] → [Fjall 引擎] → [本地 NVMe] → 返回
+                            ↓
+                      WAL + SSTable
 ```
 
-**真理源在本地磁盘**。Raft 达成共识后，状态机无网络损耗地写入本地 Fjall，写入完毕立刻返回。延迟由 NVMe 物理特性决定（μs 级），不受网络波动影响。
+**真理源在本地磁盘**。进程内直接写入 Fjall，无网络损耗，写入完毕立刻返回。延迟由 NVMe 物理特性决定（μs 级），不受网络波动影响。
 
 **ACID 批处理**：AI Agent 场景频繁需要原子修改多个复合 Key（更新对话主表 + 更新排行索引 + 更新标签索引）。Fjall 3.0 的 WriteBatch 在 WAL 中一次原子提交，崩溃时整体回滚，保证索引一致性。
 
-**容量扩展**：数据不能超过本地高性能磁盘。冷数据卸载方案：操作系统层挂载 JuiceFS，将冷 SSTable 隐式卸载到 S3——JuiceFS 在 Fjall 之下透明工作，Fjall 无感知。
+**容量上限**：数据不能超过本地高性能磁盘。需要无限存储时，不要在 Fjall 上加冷数据卸载——直接用 SlateDB。
 
-### 路径二：SlateDB + S3（替代架构）
+**集群部署**：多节点场景下，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。Fjall 本身专注于本地存储引擎职责。
+
+### 路径二：SlateDB + S3
 
 ```
 [gRPC 计算节点（无状态）] → [SlateDB] → [S3 桶] → 返回
@@ -1281,26 +1285,68 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
                                             真理源在云端
 ```
 
-**真理源在 S3**。数据 commit 后直接推送到 S3。S3 本身提供 11 个 9 的可靠性和跨区域复制——多节点同步由 S3 物理保证，不需要在应用层再套一层 Raft。
+**真理源在 S3**。数据 commit 后直接推送到 S3。S3 本身提供 11 个 9 的可靠性和跨区域复制——多节点同步由 S3 物理保证。
 
 **计算节点无状态**：多个 Rust gRPC 服务连同一个 S3 桶。节点崩溃后在新机器重启，挂载同一 S3 路径，几秒内复活接客。这就是 Scale-to-Zero 的物理基础——S3 是持久的，计算可以随时生灭。
 
-**架构冲突：Raft 在此路径下冗余**。S3 已提供高可用，Raft 的日志复制和多数派确认在 S3 之上没有增量价值。引入 Raft 只增加了运维和编码成本，没有提升可靠性。
+### Fjall vs SlateDB：写入与读取路径对比
+
+**写入路径**：
+
+| | Fjall | SlateDB |
+|:---|:---|:---|
+| 写入目标 | 本地 NVMe（MemTable → WAL） | S3（MemTable → flush → S3 PUT） |
+| 写延迟 | < 1ms（本地 I/O） | 1-10ms（S3 PUT 延迟） |
+| 崩溃恢复 | WAL 回放 | S3 重放 WAL |
+
+**读取路径**：
+
+| | Fjall | SlateDB |
+|:---|:---|:---|
+| 热数据 | MemTable/SSTable → 本地 I/O → < 1ms | 本地缓存（block cache + SST cache） → < 1ms |
+| 冷数据 | 本地 SSTable（L2+ 仍在磁盘） → 本地 I/O | S3 GET → 10-100ms |
+| 数据量上限 | 本地磁盘大小 | 无限（S3） |
+
+**核心差异**：写延迟。Fjall 写本地 NVMe（<1ms），SlateDB 写 S3（1-10ms）。读路径两者相同——热数据都走本地缓存，冷数据 SlateDB 走 S3。Fjall 的冷数据仍在本地磁盘，所以不走网络，但容量受磁盘限制。
 
 ### 选择标准
 
-两个硬指标决定路径：
+```
+需要 S3 / 无限存储 / 无状态计算？
+│
+├── 是 → SlateDB
+│   写延迟可接受 1-10ms，运维简单
+│
+└── 否 → Fjall
+    写延迟 < 1ms，私有化部署，自管磁盘
+```
 
-| 指标 | Fjall + Raft | SlateDB + S3 |
-|:--|:--|:--|
-| **写延迟极限** | < 1ms（亚毫秒，本地 NVMe） | 可接受 1-10ms（网络 RTT 主导） |
-| **私有化部署** | 必须（不依赖云厂商） | 可选（S3 是唯一外部依赖） |
-| **运维模型** | 自管磁盘/Raft 集群 | 云厂商管存储，自管无状态计算 |
-| **容量** | 本地磁盘上限（可 JuiceFS 卸载） | 无限（S3 桶） |
+**判定**：两个引擎解决不同问题，不要混用。Fjall = 纯本地，低延迟，容量受磁盘限制。SlateDB = S3 原生，写延迟稍高，容量无限。需要 S3 时不要在 Fjall 上加冷数据卸载——那是在错误的引擎上做正确的功能。直接用 SlateDB。
 
-**判定**：Fjall + Raft 适合对延迟敏感、需要完全私有化部署的场景（如 AI Agent 记忆库、实时网关）。SlateDB + S3 适合云原生 Serverless 架构（无状态计算 + 无限存储），代价是延迟上限更高且依赖云厂商。
+### 分布式场景：TiDB 的强一致选择
 
-→ Fjall + Raft 完整架构见 [§5.3](#53-为什么-fjall--openraft-是黄金组合)。Agent 记忆系统落地见 [§12 用例](#12-用例agent-记忆系统的-kv-落地)。网关落地见 [§13 用例](#13-用例openresty--kv-网关)。
+TiDB 是第三条路径——不走 S3，用 Raft 在本地 KV 之上做强一致复制。它不是 Fjall + Raft 的简单组合，而是完整的分布式数据库架构：
+
+```
+TiDB（SQL）→ PD（路由）→ TiKV（Raft Group × N）→ RocksDB
+```
+
+**核心设计**：N 个小 Raft 各管一个 Region（shard），每个 Region 独立 3 副本。写放大始终 3x，不随集群规模增长。Region 自动 split/rebalance，PD 做路由调度。
+
+**三种架构的选择标准**：
+
+| | Fjall（本地） | SlateDB + S3 | TiDB（Raft） |
+|:---|:---|:---|:---|
+| 写延迟 | < 1ms | 1-10ms | < 1ms |
+| 存储成本 | 1x（本地） | 1x（S3 单价） | 3x（Raft 副本） |
+| 容量 | 本地磁盘 | 无限 | 本地磁盘 × 节点数 |
+| 强一致性 | 单机天然强一致 | S3 最终一致 | Raft 强一致 |
+| 运维复杂度 | 低 | 低 | 高（PD + Region 调度） |
+| 适用场景 | 单机小规模 | 大部分场景 | 金融/实时网关等延迟敏感场景 |
+
+**判定**：Fjall 适合单机，SlateDB 适合大部分场景，TiDB 适合需要低延迟 + 强一致的场景。TiDB 的 3x 存储成本是为强一致性付出的代价——如果你的场景不需要这个保证，SlateDB + S3 的 20 倍成本优势太大了。
+
+→ 共识协议（Raft）的本质与边界详见 [共识协议文档](consensus-protocol.md)。Agent 记忆系统落地见 [§12 用例](#12-用例agent-记忆系统的-kv-落地)。网关落地见 [§13 用例](#13-用例openresty--kv-网关)。
 
 ## 12. 用例：Agent 记忆系统的 KV 落地
 
@@ -1392,7 +1438,7 @@ ChatGPT 平台的 OLTP 热数据查询极其单调：
 
 ### 为什么选了 PostgreSQL
 
-不是因为架构最优，是因为 2023 年 Rust 生态不成熟——OpenRaft 在 v0.7 剧烈迭代、SlateDB 尚未诞生、唯一成熟选择是重型 TiKV。在 ChatGPT 流量爆发的压力下，PG 是「不背锅」的安全选择：40 年工业验证、绝对不丢数据、严格的 Schema 治理。
+不是因为架构最优，是因为 2023 年 Rust 生态不成熟——SlateDB 尚未诞生、轻量 KV 共识库还在迭代、唯一成熟选择是重型 TiKV。在 ChatGPT 流量爆发的压力下，PG 是「不背锅」的安全选择：40 年工业验证、绝对不丢数据、严格的 Schema 治理。
 
 代价：数十亿美元算力预算 + 全球顶级 DBA 团队日夜调优 + PgBouncer 连接池 + Redis 多层缓存拦截 + 生产环境禁止大部分多表 JOIN。这是用高昂工程人力填补底层存储范式不匹配的典型案例。
 
@@ -1423,19 +1469,21 @@ PG 退化为**元数据安全闸**——只管用户账户、组织权限、购�
 | 复合键编码替代关系表（§Physical Encoding） | 对话历史 = `session_id:message_id` 复合键 |
 | 现代 KV 引擎已可信任（§11） | OpenAI 正在迁移，2026 年生态已成熟 |
 
-**判定**：OpenAI 用 PG 撑了 3 年是因为 2023 年没有成熟的轻量 Rust KV 轮子。2026 年如果还盲目复制 PG 路线，就是刻舟求剑。直接用 Fjall+Raft 或 SlateDB+S3，把分布式边缘 Case 委托给成熟的 Rust 基础设施，才是最小人力成本的现代路径。
+**判定**：OpenAI 用 PG 撑了 3 年是因为 2023 年没有成熟的轻量 Rust KV 轮子。2026 年如果还盲目复制 PG 路线，就是刻舟求剑。直接用 Fjall 或 SlateDB+S3，把分布式边缘 Case 委托给成熟的 Rust 基础设施，才是最小人力成本的现代路径。
 
 ## 交叉引用
 
 [Redis 批判](../redis-critique.md) 论证了 **Redis 在每个层面为何失败**：
 - L0（进程内）：Redis 比本地内存慢 200-50,000 倍 → **Fjall 就是带持久化的 L0 实现**
-- L3（分布式协调）：Redis 没有共识 → **Openraft 提供批判文档所说的 Raft 共识**
+- L3（分布式协调）：Redis 没有共识 → **共识协议方案见 [共识协议文档](consensus-protocol.md)**
 
-本文档是 **建设性对应物**：不只是「Redis 不好」，而是「这就是替代它的精确架构」。批判文档的「推荐替代方案」一节建议「基于 Raft 的存储（强一致性）」——这就是实现。
+本文档是 **建设性对应物**：不只是「Redis 不好」，而是「这就是替代它的精确架构」。
 
 **批判文档的具体引用：**
-- 批判 §分布式锁：说「自己构建很简单」→ 本文展示如何实现（Raft 状态机 + Fjall 锁分区）
-- 批判 §集群神话：说 Redis 缺乏强一致性 → Openraft 用经过验证的 Raft 填补这个空缺
+- 批判 §分布式锁：说「自己构建很简单」→ 本文展示 Fjall 进程内锁实现，分布式锁方案见 [共识协议文档](consensus-protocol.md)
+- 批判 §集群神话：说 Redis 缺乏强一致性 → [共识协议文档](consensus-protocol.md) 用经过验证的共识方案填补这个空缺
 
 → SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [代码即 DDL](#代码即-ddlkv-的开发者体验保障)
+
+[共识协议](consensus-protocol.md) 详述 **Raft 作为元数据共识协议的本质与边界**：为何 Raft 适合 etcd/K8s 的 MB 级元数据，却不适合 GB 级数据存储（3x 写放大的物理现实）。
 - Critique §"Network Latency Paradox": memory ~100ns vs network ~20μs → Fjall operates at the ns level (in-process function call)
