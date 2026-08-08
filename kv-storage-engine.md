@@ -459,7 +459,7 @@ let results: Vec<_> = common.iter()
     .collect();
 ```
 
-`intersect_sorted` 实现：双指针归并，与 Lucene Posting List 交集算法同源。
+`intersect_sorted` 实现：双指针归并，与 Lucene Posting List 交集算法同源，也与 [JOIN 章节的 Merge Join](#批量-join双指针归并merge-join) 是同一算法。
 
 #### 性能分析
 
@@ -526,6 +526,50 @@ let result = merge(order, user);                           // 应用层合并
 ```
 
 **代价**：2 次 KV 点查（各 ~μs），无冗余。**适用**：关联实体大（完整用户 Profile）或频繁更新（写入时不需要同步更新去范式化视图）。
+
+#### 批量 JOIN：双指针归并（Merge Join）
+
+当需要批量关联两个有序集合时，KV 的 LSM-Tree 字典序天然支持 **Merge Join**——与 SQL 的 Sort-Merge Join 算法同源，但 KV 省掉了排序步骤（前缀扫描已保证有序）。
+
+```
+两个有序集合（通过前缀扫描获得）：
+A: [order:101:2026-01, order:101:2026-02, order:101:2026-03]  ← 已排序
+B: [user:101, user:102, user:103]                              ← 已排序
+
+双指针归并：
+i=0, j=0
+while i < len(A) and j < len(B):
+    if A[i].key == B[j].key:
+        result.append(merge(A[i], B[j]))
+        i++; j++
+    elif A[i].key < B[j].key:
+        i++
+    else:
+        j++
+```
+
+```rust
+// 伪代码：批量 JOIN
+let orders = kv.scan(prefix: "order:101:");   // O(N)，已排序
+let users = kv.scan(prefix: "user:");         // O(M)，已排序
+
+// 双指针归并，O(N+M)，零额外排序
+let mut i = 0; let mut j = 0;
+while i < orders.len() && j < users.len() {
+    if orders[i].user_id == users[j].id {
+        result.push(merge(&orders[i], &users[j]));
+        i += 1; j += 1;
+    } else if orders[i].user_id < users[j].id {
+        i += 1;
+    } else {
+        j += 1;
+    }
+}
+```
+
+**对比 SQL**：SQL 的 Sort-Merge Join 需要先排序（O(N log N)），KV 的前缀扫描天然有序（O(N)），省掉一轮排序。这与 line 462 的倒排索引交集（双指针归并）是同一算法——LSM-Tree 的字典序是 Merge Join 的天然加速器。
+
+**适用**：批量关联、两个集合都已按关联键排序（通过 Key 编码保证）。
 
 #### 多对多关系：指针索引
 
