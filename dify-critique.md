@@ -191,7 +191,7 @@ Dify 是 AI 应用领域的 Harbor：用复杂性包装简单需求，用名气�
 
 **它犯的根本错误**：试图让 AI 适应人的流程（拖拽编排），而不是让人适应 AI 的能力（自主规划）。这不是技术路线选择，是对 AI 本质的误解。Workflow 约束的是业务逻辑（做什么），Harness 约束的是执行机制（怎么做）——前者压缩决策空间，后者释放决策空间。详见 [Agent 原则](agent-principles.md)。
 
-**首选替代方案**：直接写代码。Python + SurrealDB + 本地 embedding 模型，50 行代码，100MB 资源，完全可控。
+**首选替代方案**：直接写代码。Python + PostgreSQL（JSONB + 本地 embedding 模型），50 行代码，100MB 资源，完全可控。如果需要图遍历或多模型能力，SurrealDB 是补充选项——详见 [统一数据层](unified-data-layer.md)。
 
 ---
 
@@ -202,6 +202,6 @@ Dify 是 AI 应用领域的 Harbor：用复杂性包装简单需求，用名气�
 - **[Harbor 批判](harbor-critique.md)**：Harbor 与 Dify 共享相同的膨胀架构模式——多容器、多依赖、多组件，用复杂性包装简单需求。
 - **[Redis 批判](redis-critique.md)**：Dify 依赖 Redis 做缓存/队列，与 Harbor 的 Redis 依赖同源——"网络 RAM 陷阱"。
 - **[Nginx 批判](nginx-critique.md)**：Dify 使用 Nginx 做反向代理，与 Harbor 的 Nginx 依赖同源——遗留组件的不必要引入。
-- **[统一数据层](unified-data-layer.md)**：SurrealDB 作为统一数据层，替代 Dify 的 PostgreSQL + Redis + 向量数据库拼凑架构。
+- **[统一数据层](unified-data-layer.md)**：SurrealDB 的多模型架构可简化 Dify 的 PostgreSQL + Redis + 向量数据库拼凑——但 PostgreSQL 的 JSONB 已覆盖大部分 schema-free 场景，SurrealDB 的定位是关键数据场景的补充，非无条件替代。
 
 **统一的第一性原理**：不搞技术崇拜，不吃开源画的大饼，只看真实的硬件物理限制与团队生产力。
