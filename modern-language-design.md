@@ -203,6 +203,41 @@ ADT 定义可能性空间
 
 Java 加了 `Optional` 但没解决——因为 null 还在，`Optional` 是包装纸不是语义。`Optional<User> user = null;` 完全合法，NPE 照炸。类型系统的价值在于**整组设施一起前移防线**，不是单个特性点缀。
 
+### Parse, Don't Validate：防线前移的具体实践
+
+防线前移的一个具体实践是**在边界处解析，在内部使用类型**（Parse, Don't Validate，Alexis King）。核心区分：
+
+- **parse**：将外部数据（JSON、字符串、网络包）转换为领域类型。parse 失败 → 数据被拒绝，程序不会进入不一致状态。parse 成功 → 类型系统保证后续所有操作都是安全的
+- **validate**：检查数据是否满足条件，返回布尔值。validate 通过 → 下次使用时仍然可能出错，因为类型没有变。validate 是一次性的临时保证，不是结构性保证
+
+```
+// validate 模式：每次使用都要重新检查
+fn handle_user(input: &str) {
+    let data = parse_json(input);        // 可能出错
+    if !validate_email(&data.email) {    // 检查1
+        return;
+    }
+    if !validate_age(data.age) {         // 检查2
+        return;
+    }
+    // 100 行之后...
+    send_email(&data.email);  // 还能保证 email 合法吗？不确定
+}
+
+// parse 模式：边界处解析，内部用类型保证
+fn handle_user(input: &str) {
+    let user = User::parse(input)?;  // 一次 parse，产生 VerifiedUser 类型
+    // 100 行之后...
+    send_email(&user.email);  // 类型保证 email 已验证，编译器替你检查
+}
+```
+
+`User::parse()` 返回的不是"看起来像 User 的数据"，是一个**类型系统承认的 VerifiedUser**——只有通过完整 parse 链的数据才能构造出这个类型。后续代码看到 `VerifiedUser` 就知道数据是合法的，不需要额外检查。如果 parse 链中任何一个环节失败，根本不会产生 `VerifiedUser` 实例。
+
+这个模式与 Rust 的 `Result<T, E>` 天然契合：`parse()` 返回 `Result<VerifiedUser, ParseError>`，`?` 运算符在失败时提前返回。类型系统在编译期保证：如果你手里有一个 `VerifiedUser`，它一定是合法的。不需要运行时 assert，不需要防御性检查。
+
+**为什么 validate 不够**：validate 是布尔检查，不改变类型。`validate_email()` 返回 `true`，但参数类型还是 `String`——100 行之后调用 `send_email()` 时，编译器不知道这个字符串已经被验证过了。每次使用都要重新验证，或者依赖注释和纪律——而纪律会腐烂。parse 产生新类型，类型系统自动追踪"这个值是否已验证"，不需要人类记忆。
+
 类型系统的设施同时也是抽象设施——trait 既是类型约束（第三节），也是代码复用的基本单元（第四节）。这种双重身份不是巧合：当复用通过声明式约束而非状态继承来表达时，复用的语义自然被纳入类型系统，编译器可以同时验证"这个类型满足约束"和"这段复用是安全的"。下一节讨论的正是这个交汇点——当语言放弃树形继承、转向网形组合时，拓扑选择如何匹配软件的真实结构。
 
 ---
