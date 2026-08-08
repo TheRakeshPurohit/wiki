@@ -5,7 +5,7 @@
 
 ## 核心哲学
 
-传统的"多语种持久化（Polyglot Persistence）"方法（为 KV、图、关系需求使用不同数据库）在 2011 年是合理的工程判断。但十多年后，这套拼凑架构的运维复杂性和数据碎片化已成为团队生产力的系统性消耗。SurrealDB 让这种多层拼凑在关键数据场景下变得不必要——但它的分布式模式限制多、生产工具链不成熟，实际定位是 PostgreSQL 和直接 KV 存储之间的过渡选项。
+传统的"多语种持久化（Polyglot Persistence）"方法（为 KV、图、关系需求使用不同数据库）在 2011 年是合理的工程判断。但十多年后，这套拼凑架构的运维复杂性和数据碎片化已成为团队生产力的系统性消耗。SurrealDB 社区版和 PostgreSQL 在功能覆盖上差别不大——SurrealDB 的优势在 UX（图遍历、计算下推），PG 的优势在生态和工具链。真正拉开差距的是数据量：当体量大到关系型引擎扛不住时，直接用 KV 存储引擎（Fjall + Openraft）比走 SurrealDB 的分布式路线更可靠——KV 不要求查询模式固定，数据量本身就是选择 KV 的理由。
 
 PG 的 JSONB 同样支持 schema-free——一个表一个 JSONB 字段就能跳过 schema 设计。SurrealDB 默认 schema-free、可选添加 schema；PG 默认 schema-first、JSONB 字段可以绕过。两者的差异不是能力差异，是**优先级差异**：SurrealDB 把灵活放在前面，PG 把结构放在前面。
 
@@ -21,7 +21,7 @@ PG 的 JSONB 同样支持 schema-free——一个表一个 JSONB 字段就能跳
 
 **分布式模式限制多，实际生产多为单节点**：SurrealDS 的分布式能力在社区版受限，企业版才提供对象存储后端、分布式 Live Queries 等关键特性。大多数团队的实际部署是单节点 RocksDB，分布式承诺更多是路线图而非现实。
 
-**定位：PG 和 KV 存储之间的过渡选项**：SurrealDB 的核心价值在于图遍历和计算下推——这些是 PostgreSQL 做不到的。但当数据量大到 PostgreSQL 存不下时，正确的选择不是 SurrealDB 的分布式模式（限制太多），而是直接用 KV 存储引擎（Fjall + Openraft），详见 [KV 存储引擎](kv-storage-engine.md)。SurrealDB 的位置是：数据量没那么大时很香，有限制时可以跳过直接用 KV。
+**SurrealDB 的价值区间**：图遍历和计算下推——这些是 PostgreSQL 做不到的。但当数据量大到 PostgreSQL 存不下时，正确的选择不是 SurrealDB 的分布式模式（限制太多），而是直接用 KV 存储引擎（Fjall + Openraft），详见 [KV 存储引擎](kv-storage-engine.md)。SurrealDB 社区版和 PG 功能覆盖差别不大，选择 SurrealDB 的理由是 UX（SurQL 可组合性、图遍历语法），不是功能差距。
 
 **分层策略**：
 ```
@@ -436,7 +436,7 @@ DB 层做背压反而引入震荡：`Ollama 过载 → SurrealDB 拒绝 → Pyth
 - **PG 路线**：通过插件扩展能力（AGE 做图查询、`plpython3` 做逻辑），保持单体架构的简洁性。存算分离由云厂商（RDS、Cloud SQL）提供，数据库本身不需要感知。
 - **SurrealDB 路线**：查询层和存储层原生分离（SurrealDS），但分布式模式在社区版受限。实际生产多为单节点 RocksDB，存算分离的承诺更多是架构愿景。
 
-**关键数据场景的分层策略**：PostgreSQL 覆盖大多数 OLTP 场景。当需要深度图遍历或 DB 内逻辑时，SurrealDB 是补充——但只存关键数据，不存全量。当数据量大到 PostgreSQL 存不下时，正确的选择不是 SurrealDB 的分布式模式（限制太多），而是直接用 KV 存储引擎（Fjall + Openraft），详见 [KV 存储引擎](kv-storage-engine.md)。SurrealDB 的位置是：数据量没那么大时很香，有限制时可以跳过直接用 KV。
+**分层策略**：PostgreSQL 覆盖大多数 OLTP 场景。当需要深度图遍历或 DB 内逻辑时，SurrealDB 是补充——但只存关键数据，不存全量。当数据量大到 PostgreSQL 存不下时，直接用 KV 存储引擎（Fjall + Openraft）——KV 不要求查询模式固定，数据量本身就是选择 KV 的理由，详见 [KV 存储引擎](kv-storage-engine.md)。
 
 ---
 
