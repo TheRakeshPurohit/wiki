@@ -730,6 +730,80 @@ kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
 
 **判定**：框架平台的正确姿态是坚守纯 KV + 复合键编码。数据库是 KV 的上层封装，不是 KV 的替代。如果你的查询模式是固定的， Parser + Optimizer 就是用运行时 CPU 开销去解决一个编译期就能消灭的问题。
 
+### KV 的 DDL：索引管理与字段演进
+
+SQL 有 `CREATE INDEX` / `ALTER TABLE`，KV 没有等价的声明式 DDL。所有 schema 变更都是应用层编码问题。但可以设计通用工具让操作变得机械化。
+
+#### 加索引：回填历史数据
+
+新写入直接用新 Key 模式，零成本。历史数据需要迁移回填：
+
+```
+旧 Key 模式:  m:{session_id}:{reverse_ts}:{msg_id}
+新索引模式:   idx:{session_id}:{msg_id}    ← 按 session 查单条
+```
+
+通用迁移工具接口：
+
+```bash
+kv-migrate \
+  --source-prefix "m:{sid}:" \
+  --target-prefix "idx:{sid}:" \
+  --transform "extract_msg_id_from_value" \
+  --batch-size 10000
+```
+
+**执行原理**：`scan(源 prefix)` → 对每条 → `encode(目标模式)` → `batch.write()`。Batch 原子提交，LSM-Tree 追加写不锁读写，迁移可以和正常服务并行。断点续传：最后处理的 Key 记到系统表，中断后从断点恢复。
+
+**删索引**：直接停止写入该前缀。旧 Key 不需要删除——LSM-Tree 的 Compaction 会在后台自动回收空间。如果需要立即释放：`scan(旧 prefix) → batch.remove()`。
+
+#### 加字段/删字段：版本化编码
+
+Value 是字节流，没有 schema。字段变更通过编码版本管理：
+
+```
+V1: [version=1][name:u16_len][age:u8]
+V2: [version=2][name:u16_len][age:u8][email:u16_len]   ← 加字段
+V3: [version=3][name:u16_len][email:u16_len]            ← 删 age
+```
+
+读取时按版本号分发：
+
+```rust
+fn decode(buf: &[u8]) -> Record {
+    match buf[0] {
+        1 => decode_v1(&buf[1..]),
+        2 => decode_v2(&buf[1..]),
+        3 => decode_v3(&buf[1..]),
+        _ => unreachable!()
+    }
+}
+```
+
+**核心优势**：旧数据不用迁移，新旧版本共存。新写入用 V3，旧数据用 V1/V2 decoder 读，两者在同一数据库里并存。迁移可以推迟到空闲时段。
+
+**什么时候需要回填迁移**：decoder 维护 3+ 个版本时代码开始腐化。此时跑一次迁移：扫描旧 Version 的 Value → 重新编码为最新 Version → Batch 覆盖写回。迁移后可以删掉旧版本的 decoder 分支。
+
+#### 编码策略选择
+
+| 策略 | 适用场景 | 优点 | 缺点 |
+|:---|:---|:---|:---|
+| **版本化编码** | 字段变化频繁（开发期） | 旧数据零迁移，新旧共存 | decoder 维护多个版本 |
+| **追加编码** | 只加不删 | 最简单，零迁移 | Value 膨胀（空洞） |
+| **迁移回填** | 字段稳定后清理 | Value 紧凑，decoder 单一版本 | 一次性迁移成本 |
+
+#### 与 SQL DDL 的本质区别
+
+| 操作 | SQL | KV |
+|:---|:---|:---|
+| 加索引 | `CREATE INDEX` = 数据库内全表扫描 + 重建 | 新 Key 模式 + 迁移工具回填 |
+| 删索引 | `DROP INDEX` = 数据库内删除 | 停止写入，Compaction 自动回收 |
+| 加字段 | `ALTER TABLE ADD COLUMN` = 大表锁分钟级 | 新 Version 编码，零 DDL |
+| 删字段 | `ALTER TABLE DROP COLUMN` = 大表锁 + 数据重写 | 新 Version 编码，旧数据不迁移 |
+| 字段重命名 | `ALTER TABLE RENAME COLUMN` | 新 Version 编码（KV 里没有"列名"概念） |
+
+**判定**：KV 的 DDL 不存在于存储引擎层，而是应用层的编码约定 + 通用迁移工具。版本化编码让变更成本从"必须立即回填"降到"可以推迟"，迁移工具让回填成本从"手写脚本"降到"一行命令"。
+
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 
 三个纯 Rust LSM-Tree 引擎虽然底层数学模型相似，但设计场景和「第一公民」完全不同，导致 API 表达方式、事务设计哲学和状态控制存在本质代差。
