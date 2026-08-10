@@ -120,7 +120,7 @@ Fjall 是纯 KV 引擎。Redis 的数据结构通过 Key 编码 + 前缀/范围�
 
 ### Physical Encoding: Composite Key 排布细节
 
-纯 KV 引擎没有 Hash、ZSET 等原语。一切数据结构都是通过 Key 空间编码（Composite Key Encoding）在字节序上模拟出来的——LSM-Tree 的迭代器天然按字节排序，这意味着只要 Key 编码设计正确，范围扫描和排序在存储层零成本完成。
+纯 KV 引擎没有 Hash、ZSET 等原语。一切数据结构都是通过 Key 空间编码（Composite Key Encoding）在字节序上模拟出来的——LSM-Tree 的迭代器天然按字节排序，这意味着只要 Key 编码设计正确，范围扫描和排序在存储层零成本完成。Redis 的这一层抽象**极薄**：Hash 只是次一级的键空间（键拼接），ZSET 只是把"读 → 计算 → 写"序列在服务器端原子化——而"读改写"的原子化正是 KV `Batch`/CAS 的既有能力，见 [Redis 批判](redis-critique.md#65-redis-数据结构-api-的虚假护城河)。
 
 #### Hash 的物理编码
 
