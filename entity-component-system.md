@@ -9,6 +9,23 @@ ECS 与 OO 的分界线不在"有没有对象"，而在**数据与逻辑如何�
 - **OO（class 继承）＝ 树**：class 体系的结构特性在**边**——只跨级连接（父→子），同层不连接，一个类只能处在唯一继承链上，层层向上收敛到唯一根类（Java 的 Object）。class 是**命名**（标识主体"它是谁"），单一且唯一，身份来自它在这棵树上的命名位置。
 - **ECS ＝ 标签**：entity 是纯标识（一句柄），component 是标签集合——**一个物体，很多标签**，每个标签描述一个属性/方面，可同时存在（`Player`、`Health`、`Transform`）、自由组合。组合数量是标签种类的**乘积**（一物多标签，即多维）。
 
+**ECS 是 Rust 对 OO 的回应。** Rust 没有 class（详见 [现代语言设计](modern-language-design.md)），无类 + 标签化要落到"大量异质实体持续演化、彼此交互"的领域，就长出了 ECS——准确说，ECS 是"无 class/标签化"对**模拟/游戏**场景的回应。它在概念上与 OO 同级，是通用的数据+逻辑组织范式（agent 模拟、生态、物理、流行病等都能用）；但实践中它高度集中在游戏与高性能实时模拟。这不是偶然，而是**收益画像**决定的——ECS 的每一项优势都在为特定条件服务：
+
+- **缓存局部性**：同类型组件连续存储（SoA），系统批量遍历时走内存顺序访问。只有实体数量大、系统成批扫同型组件时，缓存友好才转化为可感的性能。
+- **无状态同步**：状态躺在组件里，系统 `Query` 直读，无需 getter/setter、通知、事件总线传值。数据一变全网可见，天然一致。
+- **运行时改身份**：同一句柄增删组件即改类型（活的→尸体），不用换对象。
+- **系统可并行**：调度器按系统声明的读写依赖，把无共享状态的系统并行跑。
+
+这四项收益只在**同一个画像**下才划算：**实体数量大**（体积让缓存与并行有意义）、**性能敏感/实时**（帧预算逼你优化缓存与并行）、**实体类型运行时可变**（改身份有实际用途）。这正是游戏/模拟的画像。
+
+离开这个画像，收益消失、成本显形：实体少，缓存局部性无所谓；类型稳定，运行时改身份用不上；非实时，没理由为并行付调度开销。而 ECS 的代价是恒定的——
+
+- **间接性**：实体是匿名行键，要知道"它是什么"必须查组件；OO 的 class 直接告诉你。
+- **失去封装**：行为散在作用于组件集的系统里，"方法属于对象"的局部性没了，对象内聚的逻辑更难维护。
+- **查询开销**：每次访问都过组件存储，不如 OO 的直接字段访问。
+
+业务 CRUD、低实体数、类型不变——OO 或普通数据结构更简单，ECS 不是普遍替代。
+
 这个区分的本质是 **标签 = 倒排索引**：把"实体"和"分类"解耦——实体用唯一标识定位，分类用标签集合表达，查询走倒排索引求交集。ECS 的 `component` 与 trait/tag/label 是同一类东西：都是"挂在标识上的标签"；区别只是 ECS 的组件比纯标签多承载了数据（`Health(3)`、`Transform`），是"标签 + 数据"。
 
 | ECS 里的角色 | 结构中的位置 |
@@ -21,7 +38,7 @@ ECS 与 OO 的分界线不在"有没有对象"，而在**数据与逻辑如何�
 
 ## 定义：三层模型（数据库心智模型）
 
-ECS 的心智模型不是对象树（场景为根、子系统为主枝、层层组织）——那是场景图，是引擎里另一棵用于空间寻址的树。ECS 的数据模型是**扁平的标签库，像数据库**：
+ECS 的心智模型不是对象树。对象树有两种，别混淆：一是 OO 的**类继承树**（单主体命名）——ECS 正是它的替代；二是引擎的**场景图**（`Parent`/`Child`），一棵用于空间寻址的独立树。ECS 的数据模型是**扁平的标签库，像数据库**：
 
 - **实体（Entity）**＝ 行键：把多维数据联结成一个可寻址的单元，本身无内容
 - **组件（Component）**＝ 可查询的维度（标签/列）：存数据或作身份标记
@@ -70,6 +87,62 @@ commands.spawn((Player, Health(3), Speed(3.0), Transform::from_xyz(0.0, 0.0, 0.0
 3. **缓存局部性**：同类型组件连续存储，系统批量遍历时利用内存连续性
 4. **显式依赖 = 可并行**：系统间的读写依赖由调度器显式声明，无共享状态的系统可安全并行
 
+## Bevy：心智模型与主要 API（0.19）
+
+**心智模型**：Bevy 把整个游戏做成一个 **App**——App 里有一个 ECS **World**（所有实体/组件/资源都住在里面），外加控制"系统何时运行"的 **Schedule**。你写的不是对象，而是**系统**：每个系统是一个函数，它声明自己要什么（`Query` 读哪些组件、要不要 `Commands`、要不要全局 `Res`），然后被调度到某个 Schedule 里反复跑。**数据在 World 里、逻辑在 System 里、时机在 Schedule 里**，三者分离。
+
+核心类型与 ECS 角色的对应：
+
+| Bevy 类型 | 角色 |
+|:--|:--|
+| `App` | 顶层容器：World + Schedules + Plugins 的装配 |
+| `World` | 一个 ECS 世界：所有 Entity/Component/Resource 的存储 |
+| `Entity` | 句柄（行键） |
+| `Component` | 挂在实体上的数据块（`#[derive(Component)]`） |
+| `Resource` | 不挂实体的全局单例数据（`#[derive(Resource)]`：`Time`、`AssetServer`、`Input`…） |
+| `System` | 一个函数，参数声明依赖（`Query`/`Res`/`ResMut`/`Commands`/`MessageWriter`…） |
+| `Query` | 按组件类型读/写实体（可加过滤 `With`/`Without`/`Changed`） |
+| `Commands` | 延迟的实体操作（spawn/despawn/insert），帧末统一生效 |
+| `Message` | 系统间一次性消息（0.19 取代旧 `Event`） |
+| `Schedule` | 系统的运行时机（`Startup`/`Update`/`FixedUpdate`/自定义） |
+| `Plugin` | 打包系统+资源的可复用模块（`DefaultPlugins` 或自定义 `Plugin`） |
+| `State` | 应用状态机（菜单/游玩/暂停），按状态切换运行哪些系统 |
+
+为什么说这是"心智模型"而非记忆题：**你从不写"对象方法"，你写系统**。给玩家加移动——写 `fn move_player(q: Query<&mut Transform, With<Player>>)`，它作用于所有带这两个组件的实体。加重力、加伤害——各写一个系统。每个系统只声明它要的组件，Bevy 调度器负责把它们接到正确时机、并在无冲突时并行跑。这就是"把游戏当数据库"在引擎里的落地。
+
+最小骨架：
+
+```rust
+use bevy::prelude::*;
+
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)                     // 渲染/输入/时间等内置系统
+        .init_resource::<Score>()                        // 注册全局资源
+        .add_systems(Startup, setup)                     // 启动只跑一次
+        .add_systems(Update, (move_player, update_score)) // 每帧跑
+        .run();                                           // 启动 App
+}
+
+#[derive(Resource)]
+struct Score(u32);
+
+#[derive(Component)]
+struct Player;
+
+fn setup(mut cmds: Commands) {
+    cmds.spawn((Player, Transform::default())); // 生成实体 = 一组组件
+}
+
+fn move_player(q: Query<&mut Transform, With<Player>>) {
+    for mut t in &q { /* 每帧移动 */ }
+}
+
+fn update_score(mut s: ResMut<Score>, input: Res<ButtonInput<KeyCode>>) {
+    if input.just_pressed(KeyCode::Space) { s.0 += 1; }
+}
+```
+
 ## Bevy 实践（0.19）
 
 以下 API 全部经 Bevy 0.19.0 实测编译通过。
@@ -79,7 +152,8 @@ commands.spawn((Player, Health(3), Speed(3.0), Transform::from_xyz(0.0, 0.0, 0.0
 生成、销毁、改类型都经 `Commands`（缓冲延迟执行，避免迭代中修改崩溃）：
 
 ```rust
-commands.spawn((Player, Health(3), ...));   // 生成
+let e = commands.spawn((Player, Health(3))).id();   // 生成，拿到实体句柄
+
 commands.entity(e).despawn();               // 销毁（延迟）
 commands.entity(e).insert(Dead);            // 运行时改身份
 commands.entity(e).remove::<Health>();
@@ -94,7 +168,10 @@ commands.entity(e).remove::<Health>();
 #[derive(Message)]
 struct HitEvent { target: Entity, damage: u32 }
 
-fn a(mut w: MessageWriter<HitEvent>) { w.write(HitEvent { target: e, damage: 1 }); }
+fn a(mut w: MessageWriter<HitEvent>, q: Query<Entity, With<Player>>) {
+    let Ok(e) = q.single() else { return };     // e 来自查询
+    w.write(HitEvent { target: e, damage: 1 });
+}
 fn b(mut r: MessageReader<HitEvent>) { for ev in r.read() { /* 消费 */ } }
 ```
 
