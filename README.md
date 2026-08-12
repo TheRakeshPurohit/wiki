@@ -76,6 +76,7 @@
 | [Flux 架构](flux-architecture.md) | | 响应式通信模式：从被动拉取到主动推送，Fluxora = Flux + Aura |
 | [WASM 统一运行时](wasm-unified-runtime.md) | | WebAssembly 统一运行时架构 |
 | [现代语言设计](modern-language-design.md) | | 语言设计趋势与分析 |
+| [ECS 实体组件系统](entity-component-system.md) | | ECS 三层模型、数据驱动收益、网/树拓扑定位、Bevy 0.19 实践 |
 | [Go, Zig 与反智主义](go-zig-anti-intellectualism.md) | | Go, Zig 与反智主义 |
 | [嵌入式脚本语言](embedded-script-languages.md) | | 嵌入式脚本语言选型 |
 | [Lambda 到硅](lambda-to-silicon.md) | | 从 Lambda 演算到硅片的计算模型演进 |
