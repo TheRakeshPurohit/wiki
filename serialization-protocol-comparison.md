@@ -1,16 +1,44 @@
-# 序列化协议抉择：IDL vs Code-First
+# 序列化协议分析对比：IDL vs Code-First
 
-**状态**：架构决策完成  
-**日期**：2026-06-20  
+**性质**：多方案分析对比（非单一决策）
 **核心哲学**：技术不应该是束缚开发者手脚的繁文缛节
 
 ---
 
 ## 概述
 
-在分布式系统设计中，序列化协议的选择直接影响开发体验、跨语言兼容性、向后兼容性和性能。本文档深入分析三种主流方案的优劣，并提供清晰的决策框架。
+在分布式系统设计中，序列化协议的选择直接影响开发体验、跨语言兼容性、向后兼容性和性能。本文档分析主流方案的优劣，并提供一个**按维度优先**的对比框架——不是"选一个"，而是"在哪个维度下谁优先"。
 
-→ 本决策影响 [Aura 架构](aura-architecture.md) 的 Raft 控制流和 [Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md) 的数据存储层。
+→ 本分析影响 [Aura 架构](aura-architecture.md) 的 Raft 控制流和 [Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md) 的数据存储层。
+
+## 谱系总纲：按「解码时 schema 参与程度」分层
+
+序列化格式在一条谱系上排列，核心变量是**数据流里带多少自描述信息**、以及**接收方要预先知道多少**：
+
+```
+完全自描述     ←————————————————————→    完全静态/按序
+(带字段名)                                 (字段名/ID 都没有)
+CBOR / JSON     Tagged-ID                   Cap'n/SBE/        postcard/bincode
+                Cap'n/SBE/FlatBuffers       FlatBuffers
+```
+
+| 层 | 代表 | 数据流里带 | 接收方需预知 | 冗余 | 向后兼容 |
+|:--|:--|:--|:--|:--|:--|
+| **动态（自描述）** | CBOR、JSON、MessagePack | 字段**名字字符串** | 几乎不用 | 最大 | 最强（纯靠名字） |
+| **半动态（字段 ID）** | Cap'n Proto、SBE、FlatBuffers、PB | 字段**数字 ID（tag）** | 需 type schema 对齐 | 中（数字比名字小） | 强（跳未知 ID） |
+| **静态（按序）** | postcard、bincode | 无名字、无 ID | 精确 struct 定义 | **0** | 无（加字段即崩） |
+
+**半动态层内部是两种哲学**：Cap'n Proto / FlatBuffers 是**指针式零拷贝**（读单字段 O(1) 地址跳转、演进强、体积大）；SBE 是**固定紧凑**（纳秒级延迟、演进弱）。它们用「字段数字 ID」代替 CBOR 的「字段名字字符串」，既绕开名字冗余，又保留按 tag 跳未知字段的演进能力——这正是"半动态"的本质。
+
+**按维度优先的速查**：
+
+| 优先维度 | 首选 | 理由 |
+|:--|:--|:--|
+| 体积最小 / 纯 Rust / schema 固定 | **postcard** | 0 字节元数据，Varint 最紧凑 |
+| 自描述 + 跨语言（WASM 边界） | **CBOR** | 带字段名，网关可部分解析、无需模板 |
+| 零拷贝读取 + 低延迟 + 演进 | **Cap'n Proto** | 指针式，取单字段不反序列化整条 |
+| 极致低延迟 / 固定 schema / 高频 | **SBE** | 纳秒级，无分支，但演进弱 |
+| 通用演进 + 跨语言（不追求极致体积） | **Avro** | 0 Tag 纯数据 + JSON schema |
 
 ---
 
@@ -27,7 +55,7 @@ Protocol Buffers (PB) 乃至绝大多数传统工业级通信协议在 Rust 生�
 
 ---
 
-## 二、三种方案深度对账
+## 二、各方案深度对账
 
 ### 方案 A：prost-derive 实现"纯 Rust 声明式（Code-First PB）"
 
@@ -109,6 +137,76 @@ Bincode 的"裸金属肌肉"在 Fluxora（AI-native UI 框架）项目中被实�
 
 **结论**：Bincode 的零元数据设计是一把双刃剑——它在纯 Rust 内部 RPC 场景下确实极致轻量，但一旦涉及 serde 高级特性（内部标记枚举、`deserialize_any`）或跨语言需求，就会直接崩盘。Fluxora 最终迁移到 CBOR，Aura 则选择 Postcard（继承 serde 生态兼容性 + 自带 Schema 演进）。
 
+### 方案 B2：半动态层——Cap'n Proto / SBE / FlatBuffers
+
+介于"[动态自描述]"与"[静态按序]"之间，这三个格式用**字段数字 ID** 寻址，而不是字段名字字符串、也不是纯顺序。它们规避了 CBOR 的字段名字符串冗余，又保留了"按 tag 跳过未知字段"的演进能力。
+
+#### Cap'n Proto——指针式零拷贝
+
+- 消息 = 内存中的 tree（segment + 指针）。读某字段是 **O(1) 地址跳转**，不用反序列化整条就能取出单个字段。
+- schema 演进强：`@N` 字段 ID + union，未知 ID 跳过。
+- **代价**：消息里有指针结构 + 对齐填充，**体积不紧凑**。零拷贝的"随取随用"在内存里成立，但网络/落盘时指针是偏移量，优势减弱。
+
+#### FlatBuffers——与 Cap'n 同流派（offset table）
+
+- 零拷贝、缓冲即内存布局，主打游戏/移动端的序列化缓存。
+- 定位与演进同 Cap'n，风格更"工程快调"。
+
+#### SBE（Simple Binary Encoding）——固定紧凑行式，金融高频专用
+
+- 固定宽度 struct 布局 + 字段 ID，纳秒级延迟、无分支、极紧凑。
+- 但 **schema 演进很弱**（只能尾部加字段、固定宽度），rollout 近乎全量。
+- schema 由 XML 定义生成代码（编译期）。
+
+#### 半动态层的两种哲学
+
+| | 指针式（Cap'n / FlatBuffers） | 固定紧凑（SBE） |
+|:--|:--|:--|
+| 读取 | O(1) 地址跳转，零拷贝取字段 | 顺序扫 tag，固定宽度 |
+| 演进 | 强（@N ID + union） | 弱（尾部加、固定宽度） |
+| 体积 | 大（指针 + 对齐填充） | 紧凑 |
+| 延迟 | 低 | 纳秒级 |
+| 适用 | 需零拷贝 + 演进的去序列化场景 | 高频固定 schema（金融） |
+
+#### ⚠️ 同为 IDL 驱动：PB / Cap'n / FlatBuffers 是同一个病
+
+很多从 Protobuf 逃出来的人把 Cap'n / FlatBuffers 当成解药，**这是误区**——三者都是"先写独立 IDL，再生成桩代码"的**同一家族**，用户反感的（IDL 外置、生成代码不可手改、跳转破碎、与现代 derive 流程不搭）对三者完全相同：
+
+| 能力 | Protobuf | Cap'n Proto | FlatBuffers |
+|:--|:--|:--|:--|
+| 定义方式 | `.proto` 独立 IDL | `.capnp` 独立 IDL | `.fbs` 独立 IDL |
+| Rust 免 IDL（code-first / derive） | ✅ **有 prost-derive** | ❌ 无官方 derive | ❌ 无官方 derive |
+| Rust 生态 | **最成熟** | 中 | 官方但底层繁琐 |
+| 零拷贝取字段 | ❌ 顺序解析 | ✅ 指针式 | ✅ offset table |
+| 跨语言绑定 | **最广** | 中 | 中 |
+| 体积 | Varint + Tag 紧凑 | 膨胀（指针 + 对齐） | 膨胀 |
+
+反直觉的结论：**三个里只有 PB 家族给了你出口**。`prost-derive`（方案 A）用 Rust 结构体 + `#[prost(tag="1")]` 过程宏，不写 `.proto` 就产出 PB 兼容二进制——这是唯一满足"贴近 Rust 过程宏"的 IDL 家族成员。Cap'n / FlatBuffers 的 Rust 侧没有官方 derive，必须文件 + 编译期生成，一条路走到黑。
+
+`prost-derive` 可行源自方案 A：
+
+```rust
+// 不需要 .proto，Rust 类型即定义，编译期映射为 PB 兼容二进制
+#[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
+pub struct UpdateActorStateCommand {
+    #[prost(string, tag = "1")]
+    pub agent_id: String,
+}
+```
+
+#### 真正的分类：IDL 必须是标准、可程序操作的数据格式
+
+IDL 本身没有问题——问题在 **IDL 是不是"标准数据格式"、能否用程序方便地操作**。逃离 IDL 的正确方向不是"无 IDL"，而是看**结构定义是不是标准的、程序可操作的数据**：
+
+- **JSON / KDL / TOML**：**源码即数据**、自描述、能 grep/jq/编辑器脚本直接操作，不需要 schema 便能够解释。数据当公民。
+- **Avro（.avsc）**：IDL 是**纯 JSON**——标准数据格式，程序可用通用 JSON 工具（jq / python / 任何语言）**方便地生成、校验、演进、做 schema registry**。这是"好 IDL"的样板：结构定义既可读又程序可操作，`0 Tag` 纯数据保持紧凑。
+- **PB / Cap'n / FlatBuffers / SBE（.proto/.capnp/.fbs/XML）**：IDL 是**专有语法**，只能靠专用工具链（protoc/capnpc/flatc）解析，程序无法用通用数据结构直接操作，生成代码不可手改。这才是"烦人"的根源——不是"有 IDL"，而是"IDL 不是标准格式"。
+- **postcard / bincode**：`#[derive(Serialize, Deserialize)]` 过程宏，**类型即定义**，无外部 IDL，结构与 Rust 类型合一，是"贴近现代 derive 流程"的正解（牺牲跨语言自描述，仅在纯 Rust 内部成立）。
+
+**结论修正**：告别"专有语法 IDL"，走向两条路其中之一——要么 `postcard`（纯 Rust 内部，derive，类型即定义），要么 `Avro`（若需标准、程序可操作的 IDL + 跨语言 + 演进，JSON schema 是样板），以及 `CBOR`（跨语言/WASM，serde + 自描述）。**Avro 不该与 PB/Cap'n/FlatBuffers 归为一档**——它用标准 JSON 定义 schema，程序可方便操作，恰好规避了你反感的问题。
+
+**与 KV 的 DDL 呼应**：Cap'n / SBE 这种"字段 ID + 跳未知"的编码，正是 kv-storage-engine.md 里"整行打包用 Tagged/TLV 可演进序列化"的同一种思想——字段 ID 寻址 = KV DDL 的 TLV 方案。谱系上它是 postcard（静态）与 CBOR（动态）之间的合理折中：比 postcard 多了演进能力，比 CBOR 少了字段名开销。若剖到 schema 层面，"标准 vs 专有"同样适用：Avro 的 JSON schema 程序可操作，.proto 的专有语法则不行。
+
 ### 方案 C：Apache Avro 的 Schema Evolution
 
 Avro 最恐怖、也是最迷人的物理特性——数据在通过网线传输或写进物理日志时，里面**没有包含任何字段名**（不像 CBOR），**甚至连字段 ID 都没有**（不像 PB/Thrift）！
@@ -159,36 +257,50 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
 
 ---
 
-## 三、技术现实主义的终极裁判
+## 三、维度判据
 
-### 三种方案对比表
+### 各方案按维度的对比表
 
-| 决策维度 | 方案 A（Code-First PB） | 方案 B（Bincode） | 方案 C（Avro） |
-|---------|------------------------|------------------|---------------|
-| **跨语言兼容** | ✅ 支持 Go/Java/Python 接入 | ❌ 纯 Rust 生态 | ✅ 标准 JSON Schema |
-| **IDL 文件** | ❌ 不需要（宏标记替代） | ❌ 不需要 | ✅ JSON 文件（标准化） |
-| **编码摩擦** | 中（需学习 prost 宏） | **极低**（零配置） | 低（JSON Schema） |
-| **压缩率** | 高（Varint + Tag） | **极高**（0 字节元数据） | 极高（0 Tag，纯数据） |
-| **向后兼容** | ✅ 字段 ID 稳定即可 | ❌ 加字段即崩 | ✅ **Schema Evolution** |
-| **Neovim 体验** | ✅ 全绿灯跳转 | ✅ 全绿灯跳转 | ✅ JSON 可读 |
-| **适用场景** | 未来可能需要多语言接入 | **纯 Rust 极客帝国** | **需要平滑滚动升级** ✨ |
+| 维度 | A：Code-First PB | B：Bincode | B2：半动态（Cap'n/SBE/FlatBuffers） | C：Avro |
+|---------|------------------|-----------|-------------------------------------|---------|
+| **谱系位置** | 半动态（Tagged-ID） | 静态（按序） | 半动态（Tagged-ID） | 静态（按序，但带外 schema） |
+| **跨语言** | ✅ 多语言 | ❌ 纯 Rust | ✅ Cap'n/SBE 多语言 | ✅ 标准 JSON Schema |
+| **IDL** | ❌ 宏标记替代 | ❌ 不需要 | ✅ 需 IDL（.capnp/XML） | ✅ JSON 文件 |
+| **编码摩擦** | 中（prost 宏） | **极低**（零配置） | 高（IDL 驱动） | 低（JSON Schema） |
+| **压缩率** | 高（Varint + Tag） | **极高**（0 元数据） | 中（指针/对齐膨胀）或紧凑（SBE） | 极高（0 Tag 纯数据） |
+| **向后兼容** | ✅ 字段 ID 稳定 | ❌ 加字段即崩 | ✅ 跳未知 ID（Cap'n 强） | ✅ **Schema Evolution** |
+| **零拷贝取字段** | ❌ | ❌ | ✅ Cap'n/FlatBuffers | ❌ |
+| **适用场景** | 需多语言接入 | 纯 Rust 固定 schema | 零拷贝 + 演进去序列化 | 平滑滚动升级 |
 
-### 决策树
+### 按维度优先的判据
+
+这张表的目的**不是选一个**，而是替每个维度找唯一解：
+
+- **要体积最小 + 纯 Rust + schema 固定** → **postcard / bincode**（0 元数据税）
+- **要自描述 + 跨语言（WASM 网关边界）** → **CBOR**（带字段名，可部分解析）
+- **要零拷贝读取 + 低延迟 + 演进** → **Cap'n Proto**（指针式，取单字段不反序列化整条）
+- **要极致低延迟 + 固定 schema + 高频** → **SBE**（纳秒级，演进弱）
+- **要通用演进 + 跨语言（不追求极致体积）** → **Avro**（0 Tag + JSON schema）
+
+### 决策树（按主导负载）
 
 ```
-你的集群未来有死红线，必须支持跨语言（Go/Java）微服务通信？
-├── 是 → 你的集群需要在线无感滚动升级（Schema Evolution）？
-│        ├── 是 → 选用方案 C（Avro）
-│        │        标准 JSON Schema，0 Tag 冗余
-│        │        完美向后兼容，跨天平滑升级
-│        │
-│        └── 否 → 选用方案 A（Prost Code-First）
-│                 用纯 Rust 过程宏给字段打上数字 Tag
-│                 在 Neovim 里死守 100% 的内聚爽感
+你的场景是什么负载？
+├── 纯 Rust 内部 RPC，schema 固定，追求最小体积
+│        → 用 Postcard（若需演进）或 Bincode（若纯固定、容忍加字段即崩）
+│          注意：两者都不支持 #[serde(tag=...)]，用 Externally Tagged 外部标签
 │
-└── 否 → 你的系统就是纯正的、由您主导的 Rust 极客自愈帝国
-         直接选择 Bincode
-         享受 0 字节冗余、0% 元数据税、硬件级内存转铸的最高大一统高平滑体感
+├── 需跨语言，且查询频繁、要求零拷贝取字段 + 演进
+│        → 用 Cap'n Proto（指针式零拷贝）
+│
+├── 需跨语言，高频固定 schema、纳秒级延迟
+│        → 用 SBE（演进弱，适合恒定结构）
+│
+├── 需跨语言 + 通用平滑滚动升级，但不追求极致体积
+│        → 用 Avro（0 Tag + JSON Schema Evolution）
+│
+└── 需跨语言 + 边缘/网关自描述部分解析（WASM）
+         → 用 CBOR（带字段名，可部分解析路由元数据）
 ```
 
 ---
@@ -377,7 +489,7 @@ Lance 的解法：
 
 ## 交叉引用
 
-本文档是序列化协议抉择的完整分析，与以下详细分析形成完整的决策闭环：
+本文档是序列化协议的分析对比，与以下文档形成完整的分析闭环：
 
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，采用分层序列化策略。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体，含 7 种数据格式底层字节排布对撞。

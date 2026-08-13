@@ -80,7 +80,7 @@
 | [Go, Zig 与反智主义](go-zig-anti-intellectualism.md) | | Go, Zig 与反智主义 |
 | [嵌入式脚本语言](embedded-script-languages.md) | | 嵌入式脚本语言选型 |
 | [Lambda 到硅](lambda-to-silicon.md) | | 从 Lambda 演算到硅片的计算模型演进 |
-| [序列化协议决策](serialization-protocol-decision.md) | | 序列化格式选型 |
+| [序列化协议分析对比](serialization-protocol-comparison.md) | | 序列化格式选型 |
 | [KDL vs 配置格式](kdl-vs-config-formats.md) | | 语义树 vs 数据网络：KDL 节点模式与 TOML/YAML/JSON/HTML 全景对比、工程坑点 |
 
 ## 工作流与技能

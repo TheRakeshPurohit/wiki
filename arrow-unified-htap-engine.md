@@ -491,7 +491,7 @@ Steel Lisp 策略层（DataFrame 作为一等公民函数参数）
 
 - **[Aura 架构](aura-architecture.md)**：完整的 Actor 引擎、多语言沙箱与分布式共识实现。
 - **[Aura + Fluxora DevOps](aura-fluxora-devops.md)**：脚本即代码（Script-as-Code）的工程实践，含 GitOps 工作流、CI/CD 配置、脚本测试与调试。
-- **[序列化协议抉择](serialization-protocol-decision.md)**：IDL vs Code-First 的深度对账，含 Avro Schema Evolution 与 prost-derive 代码示例。
+- **[序列化协议分析对比](serialization-protocol-comparison.md)**：IDL vs Code-First 的分析对账，含 Avro Schema Evolution 与 prost-derive 代码示例。
 - **[LanceDB vs Fjall 终极裁判](lancedb-vs-fjall.md)**：两种存储范式的详细对比与选型决策树。
 - **[常规 Web 适用性](aura-architecture.md)**：本架构在常规 Web 场景的适用性分析（Ad-hoc 查询痛点已被本文档治愈）。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Steel Lisp 作为策略层的确定性优势。

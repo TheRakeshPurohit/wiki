@@ -717,9 +717,9 @@ pub enum RaftCommand {
 **框架不再是法官，框架只提供执行能力；用户和 AI 的动态意志决定哪种语言在这一毫秒登上多模态内存舞台。**
 
 
-## 4. 序列化协议抉择
+## 4. 序列化协议分析对比
 
-→ 详见 [序列化协议抉择：IDL vs Code-First](serialization-protocol-decision.md)
+→ 详见 [序列化协议分析对比：IDL vs Code-First](serialization-protocol-comparison.md)
 
 ### Aura 的分层序列化策略（2026-06-20 更新）
 

@@ -5,7 +5,7 @@
 - **决策**：所有 Kafka 队列流量使用 CBOR。拒绝 Bincode。
 - **根因**：Bincode 在 `serde(tag = "...")`（内部标记枚举）上失败，因为它需要 `deserialize_any`，而 bincode 不支持。
 - **影响**：影响 `Brick`/`Content` 类型的所有反序列化，不仅是线路协议。
-- **替代路径**（2026-06-20 补充）：如果追求极致轻量，可以不切换格式，而是改用 Externally Tagged 默认枚举模式（变体用数字索引，不触发 `deserialize_any`）。Postcard 同样不支持 `#[serde(tag)]`，但配合 Externally Tagged 模式可安全使用。详见 [序列化协议抉择](serialization-protocol-decision.md#postcard-替代-bincode-的核心理由)。
+- **替代路径**（2026-06-20 补充）：如果追求极致轻量，可以不切换格式，而是改用 Externally Tagged 默认枚举模式（变体用数字索引，不触发 `deserialize_any`）。Postcard 同样不支持 `#[serde(tag)]`，但配合 Externally Tagged 模式可安全使用。详见 [序列化协议分析对比](serialization-protocol-comparison.md#postcard-替代-bincode-的核心理由)。
 
 ## ADR-002：通过 URL 参数实现零 RTT 握手
 

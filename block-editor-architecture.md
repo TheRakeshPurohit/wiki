@@ -472,7 +472,7 @@ class BlockOperations {
 ## 9. 交叉引用
 
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎
-- **[序列化协议抉择](serialization-protocol-decision.md)**：Postcard + Externally Tagged 枚举
+- **[序列化协议分析对比](serialization-protocol-comparison.md)**：Postcard + Externally Tagged 枚举
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体
 - **[Fluxora 架构](projects/fluxora-architecture.md)**：AI-native UI 框架，块编辑器可作为 Fluxora 的文档编辑组件
 
