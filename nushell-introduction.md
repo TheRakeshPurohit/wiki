@@ -279,6 +279,9 @@ Nushell 内置 JSON、YAML、TOML、CSV、XML 等格式的解析和生成。`ope
 | YAML | `yq '.spec.image'` | `open pod.yaml \| get spec.image` |
 | TOML | `tomlq '.server.port'` | `open config.toml \| get server.port` |
 | CSV | `csvtool col 1 file.csv` | `open data.csv \| get column1` |
+| KDL | `kq`（停滞，不兼容 v2） | `open file.kdl \| get name` |
+
+其中 KDL 值得一提：Nushell **0.114.0（2026-06）起内置 `from kdl` / `to kdl`**（PR #18219），且 `open` 对 `.kdl` 后缀自动触发解析，输出规范的节点行（`name`/`args`/`props`/`children`）直接进管道。这正是 Nushell 整合逻辑的又一例证——在 `kq` 停滞、无法兼容 KDL v2 时，Nushell 原生消化了这个格式，消除了日常使用 KDL 的最大障碍。详见 [KDL 与配置格式](kdl-vs-config-formats.md)。
 
 ### Polars 插件：数据科学环境的整合
 
