@@ -201,21 +201,45 @@ IDL 本身没有问题——问题在 **IDL 是不是"标准数据格式"、能�
 - **JSON / KDL / TOML**：**源码即数据**、自描述、能 grep/jq/编辑器脚本直接操作，不需要 schema 便能够解释。数据当公民。
 - **Avro（.avsc）**：IDL 是**纯 JSON**——标准数据格式，程序可用通用 JSON 工具（jq / python / 任何语言）**方便地生成、校验、演进、做 schema registry**。这是"好 IDL"的样板：结构定义既可读又程序可操作，`0 Tag` 纯数据保持紧凑。
 - **PB / Cap'n / FlatBuffers / SBE（.proto/.capnp/.fbs/XML）**：IDL 是**专有语法**，只能靠专用工具链（protoc/capnpc/flatc）解析，程序无法用通用数据结构直接操作，生成代码不可手改。这才是"烦人"的根源——不是"有 IDL"，而是"IDL 不是标准格式"。
+
+**"可读性更高"也不是专有 IDL 的护身符**——它两头被挤，既非无成本，也非独家：
+
+- **它不是"可读"，是"学过才可读"**：`.proto`/`.fbs` 的高密度可读性只对已掌握该语法的人成立，对首读的陌生读者反不如 JSON 直白（`name: "age", type: "int"` 一眼即懂）；且兑现它要先付学习成本，之后还要持续靠专用工具链维持，并非一次性开销。
+- **可读性不是专有格式特权**：可读性差的其实是 JSON（引号/花括号/嵌套噪音，这正是 .avsc 的真实弱项）；但标准数据格式里有一档**专门为人类可读定义设计**——**TOML / KDL**，标准、可程序操作（各语言都有现成 parser），又拿到接近 `.proto` 的可读性。可读性这两点里，专有 IDL 没有立足点。
 - **postcard / bincode**：`#[derive(Serialize, Deserialize)]` 过程宏，**类型即定义**，无外部 IDL，结构与 Rust 类型合一，是"贴近现代 derive 流程"的正解（牺牲跨语言自描述，仅在纯 Rust 内部成立）。
+
+**初始化解析时机之外，才是"标准 vs 专有"真正的分界**。如前所述，初始化读 IDL 换成 JSON 无本质区别；但那份 schema 在**其余所有使用时刻**的操作性，对两种格式天差地别。分界落在三处：
+
+1. **编辑/运维期的可操作性**：schema 是 JSON 就能被 jq/grep/python 随手查询、校验、diff、动态生成；`.fbs` 只能靠专用工具链（flatc）。这是"文件拿在手里能不能通用加工"的差异，发生在 schema 被任何人/工具接触的任何时刻，不只在引擎初始化那次。
+
+2. **运行期是否随数据带 schema / 是否要进程外解释**（重点）：跨语言、跨进程、网关/WASM 边界要读懂数据时——
+   - schema 是标准 JSON（或 CBOR 自描述）：接收方能**独立解析**，不依赖发送方代码，也能只部分解析路由元数据、随时理解。
+   - `.fbs` / 仅 Rust 布局（rkyv）：要求对方**持有对应生成代码或 schema 伴生**；跨语言甚至完全不可解读（非 Rust 无法按 Rust 布局读 rkyv）。网关/WASM 边界若要靠它路由，就要为每个语言维护一份生成桩，绑定被写死。
+   - 网关边界场景：网关只在边界读路由字段、把其余 payload 原样转发（零拷贝借用 `&[u8]`，见下节 GatewayRouterEnvelope）——若 schema 是标准 JSON/CBOR，网关能独立拿出路由元数据后转发；若绑定专有 IDL 或仅 Rust 布局，网关要么看不懂、要么被迫全量反序列化再转发，零拷贝优势反被 IDL 选择抵消。
+
+3. **schema 的演进方式**：JSON schema（Avro）能靠 registry + default 平滑演进（滚动升级在读取时做 resolution，见[方案 C](#方案-c-avro-的-schema-evolution)）；`.fbs` 的演进受 IDL 编译产物绑定——改 schema 就要重发生成代码，跨语言时尤其痛。
 
 **结论修正**：告别"专有语法 IDL"，走向两条路其中之一——要么 `postcard`（纯 Rust 内部，derive，类型即定义），要么 `Avro`（若需标准、程序可操作的 IDL + 跨语言 + 演进，JSON schema 是样板），以及 `CBOR`（跨语言/WASM，serde + 自描述）。**Avro 不该与 PB/Cap'n/FlatBuffers 归为一档**——它用标准 JSON 定义 schema，程序可方便操作，恰好规避了你反感的问题。
 
 **与 KV 的 DDL 呼应**：Cap'n / SBE 这种"字段 ID + 跳未知"的编码，正是 kv-storage-engine.md 里"整行打包用 Tagged/TLV 可演进序列化"的同一种思想——字段 ID 寻址 = KV DDL 的 TLV 方案。谱系上它是 postcard（静态）与 CBOR（动态）之间的合理折中：比 postcard 多了演进能力，比 CBOR 少了字段名开销。若剖到 schema 层面，"标准 vs 专有"同样适用：Avro 的 JSON schema 程序可操作，.proto 的专有语法则不行。
 
-### 方案 B3：零拷贝格式——rkyv / Arrow / Avro 的张力与逼近者
+### 方案 B3：零拷贝格式——rkyv / Arrow / Avro 的实际分工
 
-「零拷贝指针式」与「标准、动态可操作的 IDL」之间**存在物理张力**，不是没人愿做，而是互斥：
+先把零拷贝的**失效边界**划清，否则容易把"生态里没有现成实现"误当成"物理互斥"：
 
-- 零拷贝指针式（Cap'n/FlatBuffers）要求**布局固化**——offset 只有在 schema 确定时才可能烙进 buffer，否则无法零拷贝跳转。
-- 标准 JSON IDL（可用 jq/python 操作、可动态生成）意味着 **schema 可变**。
-- 冲突：schema 一变，offset 全变，就没法"零拷贝复用已编码 buffer"。要零拷贝就得先定死布局，要动态就得牺牲零拷贝。
+**零拷贝真正结构性失效只有两条：**
 
-因此没有现成格式同时满足"零拷贝 + 行存指针 + 标准 IDL"，只有三个逼近者分头妥协：
+1. **offset 烙不进 buffer**：数据结构引用 buffer 之外的东西（堆上 `Box`/`Rc`、外部对象）时，相对偏移只能表示 buffer 内部、无法表示外部引用——此类类型烙不出可零拷贝的形态。
+2. **布局无法在目标环境按字节重演**：非 Rust 产物无法按 Rust 编译布局解读（rkyv 的仅 Rust 限制即此类），或字节序/对齐在目标端不成立。
+
+只要 offset 能烙进 buffer（相对指针），mmap / memmove 都不失效，零拷贝对"取单字段"一直成立。
+
+**两件易被误判为"互斥"的事，其实不是：**
+
+- **schema 会变 ≠ offset 烙不进**：schema 变化时旧 buffer 作废，是**所有序列化方案的公共税**（postcard/bincode 一样要重编码，Avro 靠读取时 resolution），不是零拷贝独有。它造成的是版本/迁移**成本**，不是零拷贝失效；rkyv 对每个 schema 版本都能烙出自己的一份 offset。
+- **标准 IDL ≠ schema 必然动态变**：用标准 JSON 定义的**编译期固定** schema（如固定的 .avsc）与零拷贝并不天生互斥——固定布局照常可烙 offset。真正与指针式零拷贝互斥的是"**schema 运行时动态生成/频繁更换**"这一窄态：每次运行烙不同 offset，已编码 buffer 无从稳定复用。
+
+因此零拷贝"不可兼得"的对象不是"标准 IDL"，而是"**动态 schema**"。没有现成格式同时满足"零拷贝 + 行存指针 + 标准 IDL"是**生态/工程现状**（尚无实现两者），而非物理必然。于是仍是三个逼近者分头妥协：
 
 #### rkyv——纯 Rust 的零拷贝，"类型即 schema"
 
@@ -250,7 +274,7 @@ struct Example { id: u32, name: String }
 | Arrow | 标准 schema + 零拷贝 | 列式，非行存 |
 | Avro | 标准 IDL + 跨语言 + 演进 | 非零拷贝 |
 
-**结论**：零拷贝 + 标准 IDL + 行存指针三者不可兼得，按场景选逼近者——纯 Rust 内部 mmap 热查询 → rkyv；标准 schema 批量列访问 → Arrow；跨语言 + 演进 → Avro。
+**结论**：零拷贝 + 行存指针可与**编译期固定的标准 IDL** 兼得（固定 .avsc 照常可烙 offset）；真正互斥的只剩"零拷贝 + 动态 schema"这个窄态，而生态尚无现成实现。故仍按场景选逼近者——纯 Rust 内部 mmap 热查询 → rkyv；标准 schema 批量列访问 → Arrow；跨语言 + 演进 → Avro。
 
 ### 方案 C：Apache Avro 的 Schema Evolution
 
