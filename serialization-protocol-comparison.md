@@ -139,7 +139,7 @@ Bincode 的"裸金属肌肉"在 Fluxora（AI-native UI 框架）项目中被实�
 
 ### 方案 B2：半动态层——Cap'n Proto / SBE / FlatBuffers
 
-介于"[动态自描述]"与"[静态按序]"之间，这三个格式用**字段数字 ID** 寻址，而不是字段名字字符串、也不是纯顺序。它们规避了 CBOR 的字段名字符串冗余，又保留了"按 tag 跳过未知字段"的演进能力。
+介于[动态自描述（CBOR/JSON）](#谱系总纲按解码时-schema-参与程度分层)与[静态按序（postcard/bincode）](#谱系总纲按解码时-schema-参与程度分层)之间，这三个格式用**字段数字 ID** 寻址，而不是字段名字字符串、也不是纯顺序。它们规避了 CBOR 的字段名字符串冗余，又保留了"按 tag 跳过未知字段"的演进能力。
 
 #### Cap'n Proto——指针式零拷贝
 
@@ -207,6 +207,51 @@ IDL 本身没有问题——问题在 **IDL 是不是"标准数据格式"、能�
 
 **与 KV 的 DDL 呼应**：Cap'n / SBE 这种"字段 ID + 跳未知"的编码，正是 kv-storage-engine.md 里"整行打包用 Tagged/TLV 可演进序列化"的同一种思想——字段 ID 寻址 = KV DDL 的 TLV 方案。谱系上它是 postcard（静态）与 CBOR（动态）之间的合理折中：比 postcard 多了演进能力，比 CBOR 少了字段名开销。若剖到 schema 层面，"标准 vs 专有"同样适用：Avro 的 JSON schema 程序可操作，.proto 的专有语法则不行。
 
+### 方案 B3：零拷贝格式——rkyv / Arrow / Avro 的张力与逼近者
+
+「零拷贝指针式」与「标准、动态可操作的 IDL」之间**存在物理张力**，不是没人愿做，而是互斥：
+
+- 零拷贝指针式（Cap'n/FlatBuffers）要求**布局固化**——offset 只有在 schema 确定时才可能烙进 buffer，否则无法零拷贝跳转。
+- 标准 JSON IDL（可用 jq/python 操作、可动态生成）意味着 **schema 可变**。
+- 冲突：schema 一变，offset 全变，就没法"零拷贝复用已编码 buffer"。要零拷贝就得先定死布局，要动态就得牺牲零拷贝。
+
+因此没有现成格式同时满足"零拷贝 + 行存指针 + 标准 IDL"，只有三个逼近者分头妥协：
+
+#### rkyv——纯 Rust 的零拷贝，"类型即 schema"
+
+- **零拷贝反序列化**：输出内烙相对指针（offset-based），读取 O(1) 地址跳转、不反序列化整条。
+- **相对指针而非绝对地址**：序列化 buffer 可整体 memmove、可 **mmap**，内部指针不失效。这是它和 Cap'n 一样独立于地址空间的根本原因，也是它把 mmap 只读热查询当作第一设计目标。
+- **schema = Rust 类型 + 3 个过程宏**（`Archive` / `Serialize` / `Deserialize`），无独立 IDL 文件——code-first 极致，程序 100% 可操作，比专有 `.capnp` 更"标准"。读取 `Archived<T>` 字段 O(1)。
+- **硬约束**：需对齐 buffer（`AlignedVec`）+ 对齐访问（换来 padding）；布局只由 **Rust 编译产物**编解码——**即同为 Rust（含编译到 wasm 的纯 Rust）可读写；非 Rust 产物（宿主 JS、Go，含其编译的 wasm）无法解读**。wasm 是编译目标，不是限制本身——纯 Rust 的 wasm 完全可用。演进兼容弱（加字段/换类需自己管版本或迁移，不如 Avro/Cap'n 顺滑）。
+- **定位**：KV 海量只读 value 的 mmap 点查利器，与 postcard（紧凑）、CBOR（跨语言）不冲突、可分层。
+
+```rust
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct Example { id: u32, name: String }
+// (API 名依 0.7/0.8 版本而定，含 to_bytes / access 与 rancor 错误系统)
+```
+
+#### Arrow（IPC）——标准 schema + 列式零拷贝
+
+- schema 随数据走，通用 Arrow Schema 对象、可 JSON 序列化、程序可操作，不绑定专有 IDL。
+- 零拷贝读取是列式对齐（非行存指针式）。
+- 缺点：列式，取单行单字段不如行存指针式直接。
+
+#### Avro（.avsc JSON）——标准 IDL 完美，但非零拷贝
+
+- schema 标准 JSON、程序可操作到极致。
+- 顺序编码、无内部指针，读取必须按 schema 顺序解码整条。
+
+#### 逼近者对比
+
+| 位置 | 满足 | 妥协 |
+|:--|:--|:--|
+| rkyv | 零拷贝 + 行存 + code-first | 仅 Rust 编译产物可解、无标准 IDL 文件、演进弱 |
+| Arrow | 标准 schema + 零拷贝 | 列式，非行存 |
+| Avro | 标准 IDL + 跨语言 + 演进 | 非零拷贝 |
+
+**结论**：零拷贝 + 标准 IDL + 行存指针三者不可兼得，按场景选逼近者——纯 Rust 内部 mmap 热查询 → rkyv；标准 schema 批量列访问 → Arrow；跨语言 + 演进 → Avro。
+
 ### 方案 C：Apache Avro 的 Schema Evolution
 
 Avro 最恐怖、也是最迷人的物理特性——数据在通过网线传输或写进物理日志时，里面**没有包含任何字段名**（不像 CBOR），**甚至连字段 ID 都没有**（不像 PB/Thrift）！
@@ -261,16 +306,16 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
 
 ### 各方案按维度的对比表
 
-| 维度 | A：Code-First PB | B：Bincode | B2：半动态（Cap'n/SBE/FlatBuffers） | C：Avro |
-|---------|------------------|-----------|-------------------------------------|---------|
-| **谱系位置** | 半动态（Tagged-ID） | 静态（按序） | 半动态（Tagged-ID） | 静态（按序，但带外 schema） |
-| **跨语言** | ✅ 多语言 | ❌ 纯 Rust | ✅ Cap'n/SBE 多语言 | ✅ 标准 JSON Schema |
-| **IDL** | ❌ 宏标记替代 | ❌ 不需要 | ✅ 需 IDL（.capnp/XML） | ✅ JSON 文件 |
-| **编码摩擦** | 中（prost 宏） | **极低**（零配置） | 高（IDL 驱动） | 低（JSON Schema） |
-| **压缩率** | 高（Varint + Tag） | **极高**（0 元数据） | 中（指针/对齐膨胀）或紧凑（SBE） | 极高（0 Tag 纯数据） |
-| **向后兼容** | ✅ 字段 ID 稳定 | ❌ 加字段即崩 | ✅ 跳未知 ID（Cap'n 强） | ✅ **Schema Evolution** |
-| **零拷贝取字段** | ❌ | ❌ | ✅ Cap'n/FlatBuffers | ❌ |
-| **适用场景** | 需多语言接入 | 纯 Rust 固定 schema | 零拷贝 + 演进去序列化 | 平滑滚动升级 |
+| 维度 | A：Code-First PB | B：Bincode | B2：半动态（Cap'n/SBE/FlatBuffers） | B3：rkyv | C：Avro |
+|---------|------------------|-----------|-------------------------------------|----------|---------|
+| **谱系位置** | 半动态（Tagged-ID） | 静态（按序） | 半动态（Tagged-ID） | 静态 + 零拷贝（类型即定义） | 静态（按序，但带外 schema） |
+| **跨语言** | ✅ 多语言 | ❌ 纯 Rust | ✅ Cap'n/SBE 多语言 | ❌ 仅 Rust 编译产物 | ✅ 标准 JSON Schema |
+| **IDL** | ❌ 宏标记替代 | ❌ 不需要 | ✅ 需 IDL（.capnp/XML） | ❌ 不需要（类型即定义） | ✅ JSON 文件 |
+| **编码摩擦** | 中（prost 宏） | **极低**（零配置） | 高（IDL 驱动） | **极低**（3 个 derive 宏） | 低（JSON Schema） |
+| **压缩率** | 高（Varint + Tag） | **极高**（0 元数据） | 中（指针/对齐膨胀）或紧凑（SBE） | 中（对齐 padding） | 极高（0 Tag 纯数据） |
+| **向后兼容** | ✅ 字段 ID 稳定 | ❌ 加字段即崩 | ✅ 跳未知 ID（Cap'n 强） | ⚠️ 弱（布局依版本，需自管迁移） | ✅ **Schema Evolution** |
+| **零拷贝取字段** | ❌ | ❌ | ✅ Cap'n/FlatBuffers | ✅ **O(1) 跳转 + mmap** | ❌ |
+| **适用场景** | 需多语言接入 | 纯 Rust 固定 schema | 零拷贝 + 演进去序列化 | 纯 Rust mmap 只读热查询 | 平滑滚动升级 |
 
 ### 按维度优先的判据
 
@@ -280,6 +325,7 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
 - **要自描述 + 跨语言（WASM 网关边界）** → **CBOR**（带字段名，可部分解析）
 - **要零拷贝读取 + 低延迟 + 演进** → **Cap'n Proto**（指针式，取单字段不反序列化整条）
 - **要极致低延迟 + 固定 schema + 高频** → **SBE**（纳秒级，演进弱）
+- **要纯 Rust 零拷贝 + mmap 只读热查询** → **rkyv**（类型即定义，O(1) 跳转，无 IDL）
 - **要通用演进 + 跨语言（不追求极致体积）** → **Avro**（0 Tag + JSON schema）
 
 ### 决策树（按主导负载）
@@ -289,6 +335,9 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
 ├── 纯 Rust 内部 RPC，schema 固定，追求最小体积
 │        → 用 Postcard（若需演进）或 Bincode（若纯固定、容忍加字段即崩）
 │          注意：两者都不支持 #[serde(tag=...)]，用 Externally Tagged 外部标签
+│
+├── 纯 Rust，只读热查询，可 mmap 海量数据免反序列化
+│        → 用 rkyv（类型即定义，O(1) 零拷贝跳转，无需 IDL）
 │
 ├── 需跨语言，且查询频繁、要求零拷贝取字段 + 演进
 │        → 用 Cap'n Proto（指针式零拷贝）
@@ -423,6 +472,26 @@ fn deserialize_command(bytes: &[u8]) -> anyhow::Result<AuraRaftCommand> {
 | **云端长期记忆 Lakehouse** | Lance | 内嵌向量与倒排索引，原生支持远程 S3 流式点杀检索，替代 Parquet 的 AI 时代列式标准 |
 | **海量冷历史冬眠** | Parquet | 高压缩率冷存储，当数据进冷库时从 Lance 一键转为 Parquet 字典压缩 |
 | **UI ↔ Gateway** | CBOR | 跨语言（WASM），自描述 |
+| **KV value 只读点查（候选）** | rkyv | 纯 Rust mmap 免反序列化，O(1) 跳转读字段（见下方重新评估） |
+
+### rkyv 的引入评估 / 重新评估
+
+加入 rkyv 后，对 Aura 分层策略的再审视——**它补的是"本地存储上的只读热查询"这个缺口，但位置要放对**：
+
+**为什么值得引入**：本地工作记忆/缓存这类频繁只读点查的数据（尤其是当前直接存结构体的场景），用 rkyv 序列化 + mmap 读取，能省掉"每次访问都反序列化"的开销，取得与 Arrow IPC 不同的收益——Arrow 是列式对齐批量，rkyv 是行存一次性点查。
+
+**评估逐层**：
+
+| Aura 层级 | 是否该用 rkyv | 理由 |
+|:--|:--|:--|
+| Raft 控制流与 RPC | ❌ 不替代 Postcard | Postcard 已足够；需演进 + Varint 压缩，rkyv 演进弱、体积大不是优势 |
+| 本地事务工作记忆 | ⚠️ 看负载 | 若以**批量列访问**为主 → Arrow IPC（Polars 对接）；若以**单条点查**为主 → rkyv 更适合（行存 O(1)） |
+| 云端 Lakehouse | ❌ | Lance 内嵌向量/倒排，S3 流式，rkyv 无此能力 |
+| 冷历史 | ❌ | Parquet 压缩率高，rkyv 无其压缩与列式 |
+| UI ↔ Gateway | ❌ | 非 Rust（JS/WASM 宿主）无法解读 rkyv，CBOR 自描述是对的 |
+| **KV value 只读点查** | ✅ **新落点** | 若 Fjall 的 value 需反复 mmap 免反序列化取字段，rkyv 是高价值新增 |
+
+**结论**：rkyv 不该替代现有任何一层，而是**补入一个此前未覆盖的形态**——"纯 Rust 本地存储的只读热查询"。它和 Postcard（RPC/演进）、Arrow（批量列分析）、CBOR（跨语言）各司其职，可并存。唯一要明确的是它与 Arrow 的分工：**批量列分析 → Arrow；单条/热路径点查 → rkyv，两者不是互为替代**。
 
 ### Postcard 替代 Bincode 的核心理由
 
