@@ -5,6 +5,14 @@
 **架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
 **Cross-ref:** [Redis 批判](../redis-critique.md) — Redis 为何被 KV 替代
 
+## 核心论点
+
+KV 以极简底座覆盖绝大多数存储需求，靠三个独立成立的判断：
+
+1. **进程内零网络开销**：嵌入式 KV（Fjall 等）直接跑在应用进程内，本地读取无网络跳数，消除 RTT 与序列化开销——使"为访问数据而网络调用"成为可避免的架构负担。对照 Redis 的「网络 RAM」（数据在远端、延迟被 RTT 主导），见 [Redis 批判](redis-critique.md)。
+2. **极简底座覆盖多模型**：KV 只有 get/put/scan，但通过复合键编码能在其上表达 Hash、ZSET、图、向量、全文等一切结构——一个底座覆盖众模型，复杂性收敛在编码层而非引擎层（详见[复合键编码](#复合键编码redis-数据结构--kv)与[多模型能力](#kv-之上的多模型能力向量搜索全文检索图查询)）。
+3. **从专家专属到 AI 可用**：KV 封装存储复杂性。AI 处理胶水代码（Key 编码、序列化），人类负责架构设计和审查，以及环境特定的生产运维判断。
+
 ## KV 的基本 API
 
 KV 存储引擎的接口极简，只有四个操作：
@@ -81,15 +89,98 @@ scan("inv:hello:")
 | `put(key, value)` | O(log N) | 写 MemTable（内存），flush 时顺序写 SSTable |
 | `delete(key)` | O(log N) | 写 tombstone 标记，Compaction 时回收 |
 
-## 核心论点
+### SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
 
-KV 以极简底座覆盖绝大多数存储需求，靠三个独立成立的判断：
+对于框架平台（API 网关、Agent 执行器、3D 流水线），数据访问路径在设计期就已固化。去掉 SQL 不是为了省事，而是消灭数据库优化器（Query Planner）这个运行时黑盒，获得 100% 的物理性能确定性。
 
-1. **进程内零网络开销**：嵌入式 KV（Fjall 等）直接跑在应用进程内，本地读取无网络跳数，消除 RTT 与序列化开销——使"为访问数据而网络调用"成为可避免的架构负担。对照 Redis 的「网络 RAM」（数据在远端、延迟被 RTT 主导），见 [Redis 批判](redis-critique.md)。
-2. **极简底座覆盖多模型**：KV 只有 get/put/scan，但通过复合键编码能在其上表达 Hash、ZSET、图、向量、全文等一切结构——一个底座覆盖众模型，复杂性收敛在编码层而非引擎层（详见[复合键编码](#复合键编码redis-数据结构--kv)与[多模型能力](#kv-之上的多模型能力向量搜索全文检索图查询)）。
-3. **从专家专属到 AI 可用**：KV 封装存储复杂性。AI 处理胶水代码（Key 编码、序列化），人类负责架构设计和审查。
+#### 实际对比：拉取最近 10 条对话记忆
 
-## 复合键编码：Redis 数据结构 → KV
+**SQL 方式**（PostgreSQL / SurrealDB）：
+
+```sql
+SELECT message_id, content FROM agent_memories
+WHERE session_id = 'session_456'
+ORDER BY timestamp DESC LIMIT 10;
+```
+
+底层物理代价：词法语法分析 → AST 树生成 → 逻辑执行计划 → 优化器猜测索引扫描还是全表扫描 → B-Tree 节点间频繁跳转。
+
+**KV 方式**（Rust + 嵌入式 KV）：
+
+写入时 Key 已编排为倒序物理格式：`m:{session_id}:{u64_max - timestamp}:{message_id}`。查询只需一行 Rust 管道链：
+
+```rust
+// 前缀定位 → 向后走 10 步，搞定
+let prefix = format!("m:session_456:").into_bytes();
+let top_10 = kv_engine
+    .scan(&prefix)         // 定位起始区间（O(log N) 内存二分）
+    .take(10)              // 顺序读 10 条（O(1) 磁盘/内存顺序 I/O）
+    .collect::<Vec<_>>();
+```
+
+**为什么 KV 胜出**：Rust 方法链比 SQL 声明式样板（SELECT/FROM/WHERE/ORDER BY/LIMIT）更精炼。没有黑盒优化器自作聪明——代码就是执行路径。数据从 10MB 到 10TB，执行效率不变，亚毫秒响应雷打不动。
+
+#### 生产级组件：原子双写 + 时间线索引
+
+展示如何用一个原子 Batch 在写入主数据的同时，自动构建时间线倒序二级索引，确保主表与索引表不会数据漂移：
+
+```rust
+use bytes::Bytes;
+use std::sync::Arc;
+
+/// 原子批处理（等价于 Fjall WriteBatch / SlateDB 的 batch API）
+pub struct TransactionBatch {
+    pub actions: Vec<(Vec<u8>, Option<Bytes>)>,
+}
+
+impl TransactionBatch {
+    pub fn put(&mut self, k: &[u8], v: &[u8]) {
+        self.actions.push((k.to_vec(), Some(Bytes::copy_from_slice(v))));
+    }
+    pub fn delete(&mut self, k: &[u8]) {
+        self.actions.push((k.to_vec(), None));
+    }
+}
+
+pub struct FrameworkStorage {
+    /// 跨 Tokio 多线程共享的全局嵌入式存储引擎
+    /// 生产中替换为 Arc<fjall::Keyspace> 或 Arc<slatedb::Db>
+    pub engine: Arc<String>,
+}
+
+impl FrameworkStorage {
+    /// 原子双写：保存 Agent 记忆 + 自动构建时间线倒序索引
+    pub fn save_agent_memory(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) -> TransactionBatch {
+        let mut batch = TransactionBatch { actions: Vec::new() };
+
+        // 1. 主表：完整数据
+        let data_key = format!("data:session:{}:msg:{}", session_id, message_id).into_bytes();
+        batch.put(&data_key, payload);
+
+        // 2. 时间线索引：倒序排列（u64::MAX - timestamp）
+        let inverted_time = u64::MAX - timestamp;
+        let mut index_key = Vec::new();
+        index_key.extend_from_slice(format!("idx:time:session:{}:", session_id).as_bytes());
+        index_key.extend_from_slice(&inverted_time.to_be_bytes());
+        index_key.extend_from_slice(format!(":{}", message_id).as_bytes());
+
+        // Value 为空——实体 ID 已编码在 Key 的字典序中
+        batch.put(&index_key, &[]);
+
+        batch
+    }
+}
+```
+
+主表存完整数据，索引表只存空 Value（实体 ID 已通过二分序编码在 Key 中）。一次原子提交，两个 Key 同时成功或同时失败。SQL 的 `INSERT INTO` 无法在一个语句中同时写入两张表并保证原子性——需要额外的事务包裹。
+
+### 复合键编码：Redis 数据结构 → KV
 
 纯 KV 引擎没有 Hash、ZSET 等原语。前端需要的一切数据结构，都通过 Key 编码 + 前缀/范围扫描统一模拟（下表以 Redis 数据结构为参照给出通用映射）：
 
@@ -102,8 +193,6 @@ KV 以极简底座覆盖绝大多数存储需求，靠三个独立成立的判�
 | `ZSET` | `zset:<key>:<score>:<member>` | `range` (score interval) | `put` / `remove` |
 
 关键细节：LIST 需要原子序列号生成 → 引擎内部的单调计数器。ZSET Score 编码使用零填充固定宽度格式，保证字典序正确。
-
-### Physical Encoding: Composite Key 排布细节
 
 纯 KV 引擎没有 Hash、ZSET 等原语。一切数据结构都是通过 Key 空间编码（Composite Key Encoding）在字节序上模拟出来的——LSM-Tree 的迭代器天然按字节排序，这意味着只要 Key 编码设计正确，范围扫描和排序在存储层零成本完成。Redis 的这一层抽象**极薄**：Hash 只是次一级的键空间（键拼接），ZSET 只是把"读 → 计算 → 写"序列在服务器端原子化——而"读改写"的原子化正是 KV `Batch`/CAS 的既有能力，见 [Redis 批判](redis-critique.md#65-redis-数据结构-api-的虚假护城河)。
 
@@ -136,7 +225,50 @@ ZSET 的核心约束是「按 Score 排序」。利用 LSM-Tree 的字节序排�
 
 Score 转为固定 8 字节大端序字节数组（`i64::to_be_bytes()`），确保数值大小与字节字典序严格一致。取前 10 名：迭代器 `Seek` 到 `"rank:scores:"` 前缀后向后遍历 10 次。无需内存排序，存储层自动保证顺序。
 
-#### 大端序补零的工程陷阱
+#### 双写原子性：ZSET 更新分数
+
+更新 ZSET 分数涉及两步：删除旧分数 Key + 写入新分数 Key。这是两个不同的 KV 操作，必须在同一个原子批次内完成：
+
+```rust
+let mut batch = keyspace.batch();
+batch.delete(old_score_key);   // 旧分数的索引
+batch.put(new_score_key, b""); // 新分数的索引
+batch.put(data_key, &updated_player); // 数据主表
+keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
+```
+
+如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。KV 引擎的 `Batch` API 保证底层 WAL 一次原子提交。
+
+在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 KV 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
+
+## 物理层编码范式：Key 编码的物理层通用技巧
+
+这几个范式不属于某个具体 Redis 结构映射，而是控制 Key 字节序、宽度、前缀与边界来利用 LSM-Tree 字典序和写入路径的通用物理层技巧。
+
+### 补码反转编码（Complement Encoding）：物理层面的倒序排列
+
+
+KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
+
+```rust
+// 标准正序 Key：老数据在最上面，新数据在最底下
+let key_ascending = format!("log:{}:{}:", session_id, timestamp).into_bytes();
+
+// 倒序 Key：最新写入的数据天然排在最前面！
+// u64::MAX - timestamp：时间戳越大（越新），减出来越小
+// 越小 → LSM-Tree 字典序越靠前 → 物理层面「最新优先」
+let inverted_time = u64::MAX - timestamp;
+let mut key_descending = Vec::new();
+key_descending.extend_from_slice(format!("log:{}:", session_id).as_bytes());
+key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保证按位对比正确
+```
+
+**物理含义**：`u64::MAX - 1722500000` = `18446744072007051616`，`u64::MAX - 1722500001` = `18446744072007051615`。后者更小，在 LSM-Tree 中排在更前面——时间戳越大（越新），Key 字典序越小，迭代器正向扫描自然得到倒序结果。
+
+**应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
+
+### 大端序补零的工程陷阱
+
 
 **绝对不能**将数字转为字符串后拼入 Key。字典序与数值序不同：
 
@@ -161,44 +293,7 @@ fn score_key(prefix: &[u8], score: i64, member: &[u8]) -> Vec<u8> {
 
 所有 Score 共享同一字节长度（8 bytes），高位补零由硬件指令自动完成，字典序 = 数值序。
 
-#### 补码反转编码（Complement Encoding）：物理层面的倒序排列
-
-KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
-
-```rust
-// 标准正序 Key：老数据在最上面，新数据在最底下
-let key_ascending = format!("log:{}:{}:", session_id, timestamp).into_bytes();
-
-// 倒序 Key：最新写入的数据天然排在最前面！
-// u64::MAX - timestamp：时间戳越大（越新），减出来越小
-// 越小 → LSM-Tree 字典序越靠前 → 物理层面「最新优先」
-let inverted_time = u64::MAX - timestamp;
-let mut key_descending = Vec::new();
-key_descending.extend_from_slice(format!("log:{}:", session_id).as_bytes());
-key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保证按位对比正确
-```
-
-**物理含义**：`u64::MAX - 1722500000` = `18446744072007051616`，`u64::MAX - 1722500001` = `18446744072007051615`。后者更小，在 LSM-Tree 中排在更前面——时间戳越大（越新），Key 字典序越小，迭代器正向扫描自然得到倒序结果。
-
-**应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
-
-#### 双写原子性：ZSET 更新分数
-
-更新 ZSET 分数涉及两步：删除旧分数 Key + 写入新分数 Key。这是两个不同的 KV 操作，必须在同一个原子批次内完成：
-
-```rust
-let mut batch = keyspace.batch();
-batch.delete(old_score_key);   // 旧分数的索引
-batch.put(new_score_key, b""); // 新分数的索引
-batch.put(data_key, &updated_player); // 数据主表
-keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
-```
-
-如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。KV 引擎的 `Batch` API 保证底层 WAL 一次原子提交。
-
-在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 KV 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
-
-#### 二级索引末尾必须追加主键 ID
+### 二级索引末尾必须追加主键 ID
 
 设计二级索引（如通过时间戳反查对话消息）时，必须将全局唯一的实体主键 ID 拼接到索引 Key 的最末尾。
 
@@ -214,7 +309,7 @@ idx:time:1722500000:msg_abc → ""
 idx:time:1722500000:msg_def → ""
 ```
 
-#### 哈希前缀打散：避开自增序列的写放大灾难
+### 哈希前缀打散：避开自增序列的写放大灾难
 
 当输入源严格自增递增（高频事件流水号、日志 tick），所有写操作集中撞击 LSM-Tree 末尾（Hotspot），后台 compaction 产生严重的磁盘写放大，IOPS 出现毛刺。
 
@@ -234,7 +329,7 @@ sharded_key.extend_from_slice(&timestamp.to_be_bytes());
 
 物理效果：连续递增的写入压力被均匀分散到 16 个独立的内存树（MemTable）中，多线程并发刷盘（Flush）并行处理，避开局部块锁竞争，写入吞吐量翻倍。代价是前缀扫描需要遍历所有桶——适合写密集、读按精确 Key 点查的场景。
 
-#### 长度前缀编码：消除低效的字符串分割扫描
+### 长度前缀编码：消除低效的字符串分割扫描
 
 Key 中拼接多个字符串属性时，冒号分隔（`table:app_name:user_id`）要求读取时写循环 `split` 查找分隔符——O(N) 字符串扫描。改用固定 2 字节长度前缀：
 
@@ -258,7 +353,26 @@ pub fn pack_string_component(buf: &mut Vec<u8>, component: &str) {
 | 固定宽度 | 否（依赖分隔符） | 是（每段 = 2 字节长度 + N 字节数据） |
 | 适用场景 | 人类可读调试 | 生产环境高频读写 |
 
-#### 多租户复合键编解码器：工业级实现
+### 数字命名空间字典
+
+引入内存映射表（Map），将字符串前缀压缩为固定 2 字节 u16 命名空间 ID：
+
+| 字符串方案 | 数字方案 | 压缩率 |
+|:--|:--|:--|
+| `"user_sessions:"` (14 字节) | `u16::to_be_bytes()` → 2 字节 | **85%** |
+
+Map 极小（1024 个 namespace 撑死几 KB），100% 常驻 CPU L1 Cache，`Map.get("sessions")` 耗时仅几纳秒。
+
+全局命名空间字典（编译期固定，过程宏实现见 [object-keyspace-mapping.md](object-keyspace-mapping.md)）：
+
+```
+Namespace 1 → sessions
+Namespace 2 → users
+Namespace 3 → logs
+```
+
+### 多租户复合键编解码器：工业级实现
+
 
 生产级组件——零堆分配（Zero-heap Allocation）的多租户复合键序列化/反序列化：
 
@@ -963,11 +1077,11 @@ impl GraphIndexer {
 
 **引擎无关 vs 引擎实现**：本章编码范式与源码示例均以引擎无关的方式呈现（示例以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描）。结合这些索引的**多语言协作检索架构**（Steel/PyO3/Rust 用户驱动路由）见 [嵌入式脚本语言选型](embedded-script-languages.md) §4.3。引擎选型的分水岭（存算一体 vs 存算分离：长时记忆大规模检索是否切 LanceDB+S3）见 [存储引擎终极裁判](lancedb-vs-fjall.md)。
 
-## 代码即 DDL：KV 的开发者体验保障
+## 网络层与分布式协同
 
-→ 完整内容（强类型 Key 编码、版本化 Enum 懒迁移、指针契约、TypedTable、SurrealDB DDL 缺陷、hex 单元测试）见独立文档 [OKM：Object-Keyspace Mapping](object-keyspace-mapping.md#代码即-ddlkv-的开发者体验保障)。
+网络接入、分布式锁与共识协调共同构成把嵌入式 KV 引擎扩展为分布式协同基础设施的层级：底层以 Raft 共识保证一致性，其上提供 gRPC 多线程网络与基于共识的锁。
 
-## 网络层：gRPC 微包装突破单线程限制
+### 网络层：gRPC 微包装突破单线程限制
 
 Redis 的单线程模型是 2009 年硬件条件下的最优解。在多核服务器上，Redis 的命令执行被锁死在单核——多实例分片引入客户端路由复杂性（§10.3 选型表）。
 
@@ -992,25 +1106,30 @@ Fjall + Tokio + Tonic 的组合提供等价的网络接口，同时突破单线�
 
 **进程内读写路径**：当 gRPC 服务与 Fjall 嵌入同一进程时，热路径（Actor 状态读写）仍走进程内直接调用（ns 级），gRPC 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
 
-## 分布式锁：Fjall 的实现
 
-| 维度 | Redlock（Redis） | Raft 锁（Fjall + 共识层） |
-|:--|:--|:--|
-| 互斥性 | 不安全（GC 停顿时钟漂移） | 保证（Leader Lease + 多数派 ACK） |
-| 时钟依赖 | 物理时钟（TTL） | 逻辑时钟（term + index） |
-| 故障模式 | 静默丢失锁 | 显式 Leader 选举，无数据丢失 |
-
-单机场景下，Fjall 的 Batch 原子操作提供进程内互斥。分布式锁需要共识层保证跨节点一致性——锁状态存储在专用 Fjall 分区（`lock` CF）中，由状态机 `apply` 管理。TTL 过期通过逻辑时钟检查，不依赖物理时钟。详见 [共识协议文档](consensus-protocol.md)。
-
-> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现。Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
-
-## 性能模型
-
+**性能模型**：
 - **单次读写**：ns~μs（进程内）vs Redis 0.1~2ms（网络 RTT）
+
 - **吞吐量（异步批处理）**：Fjall 多线程并发随核心数扩展；Redis 上限 ~80K ops/s（单线程）
+
 - **资源**：无需独立进程，LZ4 压缩，无需专用 DRAM 分配
 
-## 架构
+### 共识与协调层级
+
+```
+Business Coordination (locks, scheduling, election)
+    └── Meta-Coordination (consensus protocol)
+         ├── Log ordering
+         ├── State machine state
+         └── Membership changes
+```
+
+**Core principle**: 元数据共识是基础设施的基石，不是存储引擎的职责。Redis 没有共识层 → Redlock 建立在沙堡上。共识协议方案见 [共识协议文档](consensus-protocol.md)。
+
+**永远不要重写共识算法**——重写引入新 bug，代价远超收益。
+
+
+**架构部署**：
 
 ```
 应用层（锁、调度、配置、会话）
@@ -1025,119 +1144,8 @@ Fjall + Tokio + Tonic 的组合提供等价的网络接口，同时突破单线�
 
 **关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
 
-## 共识与协调层级
+> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
 
-```
-Business Coordination (locks, scheduling, election)
-    └── Meta-Coordination (consensus protocol)
-         ├── Log ordering
-         ├── State machine state
-         └── Membership changes
-```
-
-**Core principle**: 元数据共识是基础设施的基石，不是存储引擎的职责。Redis 没有共识层 → Redlock 建立在沙堡上。共识协议方案见 [共识协议文档](consensus-protocol.md)。
-
-## 工程分工
-
-| 任务 | 执行者 | 理由 |
-|:--|:--|:--|
-| 元数据共识 | 独立共识层（Openraft / etcd） | 永远不要重写共识算法 |
-| 状态机 `apply` | AI + 人类审查 | 模式匹配代码 |
-| Key 编码工具 | AI | 纯映射逻辑 |
-| 序列化 | AI | derive 宏 + 样板代码 |
-| 集成测试 | AI + 人类验证 | AI 生成，人类补充边界情况 |
-| 生产运维 | 人类 | 环境特定判断 |
-
-## SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
-
-对于框架平台（API 网关、Agent 执行器、3D 流水线），数据访问路径在设计期就已固化。去掉 SQL 不是为了省事，而是消灭数据库优化器（Query Planner）这个运行时黑盒，获得 100% 的物理性能确定性。
-
-### 实际对比：拉取最近 10 条对话记忆
-
-**SQL 方式**（PostgreSQL / SurrealDB）：
-
-```sql
-SELECT message_id, content FROM agent_memories
-WHERE session_id = 'session_456'
-ORDER BY timestamp DESC LIMIT 10;
-```
-
-底层物理代价：词法语法分析 → AST 树生成 → 逻辑执行计划 → 优化器猜测索引扫描还是全表扫描 → B-Tree 节点间频繁跳转。
-
-**KV 方式**（Rust + 嵌入式 KV）：
-
-写入时 Key 已编排为倒序物理格式：`m:{session_id}:{u64_max - timestamp}:{message_id}`。查询只需一行 Rust 管道链：
-
-```rust
-// 前缀定位 → 向后走 10 步，搞定
-let prefix = format!("m:session_456:").into_bytes();
-let top_10 = kv_engine
-    .scan(&prefix)         // 定位起始区间（O(log N) 内存二分）
-    .take(10)              // 顺序读 10 条（O(1) 磁盘/内存顺序 I/O）
-    .collect::<Vec<_>>();
-```
-
-**为什么 KV 胜出**：Rust 方法链比 SQL 声明式样板（SELECT/FROM/WHERE/ORDER BY/LIMIT）更精炼。没有黑盒优化器自作聪明——代码就是执行路径。数据从 10MB 到 10TB，执行效率不变，亚毫秒响应雷打不动。
-
-### 生产级组件：原子双写 + 时间线索引
-
-展示如何用一个原子 Batch 在写入主数据的同时，自动构建时间线倒序二级索引，确保主表与索引表不会数据漂移：
-
-```rust
-use bytes::Bytes;
-use std::sync::Arc;
-
-/// 原子批处理（等价于 Fjall WriteBatch / SlateDB 的 batch API）
-pub struct TransactionBatch {
-    pub actions: Vec<(Vec<u8>, Option<Bytes>)>,
-}
-
-impl TransactionBatch {
-    pub fn put(&mut self, k: &[u8], v: &[u8]) {
-        self.actions.push((k.to_vec(), Some(Bytes::copy_from_slice(v))));
-    }
-    pub fn delete(&mut self, k: &[u8]) {
-        self.actions.push((k.to_vec(), None));
-    }
-}
-
-pub struct FrameworkStorage {
-    /// 跨 Tokio 多线程共享的全局嵌入式存储引擎
-    /// 生产中替换为 Arc<fjall::Keyspace> 或 Arc<slatedb::Db>
-    pub engine: Arc<String>,
-}
-
-impl FrameworkStorage {
-    /// 原子双写：保存 Agent 记忆 + 自动构建时间线倒序索引
-    pub fn save_agent_memory(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        timestamp: u64,
-        payload: &[u8],
-    ) -> TransactionBatch {
-        let mut batch = TransactionBatch { actions: Vec::new() };
-
-        // 1. 主表：完整数据
-        let data_key = format!("data:session:{}:msg:{}", session_id, message_id).into_bytes();
-        batch.put(&data_key, payload);
-
-        // 2. 时间线索引：倒序排列（u64::MAX - timestamp）
-        let inverted_time = u64::MAX - timestamp;
-        let mut index_key = Vec::new();
-        index_key.extend_from_slice(format!("idx:time:session:{}:", session_id).as_bytes());
-        index_key.extend_from_slice(&inverted_time.to_be_bytes());
-        index_key.extend_from_slice(format!(":{}", message_id).as_bytes());
-
-        // Value 为空——实体 ID 已编码在 Key 的字典序中
-        batch.put(&index_key, &[]);
-
-        batch
-    }
-}
-```
-
-主表存完整数据，索引表只存空 Value（实体 ID 已通过二分序编码在 Key 中）。一次原子提交，两个 Key 同时成功或同时失败。SQL 的 `INSERT INTO` 无法在一个语句中同时写入两张表并保证原子性——需要额外的事务包裹。
 ## KV 框架 vs 自研数据库：演化边界
 
 纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
