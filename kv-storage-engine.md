@@ -1031,6 +1031,19 @@ meta:entry_point      → [u32]                   ← 图入口节点
 
 库负责建图和距离计算，KV 负责持久化图结构。`usearch` 的 `add()` 和 `search()` 是纯算法，不绑定存储——可以把内部数据结构 dump 到 KV，加载时从 KV 读回。
 
+**工业级离线冬眠与零延迟唤醒**（以 Fjall 为例）：向量检索不必 7×24 常驻内存。HNSW 图序列化后持久化到 KV，节点启动/唤醒时反序列化载入内存，查询走内存图，无新向量插入时将图快照 + 原始向量打包写回 KV、内存释放冬眠。整个生命周期是"载入 → 内存查询 → 落盘冬眠"的循环：
+
+```rust
+// 伪代码：在宿主 Actor 的 KV 存储中融合向量持久化
+pub fn save_vector_node(&self, partition: &PartitionHandle, vector_id: &str, embedding: &[f32]) {
+    // 采用 Bincode 极速紧凑序列化
+    let serialized_vec = bincode::serialize(embedding).unwrap();
+
+    // 写入本地磁盘（Fjall 示例；任意嵌入式 KV 等价）
+    partition.insert(format!("V:{}", vector_id).as_bytes(), serialized_vec).unwrap();
+}
+```
+
 #### 2. 全文搜索（BM25）
 
 **编码模式**：
@@ -1067,6 +1080,69 @@ inv:world:42    → [1, [1]]
 | **tantivy** | 内置分词+BM25+高亮，可整体复用，也可只取 BM25 模块 |
 
 英文按空格分词，中文需要 jieba 分词或 n-gram（简单但准确度低）。停用词过滤是应用层逻辑——维护一个 HashSet，分词后过滤掉。搜索本身就是 KV 的能力：分词 → 查倒排 → BM25 打分 → 排序，不需要额外的搜索引擎。
+
+**源码示例**（以 Fjall 为例，正排 `D:` 与倒排 `T:` 两个分区）：
+
+```rust
+// [document_store]  Key: "D:<Doc_ID>"        → Value: 原始纯文本
+// [inverted_index]  Key: "T:<Term>:<Doc_ID>" → Value: 词频（用于 TF-IDF / BM25 排名分）
+
+pub struct SearchEngine {
+    docs: PartitionHandle,
+    index: PartitionHandle,
+}
+
+impl SearchEngine {
+    pub fn new(keyspace: &Keyspace) -> Self {
+        Self {
+            docs: keyspace.open_partition("text_docs", Default::default()).unwrap(),
+            index: keyspace.open_partition("text_index", Default::default()).unwrap(),
+        }
+    }
+
+    // 1. 文本分析器：分词并建立物理倒排键
+    pub fn index_document(&self, doc_id: &str, content: &str) {
+        // 先存储原始文本
+        self.docs.insert(format!("D:{}", doc_id).as_bytes(), content.as_bytes()).unwrap();
+
+        // 极简分词清洗（通用开发环境可以使用 rust-stemmers 或 tantivy-tokenizer 增强）
+        let words: Vec<String> = content
+            .to_lowercase()
+            .retain(|c| c.is_alphanumeric() || c.is_whitespace()); // 清洗标点
+
+        let mut term_counts = std::collections::HashMap::new();
+        for word in content.split_whitespace() {
+            *term_counts.entry(word.to_lowercase()).or_insert(0u32) += 1;
+        }
+
+        // 2. 将词频原子化写入倒排索引分区
+        for (term, count) in term_counts {
+            let index_key = format!("T:{}:{}", term, doc_id);
+            let val = bincode::serialize(&count).unwrap();
+            self.index.insert(index_key.as_bytes(), val).unwrap();
+        }
+    }
+
+    // 3. 关键词检索：求多个 Term 的 Posting List 交集
+    pub fn search(&self, query: &str) -> Vec<String> {
+        let search_term = query.to_lowercase();
+        let prefix = format!("T:{}:", search_term);
+        let mut matched_docs = Vec::new();
+
+        // 闪速前缀扫描
+        for item in self.index.prefix(prefix.as_bytes()) {
+            if let Ok((key, _)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() == 3 {
+                    matched_docs.push(parts[2].to_string()); // 拿到 Doc_ID
+                }
+            }
+        }
+        matched_docs
+    }
+}
+```
 
 #### 3. 图数据存储与查询
 
@@ -1120,6 +1196,60 @@ adj:alice:knows:dave    → []    ← 新增，直接 put，原子操作
 
 查询时从 KV 加载子图到 petgraph 跑算法，结果写回 KV。简单的 BFS/DFS/多跳穿透直接在 KV 层实现，不需要加载到内存图结构。
 
+**源码示例**（以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描接口）：
+
+```rust
+// [Partition: Out-Edges] Key: "E:out:<Src_ID>:<Edge_Type>:<Dst_ID>" → Value: MsgPack(权重/属性)
+// [Partition: In-Edges]  Key: "E:in:<Dst_ID>:<Edge_Type>:<Src_ID>"  → Value: None (仅用于快速反向索引)
+
+use fjall::{Keyspace, PartitionHandle};
+use serde::{Serialize, Deserialize};
+
+pub struct GraphIndexer {
+    out_edges: PartitionHandle,
+    in_edges: PartitionHandle,
+}
+
+impl GraphIndexer {
+    pub fn new(keyspace: &Keyspace) -> Self {
+        Self {
+            out_edges: keyspace.open_partition("graph_out", Default::default()).unwrap(),
+            in_edges: keyspace.open_partition("graph_in", Default::default()).unwrap(),
+        }
+    }
+
+    // 1. 插入一条边：利用分布式 Raft 达成共识后，本地双向原子写入
+    pub fn insert_edge(&self, src: &str, edge_type: &str, dst: &str, weight: f32) {
+        let out_key = format!("E:out:{}:{}:{}", src, edge_type, dst);
+        let in_key = format!("E:in:{}:{}:{}", dst, edge_type, src);
+        let val = bincode::serialize(&weight).unwrap();
+
+        // 顺序落盘，布隆过滤器会自动加速单键判定
+        self.out_edges.insert(out_key.as_bytes(), val).unwrap();
+        self.in_edges.insert(in_key.as_bytes(), &[]).unwrap();
+    }
+
+    // 2. 流式遍历出度（零拷贝获取节点 A 的所有下游邻居）
+    pub fn get_out_neighbors(&self, src: &str) -> Vec<String> {
+        let prefix = format!("E:out:{}:", src);
+        let mut neighbors = Vec::new();
+
+        // 利用 LSM-Tree 强大的顺序范围扫描 (Range Scan)
+        for item in self.out_edges.prefix(prefix.as_bytes()) {
+            if let Ok((key, _)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                // 极其干净地切割字符串，提取 Dst_ID
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() == 5 {
+                    neighbors.push(parts[4].to_string());
+                }
+            }
+        }
+        neighbors
+    }
+}
+```
+
 #### 整体架构
 
 ```
@@ -1144,6 +1274,8 @@ adj:alice:knows:dave    → []    ← 新增，直接 put，原子操作
 ```
 
 三个能力都是 KV 之上的编码模式，不是新存储引擎。组合起来就是一个多模型数据库——和 SurrealDB 的架构同源，只是没有查询语言层。
+
+**引擎无关 vs 引擎实现**：本章编码范式与源码示例均以引擎无关的方式呈现（示例以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描）。结合这些索引的**多语言协作检索架构**（Steel/PyO3/Rust 用户驱动路由）见 [嵌入式脚本语言选型](embedded-script-languages.md) §4.3。引擎选型的分水岭（存算一体 vs 存算分离：长时记忆大规模检索是否切 LanceDB+S3）见 [存储引擎终极裁判](lancedb-vs-fjall.md)。
 
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 

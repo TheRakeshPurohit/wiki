@@ -310,8 +310,7 @@ storage_options = {
 
 本文档是存储引擎选型的终极裁判，与以下详细分析形成完整的决策闭环：
 
-- **[KV 存储引擎架构](kv-storage-engine.md)**：高频状态变动的存算一体架构。
-- **[Fjall 多模态索引](fjall-multimodal-indexing.md)**：图、向量、文本索引的本地实现方案。
+- **[KV 存储引擎架构](kv-storage-engine.md)**：高频状态变动的存算一体架构。多模态索引（向量/全文/图）的编码范式与 Fjall 源码示例见其「KV 之上的多模型能力」节。
 - **[Redis 批判](redis-critique.md)**：详细论证为何 Redis 是"网络 RAM 陷阱"，本方案彻底排除 Redis。
 - **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，含反证章节（换成 Redis 的架构退化分析）。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体，含 7 种数据格式底层字节排布对撞。
