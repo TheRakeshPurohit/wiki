@@ -83,32 +83,17 @@ scan("inv:hello:")
 
 ## 核心论点
 
-三个认知转变颠覆了 Redis 作为核心基础设施的范式：
+KV 以极简底座覆盖绝大多数存储需求，靠三个独立成立的判断：
 
-1. **从跨网络到进程内**：Redis 是「网络 RAM」——为无状态语言（PHP）设计的变通方案。Rust 进程是持久状态容器。Fjall（嵌入式 LSM-Tree KV）彻底消除网络 RTT 和序列化开销。
-2. **从伪分布式到真共识**：Redis Cluster/Redlock 缺乏强一致性。Kleppmann 2016 已证明 Redlock 不安全（GC 停顿 + 时钟漂移）。元数据共识方案见 [共识协议文档](consensus-protocol.md)。
-3. **从专家专属到 AI 可用**：Fjall 封装存储复杂性。AI 处理胶水代码（Key 编码、序列化），人类负责架构设计和审查。
-
-## 架构
-
-```
-应用层（锁、调度、配置、会话）
-        │
-  状态机（Fjall 引擎 — 嵌入式持久化）
-        │
-  Fjall 引擎（LSM-Tree KV — 本地 NVMe）
-        │
-  ┌─────┼─────┐
-  节点1  节点2  节点3    （单机或集群部署）
-```
-
-**关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
+1. **进程内零网络开销**：嵌入式 KV（Fjall 等）直接跑在应用进程内，本地读取无网络跳数，消除 RTT 与序列化开销——使"为访问数据而网络调用"成为可避免的架构负担。对照 Redis 的「网络 RAM」（数据在远端、延迟被 RTT 主导），见 [Redis 批判](redis-critique.md)。
+2. **极简底座覆盖多模型**：KV 只有 get/put/scan，但通过复合键编码能在其上表达 Hash、ZSET、图、向量、全文等一切结构——一个底座覆盖众模型，复杂性收敛在编码层而非引擎层（详见[复合键编码](#复合键编码redis-数据结构--kv)与[多模型能力](#kv-之上的多模型能力向量搜索全文检索图查询)）。
+3. **从专家专属到 AI 可用**：KV 封装存储复杂性。AI 处理胶水代码（Key 编码、序列化），人类负责架构设计和审查。
 
 ## 复合键编码：Redis 数据结构 → KV
 
-Fjall 是纯 KV 引擎。Redis 的数据结构通过 Key 编码 + 前缀/范围扫描模拟：
+纯 KV 引擎没有 Hash、ZSET 等原语。前端需要的一切数据结构，都通过 Key 编码 + 前缀/范围扫描统一模拟（下表以 Redis 数据结构为参照给出通用映射）：
 
-| Redis | Fjall Pattern | Read | Write |
+| Redis | KV Pattern | Read | Write |
 |-------|--------------|------|-------|
 | `STRING` | `str:<key>` | `get` | `put` |
 | `HASH` | `hash:<key>:<field>` | `get` / `prefix` | `put` / `remove` |
@@ -124,14 +109,14 @@ Fjall 是纯 KV 引擎。Redis 的数据结构通过 Key 编码 + 前缀/范围�
 
 #### Hash 的物理编码
 
-Redis Hash `HSET user:101 name "Alice"` 在 Fjall 中拆为两个独立 KV 对：
+Redis Hash `HSET user:101 name "Alice"` 拆为两个独立的 KV 对：
 
 ```
 Key: "hash:user:101:name"  →  Value: "Alice"       (string)
 Key: "hash:user:101:age"   →  Value: [0x00000019]   (i64 big-endian, 8 bytes)
 ```
 
-**前缀扫描批量删除**：`DEL user:101` 不需要先读取再逐字段删除。直接用 `prefix("hash:user:101:")` 定位所有字段 Key，批量发出 Delete 指令。LSM-Tree 的删除本质是写入 Tombstone 标记，O(1) 操作。Redis 的大 Hash 删除（百万字段级别）会阻塞单线程事件循环数十毫秒，Fjall 无此问题——多线程后台 compaction 异步清理 Tombstone，不阻塞前台请求。
+**前缀扫描批量删除**：`DEL user:101` 不需要先读取再逐字段删除。直接用 `prefix("hash:user:101:")` 定位所有字段 Key，批量发出 Delete 指令。LSM-Tree 的删除本质是写入 Tombstone 标记，O(1) 操作。Redis 的大 Hash 删除（百万字段级别）会阻塞单线程事件循环数十毫秒，LSM-Tree 引擎无此问题——多线程后台 compaction 异步清理 Tombstone，不阻塞前台请求。
 
 #### ZSET 的物理编码：Score 作为 Key 前缀的逆向索引
 
@@ -209,9 +194,9 @@ batch.put(data_key, &updated_player); // 数据主表
 keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
 ```
 
-如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。Fjall 的 `Batch` API 保证底层 WAL 一次原子提交。
+如果不使用原子批次，崩溃导致只写了一半 → ZSET 索引产生脏数据（一个成员同时出现在两个分数位置，或丢失）。KV 引擎的 `Batch` API 保证底层 WAL 一次原子提交。
 
-在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 Fjall 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
+在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 KV 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
 
 #### 二级索引末尾必须追加主键 ID
 
@@ -330,7 +315,7 @@ impl AgentMemoryKey {
 
 在纯 KV 世界里，算法不再是游离在数据库外面的胶水代码——Key 编码格式本身就是索引层、缓存层和隔离层。
 
-### 模式一：Index-Only Scan（索引即数据）
+### Index-Only Scan（索引即数据）
 
 二级索引的 Value 留空，entity_id 编码在 Key 末尾。查询时仅遍历 Key 序列即可获取所有匹配的主键 ID，无需回表读取 Value——零磁盘 I/O。
 
@@ -348,7 +333,7 @@ impl AgentMemoryKey {
 
 **物理效果**：前缀扫描只触碰 LSM-Tree 的 MemTable + 索引层 SSTable（极小），不碰数据层的大 Value 文件。适合高频属性筛选（网关路由匹配、Agent 状态过滤）。
 
-### 模式二：Bitmap 前置拦截（热路径零 KV 调用）
+### Bitmap 前置拦截（热路径零 KV 调用）
 
 网关高频检查「IP 是否在黑名单」「Token 是否合法」。每次请求都 `kv.get()` 即便命中缓存也有哈希查找开销。解法：在应用层内存常驻 Roaring Bitmap 或布隆过滤器。
 
@@ -368,7 +353,7 @@ impl AgentMemoryKey {
 
 **与布隆过滤器的区别**：Bitmap 支持精确删除（`bitmap.unset()`），布隆过滤器只增不删。高频变更的黑名单用 Bitmap；只增不减的 Token 白名单用布隆过滤器更省内存。
 
-### 模式三：应用层 MVCC（无原生 MVCC 引擎的时间旅行）
+### 应用层 MVCC（无原生 MVCC 引擎的时间旅行）
 
 Fjall/SlateDB 不支持原生 MVCC。框架团队通过将版本号编排进 Key 骨架，实现应用层多版本控制：
 
@@ -382,7 +367,7 @@ Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
 
 **与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
 
-### 模式四：WiscKey 键值分离（大 Value 场景的写放大解药）
+### WiscKey 键值分离（大 Value 场景的写放大解药）
 
 典型场景：Key 几十字节，Value 几 MB（对话历史、3D 资产二进制、多模态特征向量、日志原始载荷）。传统 LSM-Tree 在 Compaction 时将 Key+Value 捆绑重写，写放大几十倍。
 
@@ -406,9 +391,9 @@ Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现
 
 ## SQL 操作的 KV 实现
 
-设计模式章节的模式一~四是 KV 引擎的物理特性利用（LSM-Tree 字典序、补码反转、WiscKey 分离）。本章节从 SQL 的视角出发：多维查询、JOIN、聚合这些关系型数据库的核心操作，在纯 KV 底座上如何实现。
+设计模式章节的几个范式（Index-Only Scan、Bitmap 前置拦截、应用层 MVCC、WiscKey 分离）是 KV 引擎的物理特性利用（LSM-Tree 字典序、补码反转、WiscKey 分离）。本章节从 SQL 的视角出发：多维查询、JOIN、聚合这些关系型数据库的核心操作，在纯 KV 底座上如何实现。
 
-### 模式五：倒排索引交集（多维查询的 KV 实现）
+### 倒排索引交集（多维查询的 KV 实现）
 
 SQL 的多条件组合查询：
 
@@ -487,11 +472,11 @@ Step 3: 200 次点查 → ~200μs（NVMe 随机读）
 
 | 策略 | 维度组合 | 读延迟 | 适用场景 |
 |:--|:--|:--|:--|
-| **前缀编码**（模式一思想） | 设计期固定，≤3 维度 | 1 次扫描 | 维度少、组合固定 |
+| **前缀编码**（Index-Only Scan） | 设计期固定，≤3 维度 | 1 次扫描 | 维度少、组合固定 |
 | **倒排索引交集** | 任意组合 | 2+ 次扫描 + 交集 + 回表 | 维度多、组合不可预测 |
-| **Bitmap 拦截**（模式二） | 设计期固定，维度值有限 | 0 次 KV（纯 CPU） | 高并发热路径 |
+| **Bitmap 拦截**（Bitmap 前置拦截） | 设计期固定，维度值有限 | 0 次 KV（纯 CPU） | 高并发热路径 |
 
-### 模式六：去范式化 vs 应用层 JOIN
+### 去范式化 vs 应用层 JOIN
 
 SQL JOIN 的本质是「根据关联键合并两个实体」。KV 没有关联表概念——核心决策只有一个：**在写入时合并，还是在读取时合并**。
 
@@ -592,7 +577,7 @@ while i < orders.len() && j < users.len() {
 | 多对多关系（标签、分类） | 指针索引 | 关联关系独立演进 |
 | 固定 2-3 张表的关系 | 复合实体编码 | 直接拍平成一个大 Key |
 
-### 模式七：预聚合计数器（GROUP BY 的 KV 实现）
+### 预聚合计数器（GROUP BY 的 KV 实现）
 
 SQL 的 `SELECT region, COUNT(*), SUM(amount) FROM orders GROUP BY region` 是查询时按需计算。KV 没有聚合原语，两个解法各有代价：
 
@@ -628,305 +613,6 @@ let results = kv.scan(b"idx:time:2026-08:")
 ```
 
 **代价**：全量扫描 + 内存聚合，数据量大时 OOM。与 SQL 的全表扫描 GROUP BY 物理代价相同——SQL 也不会对没有索引的 GROUP BY 字段做任何优化。
-
-## 网络层：gRPC 微包装突破单线程限制
-
-Redis 的单线程模型是 2009 年硬件条件下的最优解。在多核服务器上，Redis 的命令执行被锁死在单核——多实例分片引入客户端路由复杂性（§10.3 选型表）。
-
-Fjall + Tokio + Tonic 的组合提供等价的网络接口，同时突破单线程限制：
-
-```
-[gRPC Client]
-      │
-      ▼
-[Tonic gRPC Server — Tokio 多线程异步运行时]
-      │  多个 CPU 核心同时处理不同的 gRPC 连接
-      ▼
-[Fjall LSM-Tree — Arc<Keyspace> 线程安全]
-      │  多线程并发读写同一个存储实例
-      ▼
-[NVMe SSD]
-```
-
-**计算层**：Tonic + Tokio 天生多线程异步。数十个 CPU 核心并行处理不同连接，不存在 Redis 的单线程瓶颈。恶意阻塞命令（如全量 KEYS *）只影响单个 Tokio task，不阻塞其他连接。
-
-**存储层**：Fjall 的 `Arc<Keyspace>` 实现线程安全。多线程可同时对同一个 Keyspace 发起读写，LSM-Tree 的无锁读路径（MemTable + SSTable）和后台 compaction 线程天然并发。
-
-**进程内读写路径**：当 gRPC 服务与 Fjall 嵌入同一进程时，热路径（Actor 状态读写）仍走进程内直接调用（ns 级），gRPC 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
-
-## 分布式锁：Fjall 的实现
-
-| 维度 | Redlock（Redis） | Raft 锁（Fjall + 共识层） |
-|:--|:--|:--|
-| 互斥性 | 不安全（GC 停顿时钟漂移） | 保证（Leader Lease + 多数派 ACK） |
-| 时钟依赖 | 物理时钟（TTL） | 逻辑时钟（term + index） |
-| 故障模式 | 静默丢失锁 | 显式 Leader 选举，无数据丢失 |
-
-单机场景下，Fjall 的 Batch 原子操作提供进程内互斥。分布式锁需要共识层保证跨节点一致性——锁状态存储在专用 Fjall 分区（`lock` CF）中，由状态机 `apply` 管理。TTL 过期通过逻辑时钟检查，不依赖物理时钟。详见 [共识协议文档](consensus-protocol.md)。
-
-> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现。Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
-
-## 性能模型
-
-- **单次读写**：ns~μs（进程内）vs Redis 0.1~2ms（网络 RTT）
-- **吞吐量（异步批处理）**：Fjall 多线程并发随核心数扩展；Redis 上限 ~80K ops/s（单线程）
-- **资源**：无需独立进程，LZ4 压缩，无需专用 DRAM 分配
-
-## 共识与协调层级
-
-```
-Business Coordination (locks, scheduling, election)
-    └── Meta-Coordination (consensus protocol)
-         ├── Log ordering
-         ├── State machine state
-         └── Membership changes
-```
-
-**Core principle**: 元数据共识是基础设施的基石，不是存储引擎的职责。Redis 没有共识层 → Redlock 建立在沙堡上。共识协议方案见 [共识协议文档](consensus-protocol.md)。
-
-## 工程分工
-
-| 任务 | 执行者 | 理由 |
-|:--|:--|:--|
-| 元数据共识 | 独立共识层（Openraft / etcd） | 永远不要重写共识算法 |
-| 状态机 `apply` | AI + 人类审查 | 模式匹配代码 |
-| Key 编码工具 | AI | 纯映射逻辑 |
-| 序列化 | AI | derive 宏 + 样板代码 |
-| 集成测试 | AI + 人类验证 | AI 生成，人类补充边界情况 |
-| 生产运维 | 人类 | 环境特定判断 |
-
-## SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
-
-对于框架平台（API 网关、Agent 执行器、3D 流水线），数据访问路径在设计期就已固化。去掉 SQL 不是为了省事，而是消灭数据库优化器（Query Planner）这个运行时黑盒，获得 100% 的物理性能确定性。
-
-### 实际对比：拉取最近 10 条对话记忆
-
-**SQL 方式**（PostgreSQL / SurrealDB）：
-
-```sql
-SELECT message_id, content FROM agent_memories
-WHERE session_id = 'session_456'
-ORDER BY timestamp DESC LIMIT 10;
-```
-
-底层物理代价：词法语法分析 → AST 树生成 → 逻辑执行计划 → 优化器猜测索引扫描还是全表扫描 → B-Tree 节点间频繁跳转。
-
-**KV 方式**（Rust + 嵌入式 KV）：
-
-写入时 Key 已编排为倒序物理格式：`m:{session_id}:{u64_max - timestamp}:{message_id}`。查询只需一行 Rust 管道链：
-
-```rust
-// 前缀定位 → 向后走 10 步，搞定
-let prefix = format!("m:session_456:").into_bytes();
-let top_10 = kv_engine
-    .scan(&prefix)         // 定位起始区间（O(log N) 内存二分）
-    .take(10)              // 顺序读 10 条（O(1) 磁盘/内存顺序 I/O）
-    .collect::<Vec<_>>();
-```
-
-**为什么 KV 胜出**：Rust 方法链比 SQL 声明式样板（SELECT/FROM/WHERE/ORDER BY/LIMIT）更精炼。没有黑盒优化器自作聪明——代码就是执行路径。数据从 10MB 到 10TB，执行效率不变，亚毫秒响应雷打不动。
-
-### 生产级组件：原子双写 + 时间线索引
-
-展示如何用一个原子 Batch 在写入主数据的同时，自动构建时间线倒序二级索引，确保主表与索引表不会数据漂移：
-
-```rust
-use bytes::Bytes;
-use std::sync::Arc;
-
-/// 原子批处理（等价于 Fjall WriteBatch / SlateDB 的 batch API）
-pub struct TransactionBatch {
-    pub actions: Vec<(Vec<u8>, Option<Bytes>)>,
-}
-
-impl TransactionBatch {
-    pub fn put(&mut self, k: &[u8], v: &[u8]) {
-        self.actions.push((k.to_vec(), Some(Bytes::copy_from_slice(v))));
-    }
-    pub fn delete(&mut self, k: &[u8]) {
-        self.actions.push((k.to_vec(), None));
-    }
-}
-
-pub struct FrameworkStorage {
-    /// 跨 Tokio 多线程共享的全局嵌入式存储引擎
-    /// 生产中替换为 Arc<fjall::Keyspace> 或 Arc<slatedb::Db>
-    pub engine: Arc<String>,
-}
-
-impl FrameworkStorage {
-    /// 原子双写：保存 Agent 记忆 + 自动构建时间线倒序索引
-    pub fn save_agent_memory(
-        &self,
-        session_id: &str,
-        message_id: &str,
-        timestamp: u64,
-        payload: &[u8],
-    ) -> TransactionBatch {
-        let mut batch = TransactionBatch { actions: Vec::new() };
-
-        // 1. 主表：完整数据
-        let data_key = format!("data:session:{}:msg:{}", session_id, message_id).into_bytes();
-        batch.put(&data_key, payload);
-
-        // 2. 时间线索引：倒序排列（u64::MAX - timestamp）
-        let inverted_time = u64::MAX - timestamp;
-        let mut index_key = Vec::new();
-        index_key.extend_from_slice(format!("idx:time:session:{}:", session_id).as_bytes());
-        index_key.extend_from_slice(&inverted_time.to_be_bytes());
-        index_key.extend_from_slice(format!(":{}", message_id).as_bytes());
-
-        // Value 为空——实体 ID 已编码在 Key 的字典序中
-        batch.put(&index_key, &[]);
-
-        batch
-    }
-}
-```
-
-主表存完整数据，索引表只存空 Value（实体 ID 已通过二分序编码在 Key 中）。一次原子提交，两个 Key 同时成功或同时失败。SQL 的 `INSERT INTO` 无法在一个语句中同时写入两张表并保证原子性——需要额外的事务包裹。
-## 代码即 DDL：KV 的开发者体验保障
-
-→ 完整内容（强类型 Key 编码、版本化 Enum 懒迁移、指针契约、TypedTable、SurrealDB DDL 缺陷、hex 单元测试）见独立文档 [OKM：Object-Keyspace Mapping](object-keyspace-mapping.md#代码即-ddlkv-的开发者体验保障)。
-
-## KV 框架 vs 自研数据库：演化边界
-
-纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
-
-```
-客户端文本查询 ("SELECT * FROM users WHERE age = 25")
-        │
-        ▼
-┌─ Parser ──────────────────────┐  文本 → AST（抽象语法树）
-└───────────────┬───────────────┘
-                ▼
-┌─ Optimizer ───────────────────┐  AST → 最优物理执行路径
-└───────────────┬───────────────┘
-                ▼
-kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
-        │
-        ▼
-┌─ KV Engine (Fjall/SlateDB) ──┐  二进制字节落盘
-└───────────────────────────────┘
-```
-
-### 工业界的真实路径
-
-| 数据库 | 查询层 | 存储内核 | 本质 |
-|:--|:--|:--|:--|
-| **TiDB** | MySQL 语法解析器 + 分布式执行计划优化 | TiKV（Rust KV） | SQL 翻译器 + KV |
-| **CockroachDB** | PostgreSQL 语法兼容 + 代价优化器 | Pebble（Go KV） | SQL 翻译器 + KV |
-| **SurrealDB** | SurrealQL 函数式解析器 + 图遍历优化 | SurrealKV（Rust KV） | DSL 翻译器 + KV |
-
-它们没有发明新的磁盘驱动器，只是在 KV 之上盖了一层解析器和优化器外壳。
-
-### 坚守纯 KV 的理由（框架团队的正确选择）
-
-当查询模式在设计期就已 100% 固定时，Parser + Optimizer 是多余的运行时开销：
-
-- **零解析损耗**：编译期直接写死 `kv_engine.scan(&prefix)`，不需要运行时解析 SQL 字符串
-- **100% 确定性响应**：无优化器「抽风」变慢的风险，P99 延迟雷打不动
-- **单一二进制体积**：不引入 SQL 解析器、优化器、类型系统的代码膨胀
-
-### 什么是「查询模式固定」：需求可控性（话语权）决定
-
-KV 的零解析损耗、确定性响应、单二进制体积，只有在查询模式可固化时才兑现。但**固定与否不是技术属性，是需求可控性（话语权）问题**：
-
-- **需求由你掌控且稳定**：查询在设计期可固化，KV 的物理优势（追加写、零 DDL、确定性响应）全部兑现，「坚守纯 KV」成立。
-- **需求由多变的外部力量驱动**：查询不可预测。此时 **SQL 更通用**——即便 SQL 实现不了某个需求，失败也归结为「SQL 的技术限制」，这是行业统一认知、责任可外推；KV 则把「为什么做不到」变成你的实现责任。
-
-判断标准不是「做产品 vs 外包」的组织身份，而是**需求是否由你掌控**。话语权丧失的两种方式：**外包**（甲方决定需求），以及**做产品但服务客户多变需求**（如企业管理软件——客户需求大于一切）。后者即便你是老板也无效：业务本身在为别人服务，你就没有话语权。
-
-### 数据量大时，KV 不要求查询模式固定
-
-"查询模式固定"是 KV 的第一优先级准则——固定模式意味着编译期消灭运行时开销，零解析损耗。但还有一个容易被忽视的维度：**数据量本身**。
-
-当数据量大到关系型引擎扛不住时，KV 的物理优势即使在查询模式经常变化的场景下仍然成立。原因在于 LSM-Tree 的写入代价是 O(log N)，而关系型引擎的模式变更代价与表大小成正比：
-
-| 操作 | KV 的代价 | 关系型的代价 |
-|:---|:---|:---|
-| 新增查询模式 | 开始写新前缀的 Key，**零 DDL** | ALTER TABLE + 迁移脚本，大表锁分钟级 |
-| 新增二级索引 | 写一个新的 prefix scan 函数，**零重建** | CREATE INDEX = 全表扫描 + 重建，大表小时级 |
-| 数据迁移 | 旧 Key 保留，新 Key 按新编码写入，**零停机** | 大表重分区 = 长时间锁 + 复制 |
-
-**物理本质**：LSM-Tree 的 SSTable 是追加写入、不可变的。新增 Key 模式只是在最新的 MemTable 里多一种前缀，不需要修改已有的 SSTable。关系型引擎的索引是 B-Tree，每次结构变更都涉及页面分裂和重组，代价与表大小成正比。
-
-**实际影响**：即使你每月改一次查询模式——新增一个前缀扫描、调整一个复合键布局——KV 的成本是 O(1)（写一个 scan 函数），而关系型的成本是 O(N)（N = 表大小）。当 N 超过某个阈值（百万行起步），KV 的物理优势足以覆盖"模式不固定"带来的工程摩擦。
-
-**判定**：查询模式固定是 KV 的**最佳**使用场景，但不是**必要**条件。数据量大本身就是选择 KV 的理由——体量产生的物理优势（追加写、无索引重建、零 DDL 锁）让模式变更的代价从 O(N) 降到 O(1)。
-
-### 需求变化对 KV 是 O(1)：加字段/表/索引天然更可控
-
-一般需求变化（加字段、加表、加索引），KV 不只是"也不差"，而是**天然 O(1)**——比 SQL 更可控：
-
-| 需求变化 | KV 的代价 | 关系型的代价 |
-|:---|:---|:---|
-| 加字段 | 可演进序列化加新字段，Key 不变，零 DDL | `ALTER TABLE ADD COLUMN` = 大表锁 |
-| 加表 | 新前缀空间 | `CREATE TABLE` |
-| 加索引 | 写一个新的 scan 函数 | `CREATE INDEX` = 全表扫描 + 重建 |
-| 改查询 | 改 scan 函数，零迁移 | 优化器 + 重新设计索引 |
-
-对整行打包：加字段 = 给序列化加一个字段（field_id / 版本），Key 完全不变，旧数据用旧版本 reader 读、新老共存，零 DDL、零迁移。加表 = 新前缀空间、加索引 = 加一个 scan 函数，都是"加一行代码"，不触碰历史数据、没有在线 schema 迁移。
-
-若采用每字段一个 key 的列式布局，加字段确实更简单——只要添加一个新的前缀 Key 即可。但**这种"简单"正是它不可取的原因**：列式布局把"加字段"从序列化演进降级为"加一个扫描维度"，换来的是 OLTP 下整行读 N 次点查、写放大、跨 key 事务的代价（见「value 打包粒度」）；它只是把 DDL 的痛平移成了查询/写入的痛，并非免费的更可控——除非负载本就是列式聚合（OLAP），那才需要该字段为前缀的布局。
-
-**推论——SQL 的真正剩余优势**：SQL 的优势**不在处理需求变化**（这块反而输给 KV 的零 DDL），而在两点：
-
-1. **不可预测的即席复合分析**——SQL 是声明式，Parser + Optimizer 是现成的通用查询引擎，新查询不用写代码；KV 是命令式，复合聚合（join 多表 + 多条件 + 分桶统计）必须手写 scan 组合 + 应用层聚合。设计期可预知 → 打平；事后才冒出 → SQL 胜。
-2. **跨边界共享**——键空间是**私有协议**，SQL 是**行业通用货币**。封闭单团队自用，私有语言高效；需对接第三方/现成 BI 工具，键空间要自发明协议 + 写文档 + 让人学。
-
-**洞察**：SQL 的剩余优势不在"处理需求更强"，而在"把查询能力委托给了你没发明的通用解析器"。当团队既掌控需求、又愿意自研键空间时，这份委托失去必要性——但代价是失去即席未知查询和对外共享那两张"现成引擎"的网。
-
-### 什么时候必须蜕变为数据库
-
-只有当系统需要开放给外部第三方开发者、允许最终用户通过低代码/动态插件自由写出不可预测的复杂查询时——为了防止他们写出全表扫描的垃圾查询把底层存储扫爆，才必须在最前面加一层 Parser + Optimizer 做查询门禁。
-
-**AdHoc 分析**是另一个典型触发场景。AdHoc 面向的数据分析师（广义含开发运维分析日志）本质在做**动态的多维查询**——不断修改范围、下钻、聚合透视，无法在设计期固化成 prefix scan。更根本地，这是**分析型（OLAP）负载**，而 KV 本质是**行存**：每个键对应一条值字节流，前缀扫描要读入并解码整条记录，无法按列投影、压缩与向量化。因此即便分析者掌握键 schema、能自写扫描函数，行导向 KV 在分析负载上仍远逊于**列式 OLAP 引擎（如 DuckDB）**——列存只读所需列、同型值压缩率高、过滤聚合可下推，性能是结构性碾压。纯 KV 的用武之地是点查与固定模式扫描（OLTP 形态）；**AdHoc 这类动态多维负载的正确归宿是列式 OLAP 层，而非纯 KV**
-
-**判定**：框架平台的正确姿态是坚守纯 KV + 复合键编码。数据库是 KV 的上层封装，不是 KV 的替代。如果你的查询模式是固定的， Parser + Optimizer 就是用运行时 CPU 开销去解决一个编译期就能消灭的问题。
-
-### KV 的 value 存 Arrow/Parquet？列式存储在 KV 上的伪装
-
-被「KV 是行存、无法按列投影」的短板驱动，一个自然的想法是：把 Arrow 存进 KV 的 value。但这个想法的价值完全取决于**一个先决条件——粒度**。Arrow 是列式内存格式，列式收益只有在一个 key 对应**多行批量**时才兑现。按此切两半，结论完全不同：
-
-**解读 A：key → 单行（value = Arrow 序列化的一行）**——这就是普通 KV 行存，Arrow 只是换了个序列化格式。列式收益 ≈ 0，每行一个 1-row batch，还要额外背 Arrow 的 schema 头。纯赔本。
-
-**解读 B：key → 列式批量（value = N 行 Arrow IPC buffer）**——这才是真正的设计。key = 段 id，value = 一个列式 chunk。读入 DataFrame 直接得到列式内存布局，**零行列转置**；段内可按列压缩（zstd/lz4），schema 自带在 buffer 里。但解读 B 本质是**把 KV 改造成了一个列式批存**，代价是放弃 KV 最值钱的东西：
-
-1. **点查（OLTP）废了**——一个逻辑记录埋在 batch 里，要读整段才能拿到。KV 原本的「嵌入式零 RTT 行级定位」优势被批量粒度掐死。
-2. **行级更新是重写**——Arrow buffer 近似不可变，给 batch 追加/改一行要重写整段。这天然是追加优先的形态，契合 LSM 的 append 特性，但和行级 update 背道而驰。
-3. **跨段扫描仍要读全量**——要聚合所有段的某列，必须 range scan 读每个 value 的**全部字节**再做解释。KV 层不懂 Arrow，无法把「只投影某列」下推到存储。省掉了转置，但没省掉读全量。
-
-**内存模型错配（进程内零序列化哲学）**：若架构的进程内表示是 `ciborium::Value`（零序列化），存储层存 Arrow、读出来转回 ciborium，转置代价只是挪了个位置又回来了。Arrow-as-value 只有存储与内存都用 Arrow（直通 DataFrame）才成立——那意味着整个数据路径绑定 Arrow 内存模型，放弃进程内零序列化哲学。两条路只能选一条。
-
-**格式选型**：若真要存列式批量，应选 **Parquet** 而非 Arrow IPC——Arrow IPC 是传输/内存格式（面向零拷贝流式搬移），Parquet 才是存储格式（列式 + 行组统计 + 谓词下推）。但有个尴尬：标准 KV 返回**整个 value**，「value 内部按列跳过」的 Parquet 优势在单 value 层面是废的——反正读全量字节。这更说明批量粒度下 KV 只是「装字节的桶」，列式智能全在 value 格式里，KV 本体毫无贡献。
-
-**诚实结论**：这是列式存储在 KV 上的伪装，服务的是「内部、分析为主、追加优先、单机中规模」的负载。主导负载是分析 → 直接上真列式（Parquet/S3/DuckDB），别在有行级访问包袱的 KV 上绕；需要行级访问/点更新 → 别批量化，回到普通行存 KV。Arrow-as-value 把「KV 是行存、不能列投影」这个短板补了，补法却是把它改造成列式批存——代价是丢掉 KV 行级访问的立身之本，等于换了个赛道。
-
-### value 打包粒度：整行 vs 每字段一个 key
-
-OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，改几个字段再写回"。因此默认应把一行**整行打包**（如 postcard 序列化）填入 value：读整行 1 次点查 + 1 次反序列化，完美匹配。
-
-每字段一个 key 在 OLTP 下是灾难：
-
-| 操作 | 整行打包 | 每字段一个 key |
-|:---|:---|:---|
-| 读整行 | 1 次点查 | N 次点查（或 1 次 scan + 拼装） |
-| 改 3 个字段 | 读 1 + 写 1 | 先读 N + 写 3，且跨 key 要事务 |
-| 写放大 | 1 行 1 次写 | 每字段一次写，N 倍放大 |
-| 单字段点查 | 读整行反序列化（浪费） | 1 次点查（最优） |
-
-**关键的纠偏**："每字段一个 key"**不是 DDL 的解药**，它只是把 DDL 的痛换成四个新痛——整行读 N 次往返、scan 拼行、写放大、多 key 原子性。要解决加字段的痛，**不该换存储布局，而该让序列化格式本身可演进**。整行打包对 DDL"不友好"的根因，不是"整行打包"这个决定错，而是**用了不可演进的序列化格式**（postcard 定长、无 field tag、自描述性弱）。
-
-**DDL 真正解法：可演进序列化，而非换布局**
-
-1. **版本化 payload（最简）**：value 头带 `schema_version`。加字段 = 新版本，旧行按旧版本读，用懒迁移（读时/写时升级），Key 不变、零 DDL。字段仍按位置，新字段只能追加在尾部。
-2. **Tagged/TLV 编码（推荐）**：payload 改为 `field_id + len + bytes`。加字段 = 新增一个 field_id，旧 reader **跳过未知 field_id**，旧行不用迁移、新老行共存。这是 Cap'n Proto / SBE / FlatBuffers 的核心能力（schema evolution + 兼容，详见 [序列化协议分析对比](serialization-protocol-comparison.md) 的「半动态层」）。代价是比纯 postcard 略大，换取加字段零迁移。
-3. **热/冷分仓**：核心热字段用定长紧凑区（固定偏移），新字段/冷字段走 tagged 扩展区。读老行：热字段直接读、扩展区可空。折中：热路径零解析、演进路径全兼容。
-
-**推荐**：2 做主轴（可演进），需要极致 O(1) 单字段读时再补 3。
-
-**字段级辅助索引（按实测引入，非默认）**：若整行为主、但偶有高频单字段热路径（如 `get(id) -> name`），可双轨：主 value = 整行 blob，辅助 key = `field_idx:{id} → 单字段值`。读单字段走辅助 key，写时同步更新主行 + 受影响的辅助 key。但**辅助索引 = 写放大**，是优化而非默认——只有实测确出现单字段热路径才引入，别为想象的热路径提前付（每加一条 = 和每字段 key 同一种代价）。
 
 ### KV 的 DDL：索引管理与字段演进
 
@@ -1218,7 +904,7 @@ impl GraphIndexer {
         }
     }
 
-    // 1. 插入一条边：利用分布式 Raft 达成共识后，本地双向原子写入
+    // 1. 插入一条边：出边/入边双向原子写入
     pub fn insert_edge(&self, src: &str, edge_type: &str, dst: &str, weight: f32) {
         let out_key = format!("E:out:{}:{}:{}", src, edge_type, dst);
         let in_key = format!("E:in:{}:{}:{}", dst, edge_type, src);
@@ -1276,6 +962,320 @@ impl GraphIndexer {
 三个能力都是 KV 之上的编码模式，不是新存储引擎。组合起来就是一个多模型数据库——和 SurrealDB 的架构同源，只是没有查询语言层。
 
 **引擎无关 vs 引擎实现**：本章编码范式与源码示例均以引擎无关的方式呈现（示例以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描）。结合这些索引的**多语言协作检索架构**（Steel/PyO3/Rust 用户驱动路由）见 [嵌入式脚本语言选型](embedded-script-languages.md) §4.3。引擎选型的分水岭（存算一体 vs 存算分离：长时记忆大规模检索是否切 LanceDB+S3）见 [存储引擎终极裁判](lancedb-vs-fjall.md)。
+
+## 代码即 DDL：KV 的开发者体验保障
+
+→ 完整内容（强类型 Key 编码、版本化 Enum 懒迁移、指针契约、TypedTable、SurrealDB DDL 缺陷、hex 单元测试）见独立文档 [OKM：Object-Keyspace Mapping](object-keyspace-mapping.md#代码即-ddlkv-的开发者体验保障)。
+
+## 网络层：gRPC 微包装突破单线程限制
+
+Redis 的单线程模型是 2009 年硬件条件下的最优解。在多核服务器上，Redis 的命令执行被锁死在单核——多实例分片引入客户端路由复杂性（§10.3 选型表）。
+
+Fjall + Tokio + Tonic 的组合提供等价的网络接口，同时突破单线程限制：
+
+```
+[gRPC Client]
+      │
+      ▼
+[Tonic gRPC Server — Tokio 多线程异步运行时]
+      │  多个 CPU 核心同时处理不同的 gRPC 连接
+      ▼
+[Fjall LSM-Tree — Arc<Keyspace> 线程安全]
+      │  多线程并发读写同一个存储实例
+      ▼
+[NVMe SSD]
+```
+
+**计算层**：Tonic + Tokio 天生多线程异步。数十个 CPU 核心并行处理不同连接，不存在 Redis 的单线程瓶颈。恶意阻塞命令（如全量 KEYS *）只影响单个 Tokio task，不阻塞其他连接。
+
+**存储层**：Fjall 的 `Arc<Keyspace>` 实现线程安全。多线程可同时对同一个 Keyspace 发起读写，LSM-Tree 的无锁读路径（MemTable + SSTable）和后台 compaction 线程天然并发。
+
+**进程内读写路径**：当 gRPC 服务与 Fjall 嵌入同一进程时，热路径（Actor 状态读写）仍走进程内直接调用（ns 级），gRPC 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
+
+## 分布式锁：Fjall 的实现
+
+| 维度 | Redlock（Redis） | Raft 锁（Fjall + 共识层） |
+|:--|:--|:--|
+| 互斥性 | 不安全（GC 停顿时钟漂移） | 保证（Leader Lease + 多数派 ACK） |
+| 时钟依赖 | 物理时钟（TTL） | 逻辑时钟（term + index） |
+| 故障模式 | 静默丢失锁 | 显式 Leader 选举，无数据丢失 |
+
+单机场景下，Fjall 的 Batch 原子操作提供进程内互斥。分布式锁需要共识层保证跨节点一致性——锁状态存储在专用 Fjall 分区（`lock` CF）中，由状态机 `apply` 管理。TTL 过期通过逻辑时钟检查，不依赖物理时钟。详见 [共识协议文档](consensus-protocol.md)。
+
+> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现。Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
+
+## 性能模型
+
+- **单次读写**：ns~μs（进程内）vs Redis 0.1~2ms（网络 RTT）
+- **吞吐量（异步批处理）**：Fjall 多线程并发随核心数扩展；Redis 上限 ~80K ops/s（单线程）
+- **资源**：无需独立进程，LZ4 压缩，无需专用 DRAM 分配
+
+## 架构
+
+```
+应用层（锁、调度、配置、会话）
+        │
+  状态机（Fjall 引擎 — 嵌入式持久化）
+        │
+  Fjall 引擎（LSM-Tree KV — 本地 NVMe）
+        │
+  ┌─────┼─────┐
+  节点1  节点2  节点3    （单机或集群部署）
+```
+
+**关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
+
+## 共识与协调层级
+
+```
+Business Coordination (locks, scheduling, election)
+    └── Meta-Coordination (consensus protocol)
+         ├── Log ordering
+         ├── State machine state
+         └── Membership changes
+```
+
+**Core principle**: 元数据共识是基础设施的基石，不是存储引擎的职责。Redis 没有共识层 → Redlock 建立在沙堡上。共识协议方案见 [共识协议文档](consensus-protocol.md)。
+
+## 工程分工
+
+| 任务 | 执行者 | 理由 |
+|:--|:--|:--|
+| 元数据共识 | 独立共识层（Openraft / etcd） | 永远不要重写共识算法 |
+| 状态机 `apply` | AI + 人类审查 | 模式匹配代码 |
+| Key 编码工具 | AI | 纯映射逻辑 |
+| 序列化 | AI | derive 宏 + 样板代码 |
+| 集成测试 | AI + 人类验证 | AI 生成，人类补充边界情况 |
+| 生产运维 | 人类 | 环境特定判断 |
+
+## SQL 翻译层 vs KV 管道链：固定查询模式下的降维打击
+
+对于框架平台（API 网关、Agent 执行器、3D 流水线），数据访问路径在设计期就已固化。去掉 SQL 不是为了省事，而是消灭数据库优化器（Query Planner）这个运行时黑盒，获得 100% 的物理性能确定性。
+
+### 实际对比：拉取最近 10 条对话记忆
+
+**SQL 方式**（PostgreSQL / SurrealDB）：
+
+```sql
+SELECT message_id, content FROM agent_memories
+WHERE session_id = 'session_456'
+ORDER BY timestamp DESC LIMIT 10;
+```
+
+底层物理代价：词法语法分析 → AST 树生成 → 逻辑执行计划 → 优化器猜测索引扫描还是全表扫描 → B-Tree 节点间频繁跳转。
+
+**KV 方式**（Rust + 嵌入式 KV）：
+
+写入时 Key 已编排为倒序物理格式：`m:{session_id}:{u64_max - timestamp}:{message_id}`。查询只需一行 Rust 管道链：
+
+```rust
+// 前缀定位 → 向后走 10 步，搞定
+let prefix = format!("m:session_456:").into_bytes();
+let top_10 = kv_engine
+    .scan(&prefix)         // 定位起始区间（O(log N) 内存二分）
+    .take(10)              // 顺序读 10 条（O(1) 磁盘/内存顺序 I/O）
+    .collect::<Vec<_>>();
+```
+
+**为什么 KV 胜出**：Rust 方法链比 SQL 声明式样板（SELECT/FROM/WHERE/ORDER BY/LIMIT）更精炼。没有黑盒优化器自作聪明——代码就是执行路径。数据从 10MB 到 10TB，执行效率不变，亚毫秒响应雷打不动。
+
+### 生产级组件：原子双写 + 时间线索引
+
+展示如何用一个原子 Batch 在写入主数据的同时，自动构建时间线倒序二级索引，确保主表与索引表不会数据漂移：
+
+```rust
+use bytes::Bytes;
+use std::sync::Arc;
+
+/// 原子批处理（等价于 Fjall WriteBatch / SlateDB 的 batch API）
+pub struct TransactionBatch {
+    pub actions: Vec<(Vec<u8>, Option<Bytes>)>,
+}
+
+impl TransactionBatch {
+    pub fn put(&mut self, k: &[u8], v: &[u8]) {
+        self.actions.push((k.to_vec(), Some(Bytes::copy_from_slice(v))));
+    }
+    pub fn delete(&mut self, k: &[u8]) {
+        self.actions.push((k.to_vec(), None));
+    }
+}
+
+pub struct FrameworkStorage {
+    /// 跨 Tokio 多线程共享的全局嵌入式存储引擎
+    /// 生产中替换为 Arc<fjall::Keyspace> 或 Arc<slatedb::Db>
+    pub engine: Arc<String>,
+}
+
+impl FrameworkStorage {
+    /// 原子双写：保存 Agent 记忆 + 自动构建时间线倒序索引
+    pub fn save_agent_memory(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) -> TransactionBatch {
+        let mut batch = TransactionBatch { actions: Vec::new() };
+
+        // 1. 主表：完整数据
+        let data_key = format!("data:session:{}:msg:{}", session_id, message_id).into_bytes();
+        batch.put(&data_key, payload);
+
+        // 2. 时间线索引：倒序排列（u64::MAX - timestamp）
+        let inverted_time = u64::MAX - timestamp;
+        let mut index_key = Vec::new();
+        index_key.extend_from_slice(format!("idx:time:session:{}:", session_id).as_bytes());
+        index_key.extend_from_slice(&inverted_time.to_be_bytes());
+        index_key.extend_from_slice(format!(":{}", message_id).as_bytes());
+
+        // Value 为空——实体 ID 已编码在 Key 的字典序中
+        batch.put(&index_key, &[]);
+
+        batch
+    }
+}
+```
+
+主表存完整数据，索引表只存空 Value（实体 ID 已通过二分序编码在 Key 中）。一次原子提交，两个 Key 同时成功或同时失败。SQL 的 `INSERT INTO` 无法在一个语句中同时写入两张表并保证原子性——需要额外的事务包裹。
+## KV 框架 vs 自研数据库：演化边界
+
+纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
+
+```
+客户端文本查询 ("SELECT * FROM users WHERE age = 25")
+        │
+        ▼
+┌─ Parser ──────────────────────┐  文本 → AST（抽象语法树）
+└───────────────┬───────────────┘
+                ▼
+┌─ Optimizer ───────────────────┐  AST → 最优物理执行路径
+└───────────────┬───────────────┘
+                ▼
+kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
+        │
+        ▼
+┌─ KV Engine (Fjall/SlateDB) ──┐  二进制字节落盘
+└───────────────────────────────┘
+```
+
+### 工业界的真实路径
+
+| 数据库 | 查询层 | 存储内核 | 本质 |
+|:--|:--|:--|:--|
+| **TiDB** | MySQL 语法解析器 + 分布式执行计划优化 | TiKV（Rust KV） | SQL 翻译器 + KV |
+| **CockroachDB** | PostgreSQL 语法兼容 + 代价优化器 | Pebble（Go KV） | SQL 翻译器 + KV |
+| **SurrealDB** | SurrealQL 函数式解析器 + 图遍历优化 | SurrealKV（Rust KV） | DSL 翻译器 + KV |
+
+它们没有发明新的磁盘驱动器，只是在 KV 之上盖了一层解析器和优化器外壳。
+
+### 坚守纯 KV 的理由（框架团队的正确选择）
+
+当查询模式在设计期就已 100% 固定时，Parser + Optimizer 是多余的运行时开销：
+
+- **零解析损耗**：编译期直接写死 `kv_engine.scan(&prefix)`，不需要运行时解析 SQL 字符串
+- **100% 确定性响应**：无优化器「抽风」变慢的风险，P99 延迟雷打不动
+- **单一二进制体积**：不引入 SQL 解析器、优化器、类型系统的代码膨胀
+
+### 什么是「查询模式固定」：需求可控性（话语权）决定
+
+KV 的零解析损耗、确定性响应、单二进制体积，只有在查询模式可固化时才兑现。但**固定与否不是技术属性，是需求可控性（话语权）问题**：
+
+- **需求由你掌控且稳定**：查询在设计期可固化，KV 的物理优势（追加写、零 DDL、确定性响应）全部兑现，「坚守纯 KV」成立。
+- **需求由多变的外部力量驱动**：查询不可预测。此时 **SQL 更通用**——即便 SQL 实现不了某个需求，失败也归结为「SQL 的技术限制」，这是行业统一认知、责任可外推；KV 则把「为什么做不到」变成你的实现责任。
+
+判断标准不是「做产品 vs 外包」的组织身份，而是**需求是否由你掌控**。话语权丧失的两种方式：**外包**（甲方决定需求），以及**做产品但服务客户多变需求**（如企业管理软件——客户需求大于一切）。后者即便你是老板也无效：业务本身在为别人服务，你就没有话语权。
+
+### 数据量大时，KV 不要求查询模式固定
+
+"查询模式固定"是 KV 的第一优先级准则——固定模式意味着编译期消灭运行时开销，零解析损耗。但还有一个容易被忽视的维度：**数据量本身**。
+
+当数据量大到关系型引擎扛不住时，KV 的物理优势即使在查询模式经常变化的场景下仍然成立。原因在于 LSM-Tree 的写入代价是 O(log N)，而关系型引擎的模式变更代价与表大小成正比：
+
+| 操作 | KV 的代价 | 关系型的代价 |
+|:---|:---|:---|
+| 新增查询模式 | 开始写新前缀的 Key，**零 DDL** | ALTER TABLE + 迁移脚本，大表锁分钟级 |
+| 新增二级索引 | 写一个新的 prefix scan 函数，**零重建** | CREATE INDEX = 全表扫描 + 重建，大表小时级 |
+| 数据迁移 | 旧 Key 保留，新 Key 按新编码写入，**零停机** | 大表重分区 = 长时间锁 + 复制 |
+
+**物理本质**：LSM-Tree 的 SSTable 是追加写入、不可变的。新增 Key 模式只是在最新的 MemTable 里多一种前缀，不需要修改已有的 SSTable。关系型引擎的索引是 B-Tree，每次结构变更都涉及页面分裂和重组，代价与表大小成正比。
+
+**实际影响**：即使你每月改一次查询模式——新增一个前缀扫描、调整一个复合键布局——KV 的成本是 O(1)（写一个 scan 函数），而关系型的成本是 O(N)（N = 表大小）。当 N 超过某个阈值（百万行起步），KV 的物理优势足以覆盖"模式不固定"带来的工程摩擦。
+
+**判定**：查询模式固定是 KV 的**最佳**使用场景，但不是**必要**条件。数据量大本身就是选择 KV 的理由——体量产生的物理优势（追加写、无索引重建、零 DDL 锁）让模式变更的代价从 O(N) 降到 O(1)。
+
+### 需求变化对 KV 是 O(1)：加字段/表/索引天然更可控
+
+一般需求变化（加字段、加表、加索引），KV 不只是"也不差"，而是**天然 O(1)**——比 SQL 更可控：
+
+| 需求变化 | KV 的代价 | 关系型的代价 |
+|:---|:---|:---|
+| 加字段 | 可演进序列化加新字段，Key 不变，零 DDL | `ALTER TABLE ADD COLUMN` = 大表锁 |
+| 加表 | 新前缀空间 | `CREATE TABLE` |
+| 加索引 | 写一个新的 scan 函数 | `CREATE INDEX` = 全表扫描 + 重建 |
+| 改查询 | 改 scan 函数，零迁移 | 优化器 + 重新设计索引 |
+
+对整行打包：加字段 = 给序列化加一个字段（field_id / 版本），Key 完全不变，旧数据用旧版本 reader 读、新老共存，零 DDL、零迁移。加表 = 新前缀空间、加索引 = 加一个 scan 函数，都是"加一行代码"，不触碰历史数据、没有在线 schema 迁移。
+
+若采用每字段一个 key 的列式布局，加字段确实更简单——只要添加一个新的前缀 Key 即可。但**这种"简单"正是它不可取的原因**：列式布局把"加字段"从序列化演进降级为"加一个扫描维度"，换来的是 OLTP 下整行读 N 次点查、写放大、跨 key 事务的代价（见「value 打包粒度」）；它只是把 DDL 的痛平移成了查询/写入的痛，并非免费的更可控——除非负载本就是列式聚合（OLAP），那才需要该字段为前缀的布局。
+
+**推论——SQL 的真正剩余优势**：SQL 的优势**不在处理需求变化**（这块反而输给 KV 的零 DDL），而在两点：
+
+1. **不可预测的即席复合分析**——SQL 是声明式，Parser + Optimizer 是现成的通用查询引擎，新查询不用写代码；KV 是命令式，复合聚合（join 多表 + 多条件 + 分桶统计）必须手写 scan 组合 + 应用层聚合。设计期可预知 → 打平；事后才冒出 → SQL 胜。
+2. **跨边界共享**——键空间是**私有协议**，SQL 是**行业通用货币**。封闭单团队自用，私有语言高效；需对接第三方/现成 BI 工具，键空间要自发明协议 + 写文档 + 让人学。
+
+**洞察**：SQL 的剩余优势不在"处理需求更强"，而在"把查询能力委托给了你没发明的通用解析器"。当团队既掌控需求、又愿意自研键空间时，这份委托失去必要性——但代价是失去即席未知查询和对外共享那两张"现成引擎"的网。
+
+### 什么时候必须蜕变为数据库
+
+只有当系统需要开放给外部第三方开发者、允许最终用户通过低代码/动态插件自由写出不可预测的复杂查询时——为了防止他们写出全表扫描的垃圾查询把底层存储扫爆，才必须在最前面加一层 Parser + Optimizer 做查询门禁。
+
+**AdHoc 分析**是另一个典型触发场景。AdHoc 面向的数据分析师（广义含开发运维分析日志）本质在做**动态的多维查询**——不断修改范围、下钻、聚合透视，无法在设计期固化成 prefix scan。更根本地，这是**分析型（OLAP）负载**，而 KV 本质是**行存**：每个键对应一条值字节流，前缀扫描要读入并解码整条记录，无法按列投影、压缩与向量化。因此即便分析者掌握键 schema、能自写扫描函数，行导向 KV 在分析负载上仍远逊于**列式 OLAP 引擎（如 DuckDB）**——列存只读所需列、同型值压缩率高、过滤聚合可下推，性能是结构性碾压。纯 KV 的用武之地是点查与固定模式扫描（OLTP 形态）；**AdHoc 这类动态多维负载的正确归宿是列式 OLAP 层，而非纯 KV**
+
+**判定**：框架平台的正确姿态是坚守纯 KV + 复合键编码。数据库是 KV 的上层封装，不是 KV 的替代。如果你的查询模式是固定的， Parser + Optimizer 就是用运行时 CPU 开销去解决一个编译期就能消灭的问题。
+
+### KV 的 value 存 Arrow/Parquet？列式存储在 KV 上的伪装
+
+被「KV 是行存、无法按列投影」的短板驱动，一个自然的想法是：把 Arrow 存进 KV 的 value。但这个想法的价值完全取决于**一个先决条件——粒度**。Arrow 是列式内存格式，列式收益只有在一个 key 对应**多行批量**时才兑现。按此切两半，结论完全不同：
+
+**解读 A：key → 单行（value = Arrow 序列化的一行）**——这就是普通 KV 行存，Arrow 只是换了个序列化格式。列式收益 ≈ 0，每行一个 1-row batch，还要额外背 Arrow 的 schema 头。纯赔本。
+
+**解读 B：key → 列式批量（value = N 行 Arrow IPC buffer）**——这才是真正的设计。key = 段 id，value = 一个列式 chunk。读入 DataFrame 直接得到列式内存布局，**零行列转置**；段内可按列压缩（zstd/lz4），schema 自带在 buffer 里。但解读 B 本质是**把 KV 改造成了一个列式批存**，代价是放弃 KV 最值钱的东西：
+
+1. **点查（OLTP）废了**——一个逻辑记录埋在 batch 里，要读整段才能拿到。KV 原本的「嵌入式零 RTT 行级定位」优势被批量粒度掐死。
+2. **行级更新是重写**——Arrow buffer 近似不可变，给 batch 追加/改一行要重写整段。这天然是追加优先的形态，契合 LSM 的 append 特性，但和行级 update 背道而驰。
+3. **跨段扫描仍要读全量**——要聚合所有段的某列，必须 range scan 读每个 value 的**全部字节**再做解释。KV 层不懂 Arrow，无法把「只投影某列」下推到存储。省掉了转置，但没省掉读全量。
+
+**内存模型错配（进程内零序列化哲学）**：若架构的进程内表示是 `ciborium::Value`（零序列化），存储层存 Arrow、读出来转回 ciborium，转置代价只是挪了个位置又回来了。Arrow-as-value 只有存储与内存都用 Arrow（直通 DataFrame）才成立——那意味着整个数据路径绑定 Arrow 内存模型，放弃进程内零序列化哲学。两条路只能选一条。
+
+**格式选型**：若真要存列式批量，应选 **Parquet** 而非 Arrow IPC——Arrow IPC 是传输/内存格式（面向零拷贝流式搬移），Parquet 才是存储格式（列式 + 行组统计 + 谓词下推）。但有个尴尬：标准 KV 返回**整个 value**，「value 内部按列跳过」的 Parquet 优势在单 value 层面是废的——反正读全量字节。这更说明批量粒度下 KV 只是「装字节的桶」，列式智能全在 value 格式里，KV 本体毫无贡献。
+
+**诚实结论**：这是列式存储在 KV 上的伪装，服务的是「内部、分析为主、追加优先、单机中规模」的负载。主导负载是分析 → 直接上真列式（Parquet/S3/DuckDB），别在有行级访问包袱的 KV 上绕；需要行级访问/点更新 → 别批量化，回到普通行存 KV。Arrow-as-value 把「KV 是行存、不能列投影」这个短板补了，补法却是把它改造成列式批存——代价是丢掉 KV 行级访问的立身之本，等于换了个赛道。
+
+### value 打包粒度：整行 vs 每字段一个 key
+
+OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，改几个字段再写回"。因此默认应把一行**整行打包**（如 postcard 序列化）填入 value：读整行 1 次点查 + 1 次反序列化，完美匹配。
+
+每字段一个 key 在 OLTP 下是灾难：
+
+| 操作 | 整行打包 | 每字段一个 key |
+|:---|:---|:---|
+| 读整行 | 1 次点查 | N 次点查（或 1 次 scan + 拼装） |
+| 改 3 个字段 | 读 1 + 写 1 | 先读 N + 写 3，且跨 key 要事务 |
+| 写放大 | 1 行 1 次写 | 每字段一次写，N 倍放大 |
+| 单字段点查 | 读整行反序列化（浪费） | 1 次点查（最优） |
+
+**关键的纠偏**："每字段一个 key"**不是 DDL 的解药**，它只是把 DDL 的痛换成四个新痛——整行读 N 次往返、scan 拼行、写放大、多 key 原子性。要解决加字段的痛，**不该换存储布局，而该让序列化格式本身可演进**。整行打包对 DDL"不友好"的根因，不是"整行打包"这个决定错，而是**用了不可演进的序列化格式**（postcard 定长、无 field tag、自描述性弱）。
+
+**DDL 真正解法：可演进序列化，而非换布局**
+
+1. **版本化 payload（最简）**：value 头带 `schema_version`。加字段 = 新版本，旧行按旧版本读，用懒迁移（读时/写时升级），Key 不变、零 DDL。字段仍按位置，新字段只能追加在尾部。
+2. **Tagged/TLV 编码（推荐）**：payload 改为 `field_id + len + bytes`。加字段 = 新增一个 field_id，旧 reader **跳过未知 field_id**，旧行不用迁移、新老行共存。这是 Cap'n Proto / SBE / FlatBuffers 的核心能力（schema evolution + 兼容，详见 [序列化协议分析对比](serialization-protocol-comparison.md) 的「半动态层」）。代价是比纯 postcard 略大，换取加字段零迁移。
+3. **热/冷分仓**：核心热字段用定长紧凑区（固定偏移），新字段/冷字段走 tagged 扩展区。读老行：热字段直接读、扩展区可空。折中：热路径零解析、演进路径全兼容。
+
+**推荐**：2 做主轴（可演进），需要极致 O(1) 单字段读时再补 3。
+
+**字段级辅助索引（按实测引入，非默认）**：若整行为主、但偶有高频单字段热路径（如 `get(id) -> name`），可双轨：主 value = 整行 blob，辅助 key = `field_idx:{id} → 单字段值`。读单字段走辅助 key，写时同步更新主行 + 受影响的辅助 key。但**辅助索引 = 写放大**，是优化而非默认——只有实测确出现单字段热路径才引入，别为想象的热路径提前付（每加一条 = 和每字段 key 同一种代价）。
 
 ## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
 
