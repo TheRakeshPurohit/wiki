@@ -340,5 +340,5 @@ TiKV 节点（每个节点存一部分 region）
 - **[KV 存储引擎](kv-storage-engine.md)**：Fjall + Openraft 双引擎模式中 Raft 的角色定位
 - **[序列化协议分析对比](serialization-protocol-comparison.md)**：Raft 控制流的编码选择（Protobuf vs Bincode）
 - **[Aura 架构](aura-architecture.md)**：Fjall + Raft 在完整架构中的位置
-- **[LanceDB vs Fjall](lancedb-vs-fjall.md)**：列式向量存储 vs 嵌入式 KV 的定位对比
+- **[HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)**：对象存储上 AI 数据栈的两种路线对比
 - **[Redis 批判](redis-critique.md)**：Redis 为何被 KV 替代

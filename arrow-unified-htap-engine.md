@@ -14,7 +14,7 @@
 
 这一刀，直接切中了现代计算架构的最核心趋势：**全链路单一数据格式化**。将 Fjall（嵌入式快线事务）、Apache Arrow（内存列式标准）与 Polars（全球最快的纯 Rust 向量化数据框引擎）强行缝合，就在单个可执行进程内部，手搓出了一个**绝对零更新延迟、支持高并发任意维度复杂多表 JOIN 的"纯净流分布式内嵌 HTAP 数据库"**。
 
-→ 详见 [LanceDB vs Fjall 终极裁判](lancedb-vs-fjall.md)、[Aura 架构](aura-architecture.md)
+→ 详见 [HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)、[Aura 架构](aura-architecture.md)
 
 ---
 
@@ -154,7 +154,7 @@ Arrow 是全宇宙统一的内存列式布局标准。它不关心磁盘，它�
 
 这是 Lance 格式（Arrow 的列式开源超集）的绝对统治战场。它原生支持从远程 S3 上进行流式"点杀"读取，让你的 Rust 服务器实现彻底的"无盘化、无状态（Diskless）"弹性部署。
 
-→ 详见 [LanceDB vs Fjall 终极裁判](lancedb-vs-fjall.md)
+→ 详见 [HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)
 
 #### 历史海量审计数据的冷库（冷归档 → Parquet）
 
@@ -492,7 +492,7 @@ Steel Lisp 策略层（DataFrame 作为一等公民函数参数）
 - **[Aura 架构](aura-architecture.md)**：完整的 Actor 引擎、多语言沙箱与分布式共识实现。
 - **[Aura + Fluxora DevOps](aura-fluxora-devops.md)**：脚本即代码（Script-as-Code）的工程实践，含 GitOps 工作流、CI/CD 配置、脚本测试与调试。
 - **[序列化协议分析对比](serialization-protocol-comparison.md)**：IDL vs Code-First 的分析对账，含 Avro Schema Evolution 与 prost-derive 代码示例。
-- **[LanceDB vs Fjall 终极裁判](lancedb-vs-fjall.md)**：两种存储范式的详细对比与选型决策树。
+- **[HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)**：对象存储上 AI 数据栈的两种路线的详细对比。
 - **[常规 Web 适用性](aura-architecture.md)**：本架构在常规 Web 场景的适用性分析（Ad-hoc 查询痛点已被本文档治愈）。
 - **[嵌入式脚本语言选型](embedded-script-languages.md)**：Steel Lisp 作为策略层的确定性优势。
 - **[KV 存储引擎架构](kv-storage-engine.md)**：工作记忆的分布式强一致实现。

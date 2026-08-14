@@ -1075,7 +1075,7 @@ impl GraphIndexer {
 
 三个能力都是 KV 之上的编码模式，不是新存储引擎。组合起来就是一个多模型数据库——和 SurrealDB 的架构同源，只是没有查询语言层。
 
-**引擎无关 vs 引擎实现**：本章编码范式与源码示例均以引擎无关的方式呈现（示例以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描）。结合这些索引的**多语言协作检索架构**（Steel/PyO3/Rust 用户驱动路由）见 [嵌入式脚本语言选型](embedded-script-languages.md) §4.3。引擎选型的分水岭（存算一体 vs 存算分离：长时记忆大规模检索是否切 LanceDB+S3）见 [存储引擎终极裁判](lancedb-vs-fjall.md)。
+**引擎无关 vs 引擎实现**：本章编码范式与源码示例均以引擎无关的方式呈现（示例以 Fjall 为例，`open_partition`/`prefix` 等价于任意 LSM-Tree KV 的分区/范围扫描）。结合这些索引的**多语言协作检索架构**（Steel/PyO3/Rust 用户驱动路由）见 [嵌入式脚本语言选型](embedded-script-languages.md) §4.3。引擎选型的分水岭（存算一体 vs 存算分离：对象存储 AI 数据栈的上游应用层）见 [HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)。
 
 ## 网络层与分布式协同
 
