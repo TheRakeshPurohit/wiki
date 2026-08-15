@@ -216,7 +216,7 @@ database { host "localhost" }
 "node attr=1 {bloc}" | from kdl
 ```
 
-输出为正则节点行（`name` / `args` / `props` / `children`），可直接进入 nushell 的管道生态做过滤和处理——无需为了工具链而引入 `/bin` 级的外部依赖。`open` 对 `.kdl` 后缀也自动触发解析。详见 [Nushell 介绍](nushell-introduction.md) 的内置格式处理一节。只有需要与 `jq`（而非 nushell）协作时，才用 `kdl-py`/`kdljs` 将 KDL 转为 JSON 再输入 `jq`。
+输出为正则节点行（`name` / `args` / `props` / `children`），可直接进入 nushell 的管道生态做过滤和处理——无需为了工具链而引入 `/bin` 级的外部依赖。`open` 对 `.kdl` 后缀也自动触发解析。详见 [Nushell 介绍](nushell-introduction.md) 的内置格式处理一节。只有需要与 `jq`（而非 nushell）协作时，才用 `ckdl`/`kdljs` 将 KDL 转为 JSON 再输入 `jq`。
 
 ### 澄清 5：行长度纪律——用子节点下沉，不用硬性计数
 
@@ -375,7 +375,7 @@ layout {
 当 Skill 由人类开发者编写与维护（如 `config.kdl` 中的 auth、skills、server 等配置）时，坚持用 KDL 作为用户/开发者唯一交互接口。大模型只认 JSON，但 Python/Rust 后台是灵活的：
 
 1. **人类编写**：开发者写一份清晰的 `skills.kdl`
-2. **系统加载**：Python 后台启动时用 `kdl-py` 读取，自动转为内存中的 JSON Schema / Pydantic 模型
+2. **系统加载**：Python 后台启动时用 `ckdl` 读取，自动转为内存中的 JSON Schema / Pydantic 模型
 3. **喂给大模型**：后台将转好的 JSON Schema 传给 OpenAI/Qwen 的 `tools` 参数，发动官方 Function Calling
 4. **模型输出**：模型输出它最擅长的标准 JSON 调用结果
 5. **系统解析执行**：后台拿到 JSON，执行技能、记录日志
@@ -424,6 +424,26 @@ kdl_line += " ".join([f'{k}="{v}"' for k, v in data.get('props', {}).items()])
 
 print(kdl_line)  # video_clip "input.mp4" "output.mp4" start="00:01:00" duration="30"
 ```
+
+### 解法三：纯 Python 配置加载——KDL → Pydantic 薄桥接
+
+上面两个解法都围绕「AI 网络侧」的 JSON 硬编码。若你的场景是**纯 Python 后台加载本地配置文件**（无 AI 通信），则无需任何中转——但要做好生态的现实预期：
+
+**生态现状**：截至 2026 年中，PyPI 上**没有** `pydantic-settings` 之于 KDL 的等价桥接库，但有成熟的 KDL 解析器 **`ckdl`**（tjol/ckdl，C11 实现 + Python 绑定，完整支持 KDL 1.0 & 2.0.0）。配置加载层是空白，需自家粘一层。好在这一层很薄——`pydantic-settings` 本就把「读取来源 → 校验进模型」抽象为 `SettingsSource`，自定义一个 KDL 来源即可，依赖仅 `pydantic-settings` + `ckdl`：
+
+```python
+class Settings(BaseSettings):
+    host: str
+    port: int
+    model_config = SettingsConfigDict(settings_source=None)  # 只留自定义源
+
+def kdl_source(settings, **kwargs):
+    return ckdl.parse(kdl_str)  # ckdl 解析 → 节点树
+```
+
+更简者可直接把解析结果转成 dict 后 `Model.model_validate(d)`，不走 pydantic-settings、不声明额外来源。
+
+**为什么选 `ckdl`**（实测于 2026-08，KDL v2 语法 `enable=#true port=8080`）：完整支持 KDL 2.0.0，`#true` 正确解析为布尔 `True`，数字直接解析为 **int**（`port=8080` → `8080`，而非 float）——可直接命中 Pydantic 的 `int` 字段，免去一层值归一。API 为节点树（`Node.args`/`Node.properties`），底层是 C11 流式 SAX 解析器，性能与准确性俱佳。
 
 ### 选型路线总结
 
