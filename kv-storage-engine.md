@@ -1,7 +1,7 @@
 # KV 存储引擎：架构设计、复合键编码与用例
 
 **Status:** 持续演进
-**覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、SQLite 对比
+**覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、redb（本地 B-tree）、SQLite 对比
 **架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
 **Cross-ref:** [Redis 批判](../redis-critique.md) — Redis 为何被 KV 替代
 
@@ -241,33 +241,126 @@ keyspace.write(batch)?;        // 原子写入，全部成功或全部失败
 
 在集群部署下，Batch 的原子性由共识层保证——Leader 写入本地 KV 后复制到 Follower，多数派确认后 Apply。Batch 的原子性从单机延伸到集群。
 
+## 设计模式：纯 KV 底座上的系统级范式
+
+在纯 KV 世界里，算法不再是游离在数据库外面的胶水代码——Key 编码格式本身就是索引层、缓存层和隔离层。
+
+### 访问模式驱动：建模的起点
+
+技巧集之上需要一楼的起点：**先枚举全部访问模式，再反推 key 布局**。每个访问模式（点查实体、按前缀取最近 N、按字段区间扫、分页翻屏、关联回表）都应落成一个点查或前缀扫描——漏掉哪个模式，就是 key 里漏掉哪一段。查询模式固定不只是 KV 相比 SQL 的适用性论证（见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击)），更是**手工设计的输入**：SQL 让你声明"我会这么查"，KV 的纪律是把访问模式先列全，再让每种查询在前缀里有对应路径。
+
+### 键空间模式：逻辑编码层 vs 物理分区
+
+键空间模式常被误认为需要引擎级的多分区能力，其实它定义在**编码逻辑层**：把命名空间编码进 key（`ns:entity:field` 前缀、复合键编码、u16 命名空间字典），与引擎物理布局无关。任何 KV——包括扁平键空间引擎——都零门槛支持，因为 key 本就是扁平字节串，命名空间只是你编码进去的约定。
+
+与之相对的是**物理分区**（Fjall `Partition`、RocksDB Column Family）——独立 memtable / flush / compaction 的**性能与资源隔离**手段（控制写放大、按命名空间回收空间、隔离 I/O），不是键空间模式的必要条件。命名空间物理不隔离时 KV 照常工作，只是少了这些优化。
+
+区别一句话：**键空间模式定义在编码逻辑层；物理分区只是需要隔离时的加速器。** 需要按命名空间精细控制写放大或空间回收 → 选带分区能力（Fjall）的引擎；否则逻辑前缀编码 + 任意引擎即可。反例：sled（0.34.7，2024-10，至 2026-08 约两年停更）只有逻辑 tree、无物理分区，但它**完全适合键空间模式**——真正把它排除在生产选型之外的唯一判据是**维护停滞**，而非缺分区。
+
+### 物理局部性：相关数据的字节序相邻
+
+范围扫描天然顺序 I/O，但"扫多少字节"由 key 布局决定。物理局部性：把**会被一起访问**的数据设计成连续字节序——同一前缀的所有记录物理相邻，一次前缀扫即取整批，随机 I/O 变顺序 I/O（HDD 10-100x、SSD 数倍，见 [复杂度与物理 I/O](#复杂度与物理-io)）。这是 Bigtable 的立身之本：row key 既定义逻辑实体，又决定物理放置。
+
+两条局部性来源：前缀聚合同一实体字段；补码反转让时间线最新优先（见 [物理层编码范式](#物理层编码范式key-编码的物理层通用技巧)）。判断标准：**一起读的，在字节序上也相邻**——否则扫描跨页跳读，前缀/倒序编码救不回丢失的局部性。
+
+### Key 长度是成本变量
+
+key 每多一字节，同时放大四项：MemTable 驻留、页缓存/索引占用、IO 字节、分片空间。且 key 全量驻留内存（MemTable/缓存），长度优化是**常数倍减内存**而非摊薄——HBase rowkey 设计的第一铁律即长度控制。水线判断：key 只放"定位与排序必需"的字段，可延后投影的元数据放 value 而非塞进 key；压缩手段见 [物理层编码范式](#物理层编码范式key-编码的物理层通用技巧) 的数字命名空间 / 长度前缀 / 定宽偏移，此处给出它们背后的统一成本模型。
+
+### Index-Only Scan（索引即数据）
+
+二级索引的 Value 留空，entity_id 编码在 Key 末尾。查询时仅遍历 Key 序列即可获取所有匹配的主键 ID，无需回表读取 Value——零磁盘 I/O。
+
+```
+数据主表：
+  d:{tenant}:{type}:{id}  →  [完整业务实体]
+
+属性索引表：
+  i:{tenant}:{type}:{attr}:{value}:{id}  →  ""  (Value 留空)
+
+查询「状态为 active 的所有用户」：
+  Scan("i:1:user:status:active:") → 遍历 Key 序列 → 提取末尾 id
+  无需读取任何 Value，零回表
+```
+
+**物理效果**：前缀扫描只触碰 LSM-Tree 的 MemTable + 索引层 SSTable（极小），不碰数据层的大 Value 文件。适合高频属性筛选（网关路由匹配、Agent 状态过滤）。
+
+### Bitmap 前置拦截（热路径零 KV 调用）
+
+网关高频检查「IP 是否在黑名单」「Token 是否合法」。每次请求都 `kv.get()` 即便命中缓存也有哈希查找开销。解法：在应用层内存常驻 Roaring Bitmap 或布隆过滤器。
+
+```
+写路径（新 IP 封禁时）：
+  1. kv.put("blacklist:ip:1.1.1.1", "")   ← 持久化落盘
+  2. bitmap.set(hash("1.1.1.1"))           ← 内存标记
+
+读路径（网关拦截，零 KV 调用）：
+  网关收到请求
+    → bitmap.check(hash(ip))
+    → 未命中 → 直接放行（QPS 百万级，纯 CPU 位判断）
+    → 可能命中 → kv.get() 最终权威判定
+```
+
+**物理效果**：热路径（99%+ 的正常请求）完全在 CPU L1 Cache 内完成，不触发任何 KV 引擎调用。只有极少数命中 Bitmap 的请求才下沉到存储层。适合网关黑名单/白名单、限流计数器、Token 校验。
+
+**与布隆过滤器的区别**：Bitmap 支持精确删除（`bitmap.unset()`），布隆过滤器只增不删。高频变更的黑名单用 Bitmap；只增不减的 Token 白名单用布隆过滤器更省内存。
+
+### 应用层 MVCC（无原生 MVCC 引擎的时间旅行）
+
+Fjall/SlateDB 不支持原生 MVCC。框架团队通过将版本号编排进 Key 骨架，实现应用层多版本控制：
+
+```
+Key: data:agent:101:v:[u64::MAX - 1001]  →  记忆状态 v1001
+Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
+```
+
+- **常规读取**：`Scan("data:agent:101:v:").next()` → 补码反转后最新版本排最前，亚微秒拿到最新状态
+- **时间旅行**：将前缀指针定位到目标版本号之后，正向扫描即得历史版本链。无需数据库快照锁，纯 Key 设计实现无锁历史回滚
+
+**与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
+
+### WiscKey 键值分离（大 Value 场景的写放大解药）
+
+典型场景：Key 几十字节，Value 几 MB（对话历史、3D 资产二进制、多模态特征向量、日志原始载荷）。传统 LSM-Tree 在 Compaction 时将 Key+Value 捆绑重写，写放大几十倍。
+
+WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，大 Value 追加写入独立日志文件。
+
+```
+【内存 + SSTable 索引层】
+ Key: "asset:mesh:uuid_abc" → [File_ID : Offset : Length]  ← 十几字节指针
+                                    │
+                                    ▼ 磁盘随机点查
+【独立 Value Log（顺序追加）】
+ offset_3402 → [大体积二进制资产：3D模型 / 对话历史 / 多模态特征]
+```
+
+**物理效果**：
+- **Compaction**：只搬动小指针 Key（几字节），不碰大 Value 文件。写放大从几十倍降为接近 1
+- **读取**：索引定位指针后，一次磁盘随机点查（NVMe 上 ~10μs）抓取大 Value
+- **适用场景**：任何 Key 小 Value 大的模式——Agent 对话历史、3D 资产、多模态特征、日志载荷
+
+Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
+
 ## 物理层编码范式：Key 编码的物理层通用技巧
 
 这几个范式不属于某个具体 Redis 结构映射，而是控制 Key 字节序、宽度、前缀与边界来利用 LSM-Tree 字典序和写入路径的通用物理层技巧。
 
-### 补码反转编码（Complement Encoding）：物理层面的倒序排列
+### 数值的字典序编码：无符号 / 有符号 / 浮点 / 跨类型（总纲）
 
+这是「key 里的一段数值如何编码成字节序」的分类总纲。按「域」分四层，每深一层，直接大端编码的保序性就需要额外变换维持：
 
-KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
+| 域 | 字节序编码方式 | 保序性 |
+|:--|:--|:--|
+| **无符号正整数** | 固定宽度大端补零 | ✅ 字典序 = 数值序，零变换 |
+| **有符号整数** | 加偏置，或符号位翻转 + 其余位取反 | ⚠️ 需变换 |
+| **浮点数** | 正数翻转符号位、负数全部位取反（±0 / NaN 另约） | ⚠️ 需变换 |
+| **跨类型** | 类型 tag + 负载（FoundationDB tuple 风格） | ℹ️ 同 tag 内有序、tag 间有大序 |
 
-```rust
-// 标准正序 Key：老数据在最上面，新数据在最底下
-let key_ascending = format!("log:{}:{}:", session_id, timestamp).into_bytes();
+多数键空间只在**无符号正整数**域运作——它零变换、成本最低，两个重要落地是**大端补零**（正序入门口）与**补码反转**（在该支上叠加倒序、用于时间戳），见下方子节。有符号 / 浮点 / 跨类型是越界时再补的技能：文档的多租户复合键是定宽 struct，tuple 是其「长度可变的通用多态」版本。
 
-// 倒序 Key：最新写入的数据天然排在最前面！
-// u64::MAX - timestamp：时间戳越大（越新），减出来越小
-// 越小 → LSM-Tree 字典序越靠前 → 物理层面「最新优先」
-let inverted_time = u64::MAX - timestamp;
-let mut key_descending = Vec::new();
-key_descending.extend_from_slice(format!("log:{}:", session_id).as_bytes());
-key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保证按位对比正确
-```
+**坐标系外的替代路线：自定义 Comparator。** 以上默认把排序**编码进 key**；RocksDB / HBase / LevelDB 另提供自定义 Comparator，让引擎按给定顺序比较 key。取舍：需跨引擎可移植或依赖前缀有序 → 编码进 key；单一引擎且排序依据频繁演进 → Comparator 省去 key 内冗余排序字段，但牺牲跨引擎通用性。
 
-**物理含义**：`u64::MAX - 1722500000` = `18446744072007051616`，`u64::MAX - 1722500001` = `18446744072007051615`。后者更小，在 LSM-Tree 中排在更前面——时间戳越大（越新），Key 字典序越小，迭代器正向扫描自然得到倒序结果。
-
-**应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
-
-### 大端序补零的工程陷阱
+#### 无符号正整数的落地：大端补零（工程陷阱）
 
 
 **绝对不能**将数字转为字符串后拼入 Key。字典序与数值序不同：
@@ -293,6 +386,29 @@ fn score_key(prefix: &[u8], score: i64, member: &[u8]) -> Vec<u8> {
 
 所有 Score 共享同一字节长度（8 bytes），高位补零由硬件指令自动完成，字典序 = 数值序。
 
+#### 重要应用：补码反转（Complement Encoding）—— 无符号时间戳的倒序
+
+
+KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
+
+```rust
+// 标准正序 Key：老数据在最上面，新数据在最底下
+let key_ascending = format!("log:{}:{}:", session_id, timestamp).into_bytes();
+
+// 倒序 Key：最新写入的数据天然排在最前面！
+// u64::MAX - timestamp：时间戳越大（越新），减出来越小
+// 越小 → LSM-Tree 字典序越靠前 → 物理层面「最新优先」
+let inverted_time = u64::MAX - timestamp;
+let mut key_descending = Vec::new();
+key_descending.extend_from_slice(format!("log:{}:", session_id).as_bytes());
+key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保证按位对比正确
+```
+
+**物理含义**：`u64::MAX - 1722500000` = `18446744072007051616`，`u64::MAX - 1722500001` = `18446744072007051615`。后者更小，在 LSM-Tree 中排在更前面——时间戳越大（越新），Key 字典序越小，迭代器正向扫描自然得到倒序结果。
+
+**应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
+
+> **对齐**：此处的 `timestamp` / `inverted_time` 均为 u64 无符号，属总纲「无符号正整数大端保序」保证的范畴——补码反转正是在这一支上叠加倒序变换，不涉及有符号 / 浮点的额外变换。
 ### 二级索引末尾必须追加主键 ID
 
 设计二级索引（如通过时间戳反查对话消息）时，必须将全局唯一的实体主键 ID 拼接到索引 Key 的最末尾。
@@ -424,84 +540,6 @@ impl AgentMemoryKey {
 ```
 
 **设计要点**：所有字段固定宽度（4+16+8=28 字节 + 2 分隔符 = 30 字节），反序列化无需解析、无需堆分配，纯指针切片操作。倒序时间戳内嵌在 Key 中，正向迭代器扫描即得「最新优先」结果。
-
-## 设计模式：纯 KV 底座上的系统级范式
-
-在纯 KV 世界里，算法不再是游离在数据库外面的胶水代码——Key 编码格式本身就是索引层、缓存层和隔离层。
-
-### Index-Only Scan（索引即数据）
-
-二级索引的 Value 留空，entity_id 编码在 Key 末尾。查询时仅遍历 Key 序列即可获取所有匹配的主键 ID，无需回表读取 Value——零磁盘 I/O。
-
-```
-数据主表：
-  d:{tenant}:{type}:{id}  →  [完整业务实体]
-
-属性索引表：
-  i:{tenant}:{type}:{attr}:{value}:{id}  →  ""  (Value 留空)
-
-查询「状态为 active 的所有用户」：
-  Scan("i:1:user:status:active:") → 遍历 Key 序列 → 提取末尾 id
-  无需读取任何 Value，零回表
-```
-
-**物理效果**：前缀扫描只触碰 LSM-Tree 的 MemTable + 索引层 SSTable（极小），不碰数据层的大 Value 文件。适合高频属性筛选（网关路由匹配、Agent 状态过滤）。
-
-### Bitmap 前置拦截（热路径零 KV 调用）
-
-网关高频检查「IP 是否在黑名单」「Token 是否合法」。每次请求都 `kv.get()` 即便命中缓存也有哈希查找开销。解法：在应用层内存常驻 Roaring Bitmap 或布隆过滤器。
-
-```
-写路径（新 IP 封禁时）：
-  1. kv.put("blacklist:ip:1.1.1.1", "")   ← 持久化落盘
-  2. bitmap.set(hash("1.1.1.1"))           ← 内存标记
-
-读路径（网关拦截，零 KV 调用）：
-  网关收到请求
-    → bitmap.check(hash(ip))
-    → 未命中 → 直接放行（QPS 百万级，纯 CPU 位判断）
-    → 可能命中 → kv.get() 最终权威判定
-```
-
-**物理效果**：热路径（99%+ 的正常请求）完全在 CPU L1 Cache 内完成，不触发任何 KV 引擎调用。只有极少数命中 Bitmap 的请求才下沉到存储层。适合网关黑名单/白名单、限流计数器、Token 校验。
-
-**与布隆过滤器的区别**：Bitmap 支持精确删除（`bitmap.unset()`），布隆过滤器只增不删。高频变更的黑名单用 Bitmap；只增不减的 Token 白名单用布隆过滤器更省内存。
-
-### 应用层 MVCC（无原生 MVCC 引擎的时间旅行）
-
-Fjall/SlateDB 不支持原生 MVCC。框架团队通过将版本号编排进 Key 骨架，实现应用层多版本控制：
-
-```
-Key: data:agent:101:v:[u64::MAX - 1001]  →  记忆状态 v1001
-Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
-```
-
-- **常规读取**：`Scan("data:agent:101:v:").next()` → 补码反转后最新版本排最前，亚微秒拿到最新状态
-- **时间旅行**：将前缀指针定位到目标版本号之后，正向扫描即得历史版本链。无需数据库快照锁，纯 Key 设计实现无锁历史回滚
-
-**与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
-
-### WiscKey 键值分离（大 Value 场景的写放大解药）
-
-典型场景：Key 几十字节，Value 几 MB（对话历史、3D 资产二进制、多模态特征向量、日志原始载荷）。传统 LSM-Tree 在 Compaction 时将 Key+Value 捆绑重写，写放大几十倍。
-
-WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，大 Value 追加写入独立日志文件。
-
-```
-【内存 + SSTable 索引层】
- Key: "asset:mesh:uuid_abc" → [File_ID : Offset : Length]  ← 十几字节指针
-                                    │
-                                    ▼ 磁盘随机点查
-【独立 Value Log（顺序追加）】
- offset_3402 → [大体积二进制资产：3D模型 / 对话历史 / 多模态特征]
-```
-
-**物理效果**：
-- **Compaction**：只搬动小指针 Key（几字节），不碰大 Value 文件。写放大从几十倍降为接近 1
-- **读取**：索引定位指针后，一次磁盘随机点查（NVMe 上 ~10μs）抓取大 Value
-- **适用场景**：任何 Key 小 Value 大的模式——Agent 对话历史、3D 资产、多模态特征、日志载荷
-
-Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
 
 ## SQL 操作的 KV 实现
 
@@ -1146,6 +1184,14 @@ Business Coordination (locks, scheduling, election)
 
 > **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
 
+### 分布式场景：并发有序性与分片均衡
+
+单机视角把 key 建模视为本地物理布局；跨节点、多写入者时，key 设计叠加两个分布式维度。
+
+**并发有序性（Versionstamp）**：倒序补码假设调用方能预知时间戳。并发向同一父记录附加子项（多线程/多节点同写一个事件流、日志、时序子记录）时，两个写入者可能撞同一时间戳——需要**服务器端序列化分配单调排序键**（versionstamp）：按可观察的提交顺序排定先手，保证附加以稳定先后落盘。单机用原子计数器即可；多节点下由共识层序号或 Leader 单调分配，使跨节点的追加日志/事件流获得全局一致的提交顺序。它和"调用方预知时间戳再倒序补码"互补：一个依赖预知，一个交给引擎在并发下排定顺序。
+
+**分片放置与均衡**：跨节点时 key 前缀同时决定**分片边界**——分片（tablet）沿 key 字典序切分，同前缀数据落同一分片。这带来双刃：前缀既是逻辑聚合也是物理局部性边界（利于批扫/局部事务），但访问集中到单一前缀会形成**热键**，单分片打满、其余空闲（DynamoDB 的 hot partition）。单机下文档用哈希盐打散写热点（均匀分散，见 [物理层编码范式](#物理层编码范式key-编码的物理层通用技巧)）；跨节点则需在**局部性**（同前缀同分片，利批扫）与**均衡**（前缀分散，避免热分片）之间权衡——哈希盐保均衡但破坏前缀局部性，前缀保局部性但热点风险。这是分布式 key 设计与单机最本质的差别：单机只管写放大，分布式还要同时管放置均衡。
+
 ## KV 框架 vs 自研数据库：演化边界
 
 纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
@@ -1285,9 +1331,9 @@ OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，�
 
 **字段级辅助索引（按实测引入，非默认）**：若整行为主、但偶有高频单字段热路径（如 `get(id) -> name`），可双轨：主 value = 整行 blob，辅助 key = `field_idx:{id} → 单字段值`。读单字段走辅助 key，写时同步更新主行 + 受影响的辅助 key。但**辅助索引 = 写放大**，是优化而非默认——只有实测确出现单字段热路径才引入，别为想象的热路径提前付（每加一条 = 和每字段 key 同一种代价）。
 
-## 三引擎 API 对比：Fjall / SlateDB / SurrealKV
+## 引擎 API 对比：Fjall / SlateDB / redb / SurrealKV
 
-三个纯 Rust LSM-Tree 引擎虽然底层数学模型相似，但设计场景和「第一公民」完全不同，导致 API 表达方式、事务设计哲学和状态控制存在本质代差。
+四个纯 Rust 嵌入式引擎虽然目标场景相似，但底层数据结构与「第一公民」完全不同，导致 API 表达方式、事务设计哲学和状态控制存在本质代差——其中 Fjall / SlateDB / SurrealKV 是 LSM-Tree，redb 是 Copy-on-Write B-tree（见 [设计模式 · 键空间模式](#键空间模式逻辑编码层-vs-物理分区)）。
 
 ### API 伪代码视感
 
@@ -1342,15 +1388,36 @@ tx.set(b"cfg:app:1", b"payload_bytes")?;
 tx.commit()?;
 ```
 
+#### redb：B-tree 事务域 API
+
+纯 Rust Copy-on-Write B-tree。无后台 compaction、读路径确定，天然适合「点查/范围扫描优先、写非海量」的负载。逻辑多表（TableDefinition）组织命名空间，事务用借用生命周期表达单写者约束。
+
+```rust
+// 1. 打开 B-tree 数据库（同一 db 内可定义多个逻辑表）
+let db = redb::Database::create(db_path)?;
+
+// 2. 定义逻辑数据表（每个 TableDefinition 独立一棵 B-tree）
+let user_table: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+
+// 3. 读写事务，借用生命周期保证单写者
+let write_tx = db.begin_write()?;
+{
+    let mut table = write_tx.open_table(user_table)?;
+    table.insert(b"cfg:app:1".as_slice(), b"payload_bytes")?;
+}
+write_tx.commit()?;
+```
+
 ### 核心 API 特性对比
 
-| 特性维度 | Fjall（3.x） | SlateDB | SurrealKV |
-|:--|:--|:--|:--|
-| **异步** | ❌ 纯同步，需 `spawn_blocking` | 🚀 纯异步 `.await`，融合 Tokio | ❌ 纯同步 |
-| **多空间隔离** | 🥇 Partitions 物理分区 | ❌ 扁平键空间 | ❌ 扁平键空间 |
-| **事务** | WriteBatch 原子批量 | 基础批量原子写 | 🥇 严格 MVCC 事务 |
-| **大 Value** | 🥇 WiscKey KV 分离 | 早期演进 | 🥇 Blob Log 大对象分离 |
-| **时间旅行** | ❌ | ❌ | 🥇 Versioned Queries |
+| 特性维度 | Fjall（3.x） | SlateDB | redb | SurrealKV |
+|:--|:--|:--|:--|:--|
+| **数据结构** | LSM-Tree | LSM-Tree | Copy-on-Write B-tree | LSM-Tree |
+| **异步** | ❌ 纯同步，需 `spawn_blocking` | 🚀 纯异步 `.await`，融合 Tokio | ❌ 纯同步 | ❌ 纯同步 |
+| **多空间隔离** | 🥇 Partitions 物理分区 | ◐ 扁平（无物理分区） | ◐ 逻辑多表（TableDefinition，非物理分区） | ◐ 扁平（无物理分区） |
+| **事务** | WriteBatch 原子批量 | 基础批量原子写 | 可串行化（借用生命周期单写者） | 🥇 严格 MVCC 事务 |
+| **大 Value** | 🥇 WiscKey KV 分离 | 早期演进 | ⚠️ 无 KV 分离 | 🥇 Blob Log 大对象分离 |
+| **时间旅行** | ❌ | ❌ | ❌ | 🥇 Versioned Queries |
 
 ### 选型指南
 
@@ -1358,11 +1425,12 @@ tx.commit()?;
 |:--|:--|:--|
 | API 网关、高并发中间件 | **Fjall** | Partition 物理分区精确划分，本地盘爆发力达硬件极限 |
 | Serverless AI Agent、云原生知识库 | **SlateDB** | 纯异步融入 Tokio，攒批推 S3，缩容至零 |
+| 读确定、免后台停顿的本地服务 | **redb** | COW B-tree 无 compaction，点查/范围扫描读路径确定 |
 | 并发账务、历史版本回滚 | **SurrealKV** | MVCC 事务 + 时间戳查询，省千行应用层版本维护 |
 
 ### 统一抽象
 
-三个引擎的 API 差异可通过统一 Trait 抽象屏蔽（见 §5.1 `AuraStorage` trait）。关键决策点：异步 `async`（→ SlateDB）或事务块同步（→ SurrealKV）。统一 Trait 让一套复合 Key 结构体在三引擎间无缝切换。
+四个引擎的 API 差异可通过统一 Trait 抽象屏蔽（见 §5.1 `AuraStorage` trait）。关键决策点：异步 `async`（→ SlateDB）、事务块同步（→ SurrealKV）、免停顿本地读确定（→ redb）。统一 Trait 让一套复合 Key 结构体在四引擎间无缝切换。
 
 ## §10. 单机场景选型指南
 
@@ -1549,6 +1617,8 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 ```
 
 **真理源在本地磁盘**。进程内直接写入 Fjall，无网络损耗，写入完毕立刻返回。延迟由 NVMe 物理特性决定（μs 级），不受网络波动影响。
+
+**本地路径的 B-tree 备选**：本地部署若以点查/范围扫描为主、且要消除后台 compaction 停顿，可在 Fjall 与 redb 之间二选一——Fjall（LSM，写密集）或 redb（COW B-tree，读确定），能力差异见 §9 对比表。
 
 **ACID 批处理**：AI Agent 场景频繁需要原子修改多个复合 Key（更新对话主表 + 更新排行索引 + 更新标签索引）。Fjall 3.0 的 WriteBatch 在 WAL 中一次原子提交，崩溃时整体回滚，保证索引一致性。
 
@@ -1806,7 +1876,7 @@ PG 退化为**元数据安全闸**——只管用户账户、组织权限、购�
 - 批判 §分布式锁：说「自己构建很简单」→ 本文展示 Fjall 进程内锁实现，分布式锁方案见 [共识协议文档](consensus-protocol.md)
 - 批判 §集群神话：说 Redis 缺乏强一致性 → [共识协议文档](consensus-protocol.md) 用经过验证的共识方案填补这个空缺
 
-→ SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [代码即 DDL](#代码即-ddlkv-的开发者体验保障)
+→ SQL 的对比论证见 [SQL 翻译层 vs KV 管道链](#sql-翻译层-vs-kv-管道链固定查询模式下的降维打击) 和 [KV 的 DDL](#kv-的-ddl索引管理与字段演进)
 
 [共识协议](consensus-protocol.md) 详述 **Raft 作为元数据共识协议的本质与边界**：为何 Raft 适合 etcd/K8s 的 MB 级元数据，却不适合 GB 级数据存储（3x 写放大的物理现实）。
 - Critique §"Network Latency Paradox": memory ~100ns vs network ~20μs → Fjall operates at the ns level (in-process function call)
