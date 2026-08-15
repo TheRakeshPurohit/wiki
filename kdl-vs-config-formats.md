@@ -240,6 +240,57 @@ def _kdl_node_value(node) -> Any:
     return None
 ```
 
+**基础转换的 schema-aware 列表修正**：`_kdl_node_value` 忠实按 KDL 语法折叠——`path "skills"` 单 arg 折叠成标量 `"skills"`。若消费端字段声明为 `list[X]`（如 `path: list[str]`），这个阶段要把这类单值标量**按字段标注归一成单元素列表**。以下 `_coerce_known_lists` 递归遍历结果，用 Pydantic 字段标注推导应作为列表的路径（放在加载后、交给 pydantic 校验前）：
+
+```python
+def _coerce_known_lists(data: Any, field: Any) -> Any:
+    from typing import get_origin, get_args
+
+    def _is_list(ann) -> bool:
+        # 容忍 Optional / Union / Annotated / types.UnionType（X | None）
+        if ann is None:
+            return False
+        origin = get_origin(ann)
+        if origin is list:
+            return True
+        if origin is Annotated and get_args(ann):
+            return _is_list(get_args(ann)[0])
+        if origin is Union or origin is UnionType:
+            return any(_is_list(a) for a in get_args(ann) if a is not type(None))
+        return False
+
+    # 先判「字段声明为 list」再判数据类型——否则单 dict 会先走 dict 分支，
+    # 被当普通对象展开，永远到不了列表归一。
+    if _is_list(getattr(field, "annotation", None)):
+        if isinstance(data, list):
+            # 已列表：取 list[X] 的元素类型 X 递归每个元素，避免二次包裹
+            elem_field = _FieldLike(get_args(getattr(field, "annotation", None))[0])
+            return [_coerce_known_lists(v, elem_field) for v in data]
+        return [data]  # 单值（标量或单 dict）→ 包成单元素列表
+
+    if isinstance(data, dict):
+        # model 类直接取 model_fields；否则从标注下钻（含 dict[str,T] 用 T）
+        if isinstance(field, type) and issubclass(field, BaseModel):
+            child, fields = field, field.model_fields
+        else:
+            child, fields = _child_model(field), _child_model(field).model_fields
+        # 键值 map（dict[str,Model]）时键不一定是字段名：命中字段用字段，否则用 child 统一处理
+        return {
+            key: (
+                _coerce_known_lists(v, fields[key])
+                if (fields and key in fields)
+                else _coerce_known_lists(v, child)
+            )
+            for key, v in data.items()
+        }
+    return data
+```
+
+要点：
+- `_is_list` 必须同时识别 `typing.Union` 与 `types.UnionType`——Python 3.10+ 的 `X | None` 用后者，只判 `typing.Union` 会漏掉 `path: list[str] | None` 这类字段（实测把 `extractors` 误判为非列表）。
+- **分支顺序关键**：先判断「字段声明为 list」再判断数据类型，否则单 `dict` 值走 dict 分支被当对象展开，无法归一。
+- `_child_model`/`_FieldLike` 是递归下钻子模型（剥 Annotated/Union、`dict[str,T]` 取 `T`）的辅助，这里省略其定义。
+
 把 KDL 转成嵌套 dict/struct 供配置框架（pydantic-settings、serde 等）消费时，遵循如下约定：
 
 - **节点名 = 字段键**：顶层节点名即顶层字段键，节点值由其内容决定。
@@ -260,6 +311,22 @@ def _kdl_node_value(node) -> Any:
 这条约定是「KDL 扁平比 JSON 更紧凑」在配置反方向的关键闭合：KDL 把"列表"表达为重复节点、把"值"压入单节点位置参数，正好映射回 dict 的 kv 结构，无需额外 type tag。
 
 > **这不是 Python 局部的约定，而是跨生态统一语义**：Rust 生态的 `kdl-rs`（KDL 官方序列化库）`serde` 反序列化遵循**完全一致**的七条规则——顶层节点名=map key、单 arg 节点→标量、多 arg→sequence、有 props→map、有 children→map(子名=key)、props+children 合并单 map、重复节点名→sequence。Python（pydantic-settings + ckdl）与 Rust（serde + kdl-rs）就对同一套 KDL 反序列化语义达成一致，这正是"KDL 节点名 = type tag"优势的落地证明：它把"身份"内建于语法，两端都无需额外判别映射层。
+
+### 谁补充「列表还是标量」的类型信息
+
+因为 KDL 语法不改写"单数还是复数"，消费端**必须有类型来源**才能把单值节点归成单元素列表。三种生态差异巨大：
+
+| 生态 | 类型信息来源 | 单值 → 列表的处理 |
+|:--|:--|:--|
+| **Rust serde**（kdl-rs） | 结构体字段声明 `Vec<T>`（编译期） | ✅ **原生解决**，无需额外工作 |
+| **Python pydantic-settings** | 字段声明 `list[T]`（运行时反射） | ✅ 需反射归一（skillforge 的 `_coerce_known_lists`） |
+| **Nushell**（`from kdl`） | ❌ 无类型系统，表格模型 | ⚠️ 必须显式 `--list-fields` 点出列表字段 |
+
+- **serde 是类型驱动的反序列化**：`deserialize_any`（无约束）才会把单 arg 当标量；当目标字段是 `Vec<String>`，serde 强制走 `deserialize_seq`，KDL 解析器即使看到单个 `"skills"` 也作为序列的单元素返回。因此 Rust 侧**单值列表问题不存在**——目标类型自动决定。
+- **Python 需反射节点定义**：pydantic-settings 知道 `path: list[str]`，加载时用字段标注把单值包成列表（skillforge `_coerce_known_lists` 递归下钻子模型，含 `dict[str,T]`、`X|None`、`Annotated`、`types.UnionType`）。
+- **Nushell 是无类型的**：`from kdl` 只给 `[[name,args,props,children]]` 表格，函数面不知道 `skills.path` 该是列表。必须用 `--list-fields ["skills.path" "test.messages"]` 显式声明，否则单值节点退化为标量。**这是 nushell 的结构性限制（无类型系统），不是实现可绕过的**——除非像 `kdl to-record --list-fields` 那样把列表字段写死。
+
+结论：**配置文件的权威解析方应是有类型的生态（Rust/Python）**，nushell 只作辅助查看，接受手动声明列表字段的成本。
 
 ## 三、KDL 风格指南
 
