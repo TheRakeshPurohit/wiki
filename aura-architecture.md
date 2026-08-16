@@ -46,9 +46,9 @@ Aura 将这种融合标准化为一个可复用的引擎：
 |------|------------|----------------|
 | 服务编排 | 自建 Actor 系统 + 手写状态机 | 场域模型（emit/on/on_join/on_batch）+ `interface_schema()` 自动路由 |
 | 状态管理 | Redis / Memcached / 自建 HashMap | Fjall LSM-Tree（WAL 断电保护 + Scale-to-Zero） |
-| 跨节点一致性 | 各服务自行实现 or 不实现 | Openraft 强一致共识，Actor 状态自动多机复制 |
+| 跨节点协调 | 各服务自行实现 or 不实现 | Openraft 元数据共识（Actor 注册/路由/配置）；Actor 数据走 Fjall+落湖 或 SlateDB+S3 |
 | 多语言支持 | 各服务独立运行时（微服务模式） | 进程内嵌入（Steel/Python/Wasm），零序列化 |
-| 部署 | Docker + K8s + Helm + 服务网格 | 单二进制，`scp` 即部署，加 `--raft-nodes` 即分布式 |
+| 部署 | Docker + K8s + Helm + 服务网格 | 单二进制，`scp` 即部署，加 `--raft-nodes` 同步元数据即可多机组网 |
 
 标准化的意义在于：开发者不再需要为每个项目重新设计"怎么把多个框架拼在一起"，而是直接使用一个经过验证的融合引擎，将精力集中在业务逻辑上。
 
@@ -125,6 +125,8 @@ Rust 原生实现的 Actor 引擎利用 Tokio MPSC 管道建立低开销的 Host
 | **持久化** | 存储层 | Fjall/SlateDB + Openraft 元数据共识 | LSM-Tree + Raft 共识 | 无外部缓存中间层，单次事务原子固化 |
 
 **关键澄清**：脚本语言（Steel/Python）是 Actor 的业务逻辑载体，每个 Actor 选一种。Wasm 是隔离运行时，用于托管第三方不信任代码——编写语言通常是 Rust，但 host 不关心，只消费 `.wasm` 二进制。语言用途没有硬性规定——Steel 可以写业务逻辑，Python 可以写策略，只要开发者认为合适即可。
+
+**持久化选型补充**：Actor 消息有强**时间局部性**——热点集中在最近写入的状态，SlateDB 刚写入即落在 memtable / 缓存，冷读 S3 只在偶发点查触发，可接受。因此 **SlateDB 可取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）；仅当热路径对进程内 ns-μs 有硬要求且读取无时间局部性时才退回 Fjall。若需强一致分布式复制，不自建——直接用 FoundationDB / TiKV。详见 [KV 存储引擎](kv-storage-engine.md) §两条分布路径/强一致分布式 与 [统一数据层](unified-data-layer.md)。
 
 **语言限制的设计理由**：框架限制为 Python/Steel/Wasm 三种语言，不是"不能支持更多"，而是**限制 AI 的生成空间**。AI 生成代码的质量和语言复杂度成反比——语言越少、边界越清晰，AI 生成的代码越可靠。组件集封闭有限（enum 门卫 + 手动过 enum 加组件），和 Aura 的 Actor 枚举设计一致：AI 需要完整词汇表才能正确生成 JSON，语言数量影响判断准确率。不限制语言看似灵活，实际上是把选择负担推给了 AI 和开发者——AI 要在无限选项中选最优，开发者要在无限组合中调试兼容性。限制语言 = 降低认知复杂度 = 提高生成质量。
 
@@ -506,20 +508,23 @@ trait Distribution: Send + Sync {
 
 | 模式 | 存储引擎 | 分发层 | 真理源 | 适用场景 |
 |:--|:--|:--|:--|:--|
-| **Fjall + Raft** | Fjall → 本地 NVMe | Raft 共识复制 | 本地磁盘 | 私有部署，亚毫秒延迟，强一致 |
+| **Fjall（本地）** | Fjall → 本地 NVMe | 落湖备份 + Raft 元数据协调 | 本地 Fjall（落湖兜底） | 私有部署，亚毫秒延迟 |
 | **SlateDB + S3** | SlateDB → S3 | 无操作（S3 自身 HA） | S3 桶 | 云原生，无状态计算，无限容量 |
 
-**互斥约束**（配置加载时校验）：
+**数据引擎二选一；Raft 元数据协调正交**（`--raft-nodes` 只同步元数据，不是与 S3 并列的数据分发层）：
 
 ```toml
 [storage]
-engine = "fjall"    # 或 "slate"
-distribution = "raft" # 或 "s3"
+engine = "fjall"    # 或 "slate"（数据引擎二选一）
 
-# engine=fjall  → distribution=raft ✓
-# engine=slate  → distribution=s3   ✓
-# 其他组合     → 启动报错
+[cluster]
+raft-nodes = "node1:9004,node2:9004"  # Openraft 只同步元数据（Actor 注册/路由/配置）
+
+# engine=fjall → 本地 Fjall + 落湖备份
+# engine=slate → SlateDB + S3（无限容量）
 ```
+
+> 注意：Openraft（元数据协调）与 S3（数据路径）是**正交的两个轴**，不是二选一的互斥项——多机组网始终需要前者的元数据共识。
 
 **Actor 完全不感知底层引擎**——`ctx.state.get("history")` 的调用方式不变，底层是 Fjall 同步返回还是 SlateDB 从 Block Cache 命中，对 Actor 透明。
 
@@ -534,11 +539,11 @@ Actor 状态是 KV 模式（点查 + 前缀扫描），SQL 的关系代数和查
 | 数据类型 | 默认方案 | 备选 | 理由 |
 |:---|:---|:---|:---|
 | Actor 状态（用户数据） | SlateDB + S3 | Fjall（单机/离线） | S3 自动复制，无需手动同步 |
-| Actor 状态（延迟敏感场景） | TiDB 模式（每个 Actor = 一个 Region） | — | 写放大 3x，不随 Actor 数量增长 |
+| Actor 状态（延迟敏感 + 需强一致复制） | TiDB 模式（每个 Actor = Region） | — | **数据级 Raft 复制**，属 TiDB/TiKV 范畴（非 Openraft 元数据） |
 | 配置/元数据 | Raft（Openraft / etcd） | — | 小数据 + 强一致，Raft 的正确用途 |
 | 脚本/图片（静态资产） | 文件系统同步（git / S3） | — | 静态资产不是数据，不需要共识 |
 
-**Actor 状态的 TiDB 模式**：每个 Actor 天然是一个 shard 边界。Actor:user:alice 独立一个 Raft Group（3 副本），Actor:user:bob 独立另一个。写放大始终 3x，不随 Actor 数量增长。这和 TiDB 的 Region 模型一致——Actor 是天然的分片边界。
+**Actor 状态的 TiDB 模式**：每个 Actor 天然是一个 shard 边界。Actor:user:alice 独立一个 Raft Group（3 副本），Actor:user:bob 独立另一个。写放大始终 3x，不随 Actor 数量增长。这和 TiDB 的 Region 模型一致——Actor 是天然的分片边界。**但属数据级 Raft 复制**——区别于 Openraft 只同步元数据：此分支需要 actor 数据跨节点复制，是「分片 + Raft」强一致路径，应直接落现成的 TiKV / TiDB 分片机制（或 FoundationDB 得全局事务），非此架构的默认路径（默认 SlateDB+S3 / Fjall+落湖，元数据走 Openraft）。
 
 **大部分场景用 SlateDB + S3**：除非真的需要 <1ms 写延迟 + 强一致，否则 SlateDB + S3 更简单。S3 处理复制，成本低 20 倍，运维无 Raft/PD/Region 调度。
 
@@ -546,15 +551,15 @@ Actor 状态是 KV 模式（点查 + 前缀扫描），SQL 的关系代数和查
 
 | 核心维度 | Fjall + Openraft + 多模态嵌入沙箱（原架构） | 替换为 Redis 的退化形态 |
 |---------|---------------------------------------------|---------------------------|
-| **集群内聚度** | 纯 Rust 单体。通过 Raft 日志实现全网自愈和强一致。 | 割裂的应用服务器矩阵 + 外部独立的 Redis 实例 + 复杂的 Redis Sentinel/Cluster 运维线。 |
+| **集群内聚度** | 纯 Rust 单体。Openraft 元数据日志实现 Actor 注册/路由的自愈与强一致（数据落 Fjall+湖 或 SlateDB+S3）。 | 割裂的应用服务器矩阵 + 外部独立的 Redis 实例 + 复杂的 Redis Sentinel/Cluster 运维线。 |
 | **计算局部性** | 计算紧贴存储（Compute Near Data）。多语言虚拟机内存指针直接映射磁盘 Buffer。零网络 RTT，走 CPU 总线速度。 | 计算远离存储。网关每次收请求必须打开 TCP 连接，数据打包成文本型 RESP 协议跨进程传输，重新背负 1.0ms–3.0ms 的网络往返延迟（RTT）。 |
 | **零拷贝** | Rust 生命周期系统（`serde(borrow)`）让多语言虚拟机直接用指针读取磁盘 Buffer，无新内存申请。 | 数据必须在 Redis 侧打包、经 Socket 传输、在 Rust 客户端解包，在堆内存申请新空间大块拷贝。高频内存分配与 GC 开销。 |
-| **多线程并行** | Openraft 共识日志基于 Tokio 异步协程多核高并发，Fjall 多线程 LSM 异步刷盘，Steel/PyO3 各走独立 OS 线程，全网无中心化吞吐卡死。 | Redis 单线程事件循环，一旦运行复杂 Lua 脚本或重度 CPU 计算，全球所有其他读写请求瞬间死锁卡死。 |
+| **多线程并行** | Openraft 元数据共识日志基于 Tokio 异步协程多核高并发，Fjall 多线程 LSM 异步刷盘，Steel/PyO3 各走独立 OS 线程，全网无中心化吞吐卡死。 | Redis 单线程事件循环，一旦运行复杂 Lua 脚本或重度 CPU 计算，全球所有其他读写请求瞬间死锁卡死。 |
 | **Scale-to-Zero** | Fjall LSM-Tree 将不活跃冷状态高度压缩为磁盘 SSTables。Agent 睡着时 RAM 消耗 0 字节。百万级 Agent 也无内存压力。 | Redis 纯内存数据库，所有数据全量躺在物理内存里。智能体扩大到 1 万或 100 万个时，硬件账单指数级爆炸。 |
 | **Token 优化** | 后台静默触发"环境梦境整理（Ambient Consolidation）"，自动将长时文本 Sink 进 S3。 | 必须在应用端写复杂的定时任务（Cron Jobs），高频跨网络去捞内存数据再执行归档。 |
 | **系统复杂度** | 极致极简。1 个可执行文件，0 个外部数据库配置文件，解压即组网。 | 高运维负荷。需要维护多套发布流水线、外部连接池监控以及缓存击穿/雪崩的防御代码。 |
 
-**一句话总结**：把 Fjall + Openraft 换成 Redis，是用系统长期的"运行期高延迟、带宽开销、内存账单膨胀以及单线程死锁风险"，去仅仅换取"在第一周开发时少写几行 Openraft 节点连接代码"的短暂偷懒。没有 Redis 集群的心跳同步紊乱，没有 PostgreSQL 昂贵的连接池耗尽与 SQL 树解析开销，没有 JavaScript（Rivet）运行时的冗余与弱类型妥协。在 Rust 语言的底层安全原语之上，构建了一座全网络自动强一致性状态锁定的分布式智能体系统。
+**一句话总结**：把 Fjall + Openraft 换成 Redis，是用系统长期的"运行期高延迟、带宽开销、内存账单膨胀以及单线程死锁风险"，去仅仅换取"在第一周开发时少写几行 Openraft 节点连接代码"的短暂偷懒。没有 Redis 集群的心跳同步紊乱，没有 PostgreSQL 昂贵的连接池耗尽与 SQL 树解析开销，没有 JavaScript（Rivet）运行时的冗余与弱类型妥协。在 Rust 语言的底层安全原语之上，构建了一套跨节点元数据强一致、数据存算分离（Fjall+湖 / SlateDB+S3）的分布式智能体系统。
 
 **Lua 脚本的工程断层**：Redis 为挽救吞吐量引入的 Lua 脚本，除了单线程死锁风险外，还导致主技术栈（Rust/Go）与脚本层发生工程学与调试断层——失去强类型保护、单元测试和 IDE 感知提示。
 
@@ -956,7 +961,7 @@ result = await ctx.invoke("charge_processor", {"user_id": "42", "amount": 100})
 |------|------|------|
 | 进程内 Actor ↔ Actor | `ciborium::Value` | 内存 clone，零编解码 |
 | Actor → Fjall 持久化 | CBOR bytes | `ciborium::serialize()` 写入 LSM-Tree |
-| 跨节点 Openraft 复制 | CBOR bytes | 网络传输需要序列化 |
+| 跨节点 Openraft 元数据复制 | 小体积 CBOR | 仅注册/路由/配置（非 Actor 数据） |
 | Actor → Fluxora（HTTP/WS） | JSON | 外部系统消费 JSON |
 | Actor → Webhook | CBOR 或 JSON | 按配置选择 |
 
@@ -1399,7 +1404,7 @@ Realm 分发时，对每个匹配的 Route 按 mode 分别处理：On 直接投�
 | **命名空间** | namespace（默认 "default"） | 场域按 namespace 隔离，跨 namespace 的事件不投递 |
 | **顺序保证** | 因果一致性 | 如果 e1 因果先于 e2（e1 的处理导致 e2 的发射），则任何订阅者收到 e1 必在 e2 之前。无因果关系的并发事件可乱序 |
 
-因果一致是甜区：保证逻辑正确性（因先于果），不需要全序的共识开销。进程内事件天然因果有序（同一线程内的 emit 序列）；跨节点时 Openraft 日志本身是全序的（跨节点事件实际拿到比因果更强的保证）；同节点并发 Actor 的事件用向量时钟标记 happened-before 关系。
+因果一致是甜区：保证逻辑正确性（因先于果），不需要全序的共识开销。进程内事件天然因果有序（同一线程内的 emit 序列）；跨节点事件序号由 Openraft 元数据日志排定（只排先后、不复制事件体，实际获比因果更强的次序保证）；同节点并发 Actor 的事件用向量时钟标记 happened-before 关系。
 
 ### 5.8 传统 Actor 模型可借鉴的设计
 
@@ -1850,7 +1855,7 @@ bounded mailbox 收到背压信号时，正确的反应是**触发水平扩展**
 
 | 模式 | 存储引擎 | 分发层 | 真理源 | 归档职责 |
 |:--|:--|:--|:--|:--|
-| **Fjall + Raft** | Fjall → 本地 NVMe | Raft 共识复制 | 本地磁盘 | **自管**：自行截断/上传 S3 归档 |
+| **Fjall（本地）** | Fjall → 本地 NVMe | 落湖备份 + Raft 元数据协调 | 本地 Fjall（落湖兜底） | **自管**：自行截断/上传 S3 归档 |
 | **SlateDB + S3** | SlateDB → S3 | 无（S3 自身 HA） | S3 桶 | 天然（S3 即归档） |
 
 选择 Fjall + Raft 时，冷数据归档**不在 SlateDB 通道里**——Fjall 自管，分两步走：
@@ -1865,7 +1870,7 @@ bounded mailbox 收到背压信号时，正确的反应是**触发水平扩展**
 
 | 层 | 组件 | 负责 |
 |:--|:--|:--|
-| 场域内状态/事件 | Fjall + Raft（或 SlateDB + S3） | 低延迟、强一致、随机读写 |
+| 场域内状态/事件 | Fjall 本地+落湖（或 SlateDB + S3）＋ Openraft 元数据 | 低延迟、随机读写、元数据强一致 |
 | 边界事件/审计/归档 | S3（本模式由 Fjall 自管上传） | 无限容量、不可变日志、保留删除 |
 | 消费组元数据 | KV（Fjall 或 SlateDB） | offset 点查、重试进度 |
 
@@ -1887,7 +1892,7 @@ Rivet Actors 提供了优秀的 Actor 开发体验：TypeScript SDK、自动 HTT
 | **语言** | TypeScript/JavaScript（V8 隔离） | Rust 核心 + Steel Lisp/Python/Wasm 嵌入（进程内，无 IPC） |
 | **系统启动** | 数百毫秒（Node.js 进程 + V8 初始化） | 毫秒级（Tokio 运行时 + Fjall 打开） |
 | **Actor 唤醒** | 几毫秒（V8 虚拟机激活） | 微秒级（Steel 字节码 VM 瞬时创建；Python PyO3 ~1ms） |
-| **状态存储** | SQLite（同机共生，但单机瓶颈） | Fjall LSM-Tree（嵌入式，支持 Openraft 分布式复制） |
+| **状态存储** | SQLite（同机共生，但单机瓶颈） | Fjall LSM-Tree（嵌入式；跨节点元数据由 Openraft 协调，数据落湖/S3） |
 | **类型安全** | TypeScript（运行时类型，编译期弱） | Rust 编译期强类型 + Steel Lisp 的 S-表达式零二义性 |
 | **多语言** | 仅 JS/TS | Rust/Steel/Python/Wasm 四语言进程内混合 |
 | **状态持久化** | SQLite 文件 | Fjall KV + CBOR 序列化 |
@@ -1995,7 +2000,7 @@ $ aura build --release
 $ scp target/release/order_service user@server:/opt/aura/
 $ ssh user@server "aura serve order_service --port 8080"
 
-# 多机部署——加一行 Openraft 配置即可分布式
+# 多机部署——加一行 Openraft 配置即可组网（--raft-nodes 同步元数据，数据落湖/S3）
 $ aura serve order_service --raft-nodes "node1:9004,node2:9004,node3:9004"
 ```
 
@@ -2006,7 +2011,7 @@ $ aura serve order_service --raft-nodes "node1:9004,node2:9004,node3:9004"
 | 构建 | Dockerfile → docker build → push registry | `aura build --release` |
 | 配置 | Deployment YAML + Service YAML + Ingress YAML | `aura serve --port 8080` |
 | 状态存储 | PVC + StorageClass + PV | Fjall 内嵌（自动） |
-| 多副本 | StatefulSet + etcd + headless Service | `--raft-nodes` 一行配置 |
+| 多机元数据同步 | StatefulSet + etcd + headless Service | `--raft-nodes` 一行配置（同步元数据） |
 | 扩缩容 | HPA + Metrics Server + CPU/内存阈值 | Actor 自动 Scale-to-Zero |
 | 证书 | cert-manager + ClusterIssuer + Certificate CRD | 内置 Let's Encrypt（可选） |
 
@@ -2030,7 +2035,7 @@ Rivet 的状态是单机 SQLite，多副本需要外部同步。Aura 通过 Open
 2. **状态即代码**：Actor 状态是 CBOR Value 树（`ctx.state`），通过 `ctx.state` 操作立即写 WAL 落盘。Rust Actor 享有编译期类型安全，脚本 Actor 享有 JSON Schema 校验
 3. **声明式生命周期**：`on_wake`/`on_sleep`/`cron` 注解声明 Actor 行为，不需要外部调度器
 4. **本地即生产**：本地开发用 Fjall 临时目录，生产用 Fjall 持久目录，行为 100% 一致——没有"本地能跑线上炸了"的问题
-5. **渐进式复杂度**：单机 → 分布式只需加一行 `--raft-nodes`，不需要重写代码或引入新组件
+5. **渐进式复杂度**：单机 → 多机组网只需加一行 `--raft-nodes`（同步元数据；数据侧本地落湖或 SlateDB+S3），不需要重写代码或引入新组件
 
 ### 6.9 auractl：CLI 管理工具
 
@@ -2146,16 +2151,16 @@ auractl fjall rollback cart_actor --version 2
 | **编码摩擦** | 极低 | 极高（状态机抽象） | **低**（简单 KV 接口） |
 | **断电保护** | ❌ 无 | ✅ WAL + RaftLog | **✅ WAL** |
 | **Scale-to-Zero** | ❌ 无（10 万 Actor 撑爆内存） | ✅ LSM-Tree | **✅ LSM-Tree** |
-| **持久化** | ❌ 无（重启后状态丢失） | ✅ RaftLog | **✅ Fjall 磁盘** |
-| **未来扩展性** | ✅ 无限 | ❌ 锁死 CP 强一致 | **✅ 无限** |
-| **心智负荷** | 极低 | 极高 | **低** |
-| **推荐场景** | 原型验证 | 明确需要分布式 | **通用起手式** ✨ |
+| **持久化** | ❌ 无（重启后状态丢失） | ✅（元数据 Raft + 数据 Fjall/S3） | **✅ Fjall 磁盘** |
+| **未来扩展性** | ✅ 无限 | ⚠️ 元数据绑 Raft（数据仍可 S3/落湖） | **✅ 无限** |
+| **心智负荷** | 极低 | 中（共识依赖） | **低** |
+| **推荐场景** | 原型验证 | 确定需要多机元数据协调 | **通用起手式** ✨ |
 
 **模式一：Mutex<HashMap> 起手（零依赖体验）**——项目刚敲下第一行代码时，状态就是 Rust 原生类型，不需要写任何序列化宏。致命缺陷：无断电保护、无 Scale-to-Zero、无持久化。
 
-**模式二：Openraft 起手（分布式铁笼枷锁）**——状态不能再任性地通过指针直接修改，必须强制把每一个业务动作定义为可全网广播的 `RaftCommand`。如果后续发现项目需要 AP 最终一致性系统（如 CRDT），整个业务控制路由早已和 RaftLog 紧密绑定。不推荐项目早期、业务边界未定型时使用。
+**模式二：Openraft 起手（元数据协调枷锁）**——Openraft 只同步元数据（Actor 注册/路由/配置），不复制 Actor 数据、也不要求每个业务动作都经 `RaftCommand` 广播；但引入它仍是为跨节点协调的共识依赖，会把数据落湖/S3 之外的协调逻辑绑进 Raft。适合确定要多机元数据协调的场景；业务边界未定型时可不急于引入。
 
-**模式三：Tokio Actor + 单机 Fjall 起手（工程学的最高折中）✨**——用 Fjall 替代 HashMap 几乎没有增加编码摩擦，却带来了：✅ 本地 bare-metal 级别的断电崩溃物理保护（WAL）、✅ 闲时内存自动归零（Scale-to-Zero）、✅ 读写速度快到物理硬件的极限、✅ 布隆过滤器微秒级定位。如果项目做大了需要多机灾备，由于已经是 Actor + Fjall 架构，随时可以轻松地把 Openraft 的分布式共识日志作为一层"轻量保护膜"套在 Fjall 的外面。**起手式不锁定终极宿命。**
+**模式三：Tokio Actor + 单机 Fjall 起手（工程学的最高折中）✨**——用 Fjall 替代 HashMap 几乎没有增加编码摩擦，却带来了：✅ 本地 bare-metal 级别的断电崩溃物理保护（WAL）、✅ 闲时内存自动归零（Scale-to-Zero）、✅ 读写速度快到物理硬件的极限、✅ 布隆过滤器微秒级定位。如果项目做大了需要多机灾备，由于已经是 Actor + Fjall 架构，随时可以轻松地把 Openraft 的元数据协调作为一层"轻量保护膜"盖在 Fjall 之上（数据仍本地 + 落湖/S3）。**起手式不锁定终极宿命。**
 
 ### 8.3 起手式代码示例
 
@@ -2224,27 +2229,28 @@ impl ActorState {
 }
 ```
 
-#### 未来演进：套上 Openraft 保护膜
+#### 未来演进：Openraft 只做元数据，数据不复制
 
 ```rust
-// 当需要多机灾备时，只需在 Fjall 外面套一层 Openraft
+// 多机时：Openraft 只同步元数据（Actor 注册/路由），数据直写本地 Fjall（后落湖），不经 Raft 写路径
 use openraft::Raft;
 
 struct DistributedActorState {
-    raft: Raft<FluxarrowTypeConfig>,
-    fjall: Arc<ActorState>,  // 复用上面的单机 Fjall 实现
+    registry: Raft<FluxarrowTypeConfig>, // 元数据：Actor => 所在节点
+    actor: Arc<ActorState>,              // 复用上面的单机 Fjall 实现
+    store: Option<ObjectStoreClient>,    // 数据兜底：落湖 / SlateDB+S3
 }
 
-// 业务代码几乎不需要修改
 impl DistributedActorState {
     async fn upsert(&self, key: &str, value: Vec<u8>) -> anyhow::Result<()> {
-        // 通过 Raft 共识后，写入本地 Fjall
-        let cmd = RaftCommand::UpsertState {
-            agent_id: key.to_string(),
-            value,
-        };
-        self.raft.client_write(cmd).await?;
+        // 数据直写本地 Fjall；落湖 / S3 异步兜底——不经过 Raft 日志
+        self.actor.upsert(key, value).await?;
         Ok(())
+    }
+
+    async fn locate(&self, actor: &str) -> anyhow::Result<NodeId> {
+        // 仅元数据（Actor 注册/路由）走 Raft
+        Ok(self.registry.metrics().await?.current_leader)
     }
 }
 ```

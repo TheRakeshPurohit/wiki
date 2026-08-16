@@ -42,8 +42,33 @@ PG 的泛化能力使它成为探索期的最优默认：
 
 - **OLTP：嵌入式 KV**——查询模式可预测 / 大规模状态用 KV 取代 PG。可预测与否取决于需求可控性（话语权），而非组织身份。零解析、零优化器、进程内零 RTT、单一二进制；数据量大时 KV 的物理优势即便模式多变也成立。完整论证见 [KV 存储引擎](kv-storage-engine.md)。
 - **OLAP：Iceberg + DuckDB**——历史与分析数据归 Iceberg 落在 S3（对象存储为唯一 Truth），DuckDB 做嵌入式查询层，只读所需列、同型值压缩、过滤聚合下推。Catalog 可无状态化：本地 KV 只是 `table → snapshot` 缓存，丢了扫 S3 重建。详见 [Lakehouse 研究](lakehouse-research.md)。
-- **持久与分布**：Lakehouse 同时承担 OLTP 的**持久备份**与对外 **OLAP 服务**——异步 Flush 把 Fjall 状态落入 Iceberg，DuckDB 及第三方引擎经标准表格式读取同一份 S3 数据。由此「Fjall + Lakehouse」与「SlateDB + S3」是两条并行路径：前者本地写入、落湖为备份，后者直接以 S3 为存储后端。共识层（Openraft）只承载**元数据规模**协调（登录态、Catalog 指针、配置）——Raft 不分片，每节点为全量副本，存储与写放大随节点数线性增长（3x 可接受，但无法随节点数扩展），不适合大规模同步数据。
+- **持久与分布**：Lakehouse 同时承担 OLTP 的**持久备份**与对外 **OLAP 服务**——异步 Flush 把 Fjall 状态落入 Iceberg，DuckDB 及第三方引擎经标准表格式读取同一份 S3 数据。分布形态在「Fjall + Lakehouse」与「SlateDB + S3」间选择，见下节《两条分布路径》。
 - **收敛哲学**：剔除中间商——Redis 的网络态缓存、关系型的解析器运行时、独立数仓的运维，都由这两件套吸收。服务即数据库，数据库即服务。
+
+### 两条分布路径：Fjall + Lakehouse vs SlateDB + S3
+
+分水岭先看**时间局部性**：若热数据是近期写入、能被 memtable / 本地缓存兜住（Actor 消息、会话状态这类），冷读概率低——SlateDB 的 S3 往返只在偶发点查触发，可接受，甚至可**取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）。仅当热读取对进程内 ns-μs 有硬要求、且读取无时间局部性时，Fjall 才是必需。
+
+| 维度 | Fjall + Iceberg | SlateDB + S3 |
+|:---|:---|:---|
+| 真相位置 | 本地磁盘（serving）+ Iceberg 落湖，两处 | S3 即真相，一处 |
+| 热路径服务延迟 | 进程内零 RTT（ns-μs） | 缓存命中快；冷读走 S3（ms） |
+| 持久性 / 容灾 | 单节点本地；落湖滞后=崩溃丢失窗口 | S3 3-AZ 原生，无独立备份管线 |
+| 跨实例共享 / 读扩展 | 单节点进程内；共享需经 Iceberg/共识 | 多实例读共享 S3，读天然水平扩展 |
+| 写入路径 | 本地 WAL→SSTable（极快） | memtable→异步 flush S3 |
+| 架构件数 | 两套 + 自建 flush 管线 | 一套 |
+| 一致性 | KV 与 Iceberg 间 eventual（flush 滞后） | 单真相，manifest 协调 |
+| 分析 | DuckDB 读 Iceberg（标准表格式/时旅/演进） | DataFusion 直接查；接 DuckDB/BI 需导出 Parquet/Iceberg |
+| 导向规模 | 单机中规模 + 归档分析分离 | 大规模、多写多读、存算分离 |
+| 成熟度 | Fjall 成熟；管线自搭 | SlateDB 相对新，生产待验证 |
+
+**Fjall + Iceberg 赢在「热」**：进程内直接 `scan` 服务请求、确定性响应，Iceberg 兜持久与分析；代价是两套真相 + flush 滞后（节点落湖前崩溃丢最近写入），且热数据无法靠共识复制来跨实例共享——Raft/Openraft 不分片、每节点全量副本，存储与写放大随节点数线性增长，只配管元数据规模。
+
+**SlateDB 赢在「单真相 + 扩展」**：S3 唯一真、无独立备份管线、多实例读共享，收齐存算分离红利（副本固定 3-AZ，与节点数无关）；代价是冷读的 S3 往返，热路径靠内存/本地缓存兜底，点查不及 Fjall 的嵌入式零 RTT。
+
+**决策**：有强时间局部性、或接受偶发冷读 → SlateDB + S3（单真相、可扩展）；对进程内 ns-μs 有硬要求且读取无时间局部性 → Fjall + Iceberg。二者是优化目标不同（单真相 + 扩展 vs 进程内热延迟）的两条路，非同类替换。
+
+**强一致分布式不自建**：若需要的是强一致的数据复制 + 水平扩展（「分片 + Raft」形态），别把嵌入式引擎拼成分片 + Raft（那等于重造分布式数据库），直接用成熟的 FoundationDB / TiKV——要跨片 ACID 用 FDB，分片 KV + 片内一致用 TiKV。对比详见 [KV 存储引擎](kv-storage-engine.md) §强一致分布式。
 
 ## 为什么路径 B 也不选单引擎（SurrealDB）
 
