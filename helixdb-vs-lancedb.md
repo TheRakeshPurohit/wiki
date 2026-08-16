@@ -92,7 +92,7 @@ HelixDB 与 LanceDB 都依赖对象存储原生，这点与 Fjall 的"本地存�
 | 原子写 | 依赖对象存储 `If-None-Match` 条件写 | SlateDB 对象存储 LSM |
 | 底座关系 | 自研 Lance 格式 | SlateDB（与你在 kv 文档对比的底层同源） |
 
-**"Fjall + Openraft 不适合 S3"的论证**已在 [共识协议 §3](consensus-protocol.md) 完整展开（写放大、Raft 复制成本 vs S3 固定三副、存算分离），此处不重复——两个后续方案（LanceDB、HelixDB）都是对象存储原生的正面解法。
+**"Fjall + Openraft 不适合 S3"的论证**已在 [共识协议](consensus-protocol.md)「Raft 不适合什么」章完整展开（写放大、Raft 复制成本 vs S3 固定三副、存算分离），此处不重复——两个后续方案（LanceDB、HelixDB）都是对象存储原生的正面解法。
 
 多厂商对象存储适配（阿里云 OSS/华为 OBS/腾讯 COS/Cloudflare R2 的 `If-None-Match` 兼容矩阵）见附录。
 
@@ -143,7 +143,7 @@ LanceDB 与 Delta Lake 的原子写依赖标准 AWS S3 的 `If-None-Match: *` �
 ## 交叉引用
 
 - **[KV 存储引擎](kv-storage-engine.md)**：Fjall 本地存算一体 vs SlateDB 对象存储的原语层对比，即本文应用层决策的底层依据。
-- **[共识协议](consensus-protocol.md)**：§3"Raft 不适合批量数据存储"、§6.4 "Fjall + Raft vs SlateDB + S3"——S3 为何是对象存储原生的正确底座。
+- **[共识协议](consensus-protocol.md)**：「Raft 不适合什么」与「Fjall + Raft vs SlateDB + S3」——S3 为何是对象存储原生的正确底座。
 - **[分布式锁：反模式分析](distributed-lock-anti-pattern.md)**：HelixDB 单写者多读者、对象存储原子写，正是避开分布式锁的架构体现。
 - **[Redis 批判](redis-critique.md)**：缓存/协调层为何排除 Redis 型单点内存。
 - **[序列化协议对比](serialization-protocol-comparison.md)**：反专有语法 IDL 的立场，是本文批判 HelixDB 专有 DSL 的依据。
