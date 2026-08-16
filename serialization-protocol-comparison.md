@@ -18,14 +18,14 @@
 ```
 完全自描述     ←————————————————————→    完全静态/按序
 (带字段名)                                 (字段名/ID 都没有)
-CBOR / JSON     Tagged-ID                   Cap'n/SBE/        postcard/bincode
+CBOR / JSON    Tagged/TLV                   Cap'n/SBE/        postcard/bincode
                 Cap'n/SBE/FlatBuffers       FlatBuffers
 ```
 
 | 层 | 代表 | 数据流里带 | 接收方需预知 | 冗余 | 向后兼容 |
 |:--|:--|:--|:--|:--|:--|
 | **动态（自描述）** | CBOR、JSON、MessagePack | 字段**名字字符串** | 几乎不用 | 最大 | 最强（纯靠名字） |
-| **半动态（字段 ID）** | Cap'n Proto、SBE、FlatBuffers、PB | 字段**数字 ID（tag）** | 需 type schema 对齐 | 中（数字比名字小） | 强（跳未知 ID） |
+| **半动态（Tagged/TLV）** | Cap'n Proto、SBE、FlatBuffers、PB | 字段**数字 ID（tag）** | 需 type schema 对齐 | 中（数字比名字小） | 强（跳未知 ID） |
 | **静态（按序）** | postcard、bincode | 无名字、无 ID | 精确 struct 定义 | **0** | 无（加字段即崩） |
 
 **半动态层内部是两种哲学**：Cap'n Proto / FlatBuffers 是**指针式零拷贝**（读单字段 O(1) 地址跳转、演进强、体积大）；SBE 是**固定紧凑**（纳秒级延迟、演进弱）。它们用「字段数字 ID」代替 CBOR 的「字段名字字符串」，既绕开名字冗余，又保留按 tag 跳未知字段的演进能力——这正是"半动态"的本质。
@@ -248,6 +248,7 @@ IDL 本身没有问题——问题在 **IDL 是不是"标准数据格式"、能�
 - **schema = Rust 类型 + 3 个过程宏**（`Archive` / `Serialize` / `Deserialize`），无独立 IDL 文件——code-first 极致，程序 100% 可操作，比专有 `.capnp` 更"标准"。读取 `Archived<T>` 字段 O(1)。
 - **硬约束**：需对齐 buffer（`AlignedVec`）+ 对齐访问（换来 padding）；布局只由 **Rust 编译产物**编解码——**即同为 Rust（含编译到 wasm 的纯 Rust）可读写；非 Rust 产物（宿主 JS、Go，含其编译的 wasm）无法解读**。wasm 是编译目标，不是限制本身——纯 Rust 的 wasm 完全可用。演进兼容弱（加字段/换类需自己管版本或迁移，不如 Avro/Cap'n 顺滑）。
 - **定位**：KV 海量只读 value 的 mmap 点查利器，与 postcard（紧凑）、CBOR（跨语言）不冲突、可分层。
+- **落点边界（别按"性能倍增器"立项）**：零拷贝只兑现于"在 mmap 归档缓冲上服务反复随机点查、不物化 owned 结构"这条热路径。若是「KV → Arrow/Iceberg/Parquet 批量导出」，字节照例被拷进 Arrow/Parquet 缓冲，rkyv 只能省掉中间那趟 owned 反序列化，增益小于"免反序列化"的全部。rkyv 与 postcard/CBOR 不是二选一，而是按层分工；且其为仅 Rust 的专有布局 + 演进需自管版本（见上），只适合"留在进程内"那一半，跨语言/出口仍走 Arrow / Avro。
 
 ```rust
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -332,7 +333,7 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
 
 | 维度 | A：Code-First PB | B：Bincode | B2：半动态（Cap'n/SBE/FlatBuffers） | B3：rkyv | C：Avro |
 |---------|------------------|-----------|-------------------------------------|----------|---------|
-| **谱系位置** | 半动态（Tagged-ID） | 静态（按序） | 半动态（Tagged-ID） | 静态 + 零拷贝（类型即定义） | 静态（按序，但带外 schema） |
+| **谱系位置** | 半动态（Tagged/TLV） | 静态（按序） | 半动态（Tagged/TLV） | 静态 + 零拷贝（类型即定义） | 静态（按序，但带外 schema） |
 | **跨语言** | ✅ 多语言 | ❌ 纯 Rust | ✅ Cap'n/SBE 多语言 | ❌ 仅 Rust 编译产物 | ✅ 标准 JSON Schema |
 | **IDL** | ❌ 宏标记替代 | ❌ 不需要 | ✅ 需 IDL（.capnp/XML） | ❌ 不需要（类型即定义） | ✅ JSON 文件 |
 | **编码摩擦** | 中（prost 宏） | **极低**（零配置） | 高（IDL 驱动） | **极低**（3 个 derive 宏） | 低（JSON Schema） |

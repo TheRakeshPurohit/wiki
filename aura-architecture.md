@@ -735,6 +735,7 @@ pub enum RaftCommand {
 | **Raft 元数据（LogId 等）** | Postcard | Openraft 内部用，与 Raft 控制流统一格式 |
 | **Raft 控制流与 RPC** | Postcard | 纯 Rust 声明式、Postcard-Schema 宏支持 Schema 演进 |
 | **分析查询路径** | Arrow IPC | 列式对齐，Fjall 读出后 Polars 零拷贝转铸 DataFrame |
+| **KV value 只读点查（候选）** | rkyv | 纯 Rust mmap 零拷贝，O(1) 点查；仅进程内热路径，跨语言/出口仍走 CBOR/Arrow（见序列化文档方案 B3 落点边界） |
 | **云端长期记忆 Lakehouse** | Lance | 内嵌向量与倒排索引，原生支持远程 S3 流式检索 |
 | **海量冷历史冬眠** | Parquet | 高压缩率冷存储 |
 | **UI ↔ Gateway** | CBOR | 跨语言（WASM），自描述 |
