@@ -7,7 +7,7 @@
 
 ## 核心论点
 
-KV 以极简底座覆盖绝大多数存储需求，靠四个独立成立的判断：
+KV 以极简底座覆盖绝大多数存储需求，靠三个独立成立的判断：
 
 1. **进程内零网络开销**：嵌入式 KV（Fjall 等）直接跑在应用进程内，本地读取无网络跳数——它让"为访问数据而网络调用"成为可避免的架构负担：
    - **数据与进程同址读取**：无网络跳数、无远端往返。
@@ -19,12 +19,6 @@ KV 以极简底座覆盖绝大多数存储需求，靠四个独立成立的判�
 3. **从专家专属到 AI 可用**：KV 把存储复杂性封装掉，让存储建模从"专家专属"变为"AI 可参与"：
    - **AI 处理胶水代码**：Key 编码、序列化等机械部分由 AI 胜任。
    - **人类负责判断**：架构设计、审查，以及环境特定的生产运维。
-4. **SQL 动态性神话**：常被拿来反对 KV 的一句话是"SQL 更灵活/更动态"——拆开看只在很窄的意义上成立，**程序内部层面根本不成立**：
-   - **程序内部：SQL 同样写死**。一个应用能发出的查询集合，在编译/部署那一刻已经固定——SQL 语句写死在源码里；即便靠 ORM 动态拼 SQL，ORM 的映射规则本身也是写死的代码，只会生成那几种形态的查询。所以从"程序能做什么"看，SQL 不比 KV 更动态。
-   - **真正的动态性只出现在"即席查询面"**：SQL 存储能对外部客户端（psql、BI、迁移、控制台）在运行时回答任意查询与 DDL，无需重编译应用；裸 KV 没有这类标准查询面——外部工具缺 key 编解码与目标类型，无从下手。但这是"是否刻意暴露一个可查询的活接口"的**产品/架构决定，不是存储语义固有**。绝大多数应用不暴露它，于是 SQL 的内部访问与 KV 一样固定。
-   - **余下差别是设计语言与运维工具，不是动态性/更优**：迁移、Catalog、EXPLAIN、索引是一整套成熟工具；键空间建模难度不高于 SQL schema，只是生态年轻。SQL 的"标准"有一半来自所有人都投入过学习时间——**沉没成本，不是先天优势**。
-   - **性能排查并不更轻松**：复杂计划、join、基数估算难推理；KV 点扫语义更简单。真到性能瓶颈，"SQL 好排查"往往是反的。
-
 ## KV 的基本 API
 
 KV 存储引擎的接口极简，只有四个操作：
@@ -338,6 +332,31 @@ Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
 
 **与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
 
+### value 打包粒度：整行 vs 每字段一个 key
+
+OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，改几个字段再写回"。因此默认应把一行**整行打包**（如 postcard 序列化）填入 value：读整行 1 次点查 + 1 次反序列化，完美匹配。
+
+每字段一个 key 在 OLTP 下是灾难：
+
+| 操作 | 整行打包 | 每字段一个 key |
+|:---|:---|:---|
+| 读整行 | 1 次点查 | N 次点查（或 1 次 scan + 拼装） |
+| 改 3 个字段 | 读 1 + 写 1 | 先读 N + 写 3，且跨 key 要事务 |
+| 写放大 | 1 行 1 次写 | 每字段一次写，N 倍放大 |
+| 单字段点查 | 读整行反序列化（浪费） | 1 次点查（最优） |
+
+**关键的纠偏**："每字段一个 key"**不是 DDL 的解药**，它只是把 DDL 的痛换成四个新痛——整行读 N 次往返、scan 拼行、写放大、多 key 原子性。要解决加字段的痛，**不该换存储布局，而该让序列化格式本身可演进**。整行打包对 DDL"不友好"的根因，不是"整行打包"这个决定错，而是**用了不可演进的序列化格式**（postcard 定长、无 field tag、自描述性弱）。
+
+**DDL 真正解法：可演进序列化，而非换布局**
+
+1. **版本化 payload（最简）**：value 头带 `schema_version`。加字段 = 新版本，旧行按旧版本读，用懒迁移（读时/写时升级），Key 不变、零 DDL。字段仍按位置，新字段只能追加在尾部。
+2. **Tagged/TLV 编码（推荐）**：payload 改为 `field_id + len + bytes`。加字段 = 新增一个 field_id，旧 reader **跳过未知 field_id**，旧行不用迁移、新老行共存。这是 Cap'n Proto / SBE / FlatBuffers 的核心能力（schema evolution + 兼容，详见 [序列化协议分析对比](serialization-protocol-comparison.md) 的「半动态层」）。代价是比纯 postcard 略大，换取加字段零迁移。
+3. **热/冷分仓**：核心热字段用定长紧凑区（固定偏移），新字段/冷字段走 tagged 扩展区。读老行：热字段直接读、扩展区可空。折中：热路径零解析、演进路径全兼容。
+
+**推荐**：2 做主轴（可演进），需要极致 O(1) 单字段读时再补 3。
+
+**字段级辅助索引（按实测引入，非默认）**：若整行为主、但偶有高频单字段热路径（如 `get(id) -> name`），可双轨：主 value = 整行 blob，辅助 key = `field_idx:{id} → 单字段值`。读单字段走辅助 key，写时同步更新主行 + 受影响的辅助 key。但**辅助索引 = 写放大**，是优化而非默认——只有实测确出现单字段热路径才引入，别为想象的热路径提前付（每加一条 = 和每字段 key 同一种代价）。
+
 ### WiscKey 键值分离（大 Value 场景的写放大解药）
 
 典型场景：Key 几十字节，Value 几 MB（对话历史、3D 资产二进制、多模态特征向量、日志原始载荷）。传统 LSM-Tree 在 Compaction 时将 Key+Value 捆绑重写，写放大几十倍。
@@ -359,6 +378,26 @@ WiscKey 的核心：Key 和 Value 物理分离——索引层只存小指针，�
 - **适用场景**：任何 Key 小 Value 大的模式——Agent 对话历史、3D 资产、多模态特征、日志载荷
 
 Fjall 3.0 原生支持 WiscKey（KV 分离），SurrealKV 通过 Blob Log 实现同等效果。SlateDB 依赖 S3 的 Range Get 读取大 Value。
+
+
+### KV 的 value 存 Arrow/Parquet？列式存储在 KV 上的伪装
+
+被「KV 是行存、无法按列投影」的短板驱动，一个自然的想法是：把 Arrow 存进 KV 的 value。但这个想法的价值完全取决于**一个先决条件——粒度**。Arrow 是列式内存格式，列式收益只有在一个 key 对应**多行批量**时才兑现。按此切两半，结论完全不同：
+
+**解读 A：key → 单行（value = Arrow 序列化的一行）**——这就是普通 KV 行存，Arrow 只是换了个序列化格式。列式收益 ≈ 0，每行一个 1-row batch，还要额外背 Arrow 的 schema 头。纯赔本。
+
+**解读 B：key → 列式批量（value = N 行 Arrow IPC buffer）**——这才是真正的设计。key = 段 id，value = 一个列式 chunk。读入 DataFrame 直接得到列式内存布局，**零行列转置**；段内可按列压缩（zstd/lz4），schema 自带在 buffer 里。但解读 B 本质是**把 KV 改造成了一个列式批存**，代价是放弃 KV 最值钱的东西：
+
+1. **点查（OLTP）废了**——一个逻辑记录埋在 batch 里，要读整段才能拿到。KV 原本的「嵌入式零 RTT 行级定位」优势被批量粒度掐死。
+2. **行级更新是重写**——Arrow buffer 近似不可变，给 batch 追加/改一行要重写整段。这天然是追加优先的形态，契合 LSM 的 append 特性，但和行级 update 背道而驰。
+3. **跨段扫描仍要读全量**——要聚合所有段的某列，必须 range scan 读每个 value 的**全部字节**再做解释。KV 层不懂 Arrow，无法把「只投影某列」下推到存储。省掉了转置，但没省掉读全量。
+
+**内存模型错配（进程内零序列化哲学）**：若架构的进程内表示是 `ciborium::Value`（零序列化），存储层存 Arrow、读出来转回 ciborium，转置代价只是挪了个位置又回来了。Arrow-as-value 只有存储与内存都用 Arrow（直通 DataFrame）才成立——那意味着整个数据路径绑定 Arrow 内存模型，放弃进程内零序列化哲学。两条路只能选一条。
+
+**格式选型**：若真要存列式批量，应选 **Parquet** 而非 Arrow IPC——Arrow IPC 是传输/内存格式（面向零拷贝流式搬移），Parquet 才是存储格式（列式 + 行组统计 + 谓词下推）。但有个尴尬：标准 KV 返回**整个 value**，「value 内部按列跳过」的 Parquet 优势在单 value 层面是废的——反正读全量字节。这更说明批量粒度下 KV 只是「装字节的桶」，列式智能全在 value 格式里，KV 本体毫无贡献。
+
+**诚实结论**：这是列式存储在 KV 上的伪装，服务的是「内部、分析为主、追加优先、单机中规模」的负载。主导负载是分析 → 直接上真列式（Parquet/S3/DuckDB），别在有行级访问包袱的 KV 上绕；需要行级访问/点更新 → 别批量化，回到普通行存 KV。Arrow-as-value 把「KV 是行存、不能列投影」这个短板补了，补法却是把它改造成列式批存——代价是丢掉 KV 行级访问的立身之本，等于换了个赛道。
+
 
 ## 物理层编码范式：Key 编码的物理层通用技巧
 
@@ -1290,10 +1329,9 @@ Business Coordination (locks, scheduling, election)
 
 **分片放置与均衡**：跨节点时 key 前缀同时决定**分片边界**——分片（tablet）沿 key 字典序切分，同前缀数据落同一分片。这带来双刃：前缀既是逻辑聚合也是物理局部性边界（利于批扫/局部事务），但访问集中到单一前缀会形成**热键**，单分片打满、其余空闲（DynamoDB 的 hot partition）。单机下文档用哈希盐打散写热点（均匀分散，见 [物理层编码范式](#物理层编码范式key-编码的物理层通用技巧)）；跨节点则需在**局部性**（同前缀同分片，利批扫）与**均衡**（前缀分散，避免热分片）之间权衡——哈希盐保均衡但破坏前缀局部性，前缀保局部性但热点风险。这是分布式 key 设计与单机最本质的差别：单机只管写放大，分布式还要同时管放置均衡。
 
-## KV 框架 vs 自研数据库：演化边界
+## 什么时候用 SQL
 
 纯 KV 之上叠加两层抽象——Parser（查询解析层）+ Optimizer（查询优化器）——就是一个完整的数据库引擎。SurrealDB、CockroachDB、TiDB 的诞生路径无一例外：拿现成的 KV 引擎（RocksDB/Pebble/SurrealKV）做底座，在上面写查询语言解析器和代价优化器。
-
 ```
 客户端文本查询 ("SELECT * FROM users WHERE age = 25")
         │
@@ -1311,15 +1349,13 @@ kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
 └───────────────────────────────┘
 ```
 
-### 工业界的真实路径
+### SQL 动态性神话
 
-| 数据库 | 查询层 | 存储内核 | 本质 |
-|:--|:--|:--|:--|
-| **TiDB** | MySQL 语法解析器 + 分布式执行计划优化 | TiKV（Rust KV） | SQL 翻译器 + KV |
-| **CockroachDB** | PostgreSQL 语法兼容 + 代价优化器 | Pebble（Go KV） | SQL 翻译器 + KV |
-| **SurrealDB** | SurrealQL 函数式解析器 + 图遍历优化 | SurrealKV（Rust KV） | DSL 翻译器 + KV |
-
-它们没有发明新的磁盘驱动器，只是在 KV 之上盖了一层解析器和优化器外壳。
+常被拿来反对 KV 的一句话是"SQL 更灵活/更动态"——拆开看只在很窄的意义上成立，**程序内部层面根本不成立**：
+- **程序内部：SQL 同样写死**。一个应用能发出的查询集合，在编译/部署那一刻已经固定——SQL 语句写死在源码里；即便靠 ORM 动态拼 SQL，ORM 的映射规则本身也是写死的代码，只会生成那几种形态的查询。所以从"程序能做什么"看，SQL 不比 KV 更动态。
+- **真正的动态性只出现在"即席查询面"**：SQL 存储能对外部客户端（psql、BI、迁移、控制台）在运行时回答任意查询与 DDL，无需重编译应用；裸 KV 没有这类标准查询面——外部工具缺 key 编解码与目标类型，无从下手。但这是"是否刻意暴露一个可查询的活接口"的**产品/架构决定，不是存储语义固有**。绝大多数应用不暴露它，于是 SQL 的内部访问与 KV 一样固定。
+- **余下差别是设计语言与运维工具，不是动态性/更优**：迁移、Catalog、EXPLAIN、索引是一整套成熟工具；键空间建模难度不高于 SQL schema，只是生态年轻。SQL 的"标准"有一半来自所有人都投入过学习时间——**沉没成本，不是先天优势**。
+- **性能排查并不更轻松**：复杂计划、join、基数估算难推理；KV 点扫语义更简单。真到性能瓶颈，"SQL 好排查"往往是反的。
 
 ### 坚守纯 KV 的理由（框架团队的正确选择）
 
@@ -1329,6 +1365,7 @@ kv.scan("idx:age:25:") → 回表点查   ← 你手写的 KV 指令
 - **100% 确定性响应**：无优化器「抽风」变慢的风险，P99 延迟雷打不动
 - **单一二进制体积**：不引入 SQL 解析器、优化器、类型系统的代码膨胀
 
+
 ### 什么是「查询模式可预测」：需求可控性（话语权）决定
 
 KV 的零解析损耗、确定性响应、单二进制体积，只有在查询模式可固化时才兑现。但**可预测与否不是技术属性，是需求可控性（话语权）问题**：
@@ -1337,6 +1374,7 @@ KV 的零解析损耗、确定性响应、单二进制体积，只有在查询�
 - **需求由多变的外部力量驱动**：查询不可预测。此时 **SQL 更通用**——即便 SQL 实现不了某个需求，失败也归结为「SQL 的技术限制」，这是行业统一认知、责任可外推；KV 则把「为什么做不到」变成你的实现责任。
 
 判断标准不是「做产品 vs 外包」的组织身份，而是**需求是否由你掌控**。话语权丧失的两种方式：**外包**（甲方决定需求），以及**做产品但服务客户多变需求**（如企业管理软件——客户需求大于一切）。后者即便你是老板也无效：业务本身在为别人服务，你就没有话语权。
+
 
 ### 数据量大时，KV 不要求查询模式可预测
 
@@ -1355,6 +1393,7 @@ KV 的零解析损耗、确定性响应、单二进制体积，只有在查询�
 **实际影响**：即使你每月改一次查询模式——新增一个前缀扫描、调整一个复合键布局——KV 的成本是 O(1)（写一个 scan 函数），而关系型的成本是 O(N)（N = 表大小）。当 N 超过某个阈值（百万行起步），KV 的物理优势足以覆盖"模式不固定"带来的工程摩擦。
 
 **判定**：查询模式可预测是 KV 的**最佳**使用场景，但不是**必要**条件。数据量大本身就是选择 KV 的理由——体量产生的物理优势（追加写、无索引重建、零 DDL 锁）让模式变更的代价从 O(N) 降到 O(1)。
+
 
 ### 需求变化对 KV 是 O(1)：加字段/表/索引天然更可控
 
@@ -1378,6 +1417,7 @@ KV 的零解析损耗、确定性响应、单二进制体积，只有在查询�
 
 **洞察**：SQL 的剩余优势不在"处理需求更强"，而在"把查询能力委托给了你没发明的通用解析器"。当团队既掌控需求、又愿意自研键空间时，这份委托失去必要性——但代价是失去即席未知查询和对外共享那两张"现成引擎"的网。
 
+
 ### 什么时候必须蜕变为数据库
 
 只有当系统需要开放给外部第三方开发者、允许最终用户通过低代码/动态插件自由写出不可预测的复杂查询时——为了防止他们写出全表扫描的垃圾查询把底层存储扫爆，才必须在最前面加一层 Parser + Optimizer 做查询门禁。
@@ -1395,316 +1435,15 @@ KV 的零解析损耗、确定性响应、单二进制体积，只有在查询�
 
 **判定**：框架平台的正确姿态是坚守纯 KV + 复合键编码。数据库是 KV 的上层封装，不是 KV 的替代。如果你的查询模式是可预测的， Parser + Optimizer 就是用运行时 CPU 开销去解决一个编译期就能消灭的问题。
 
-### KV 的 value 存 Arrow/Parquet？列式存储在 KV 上的伪装
+## 引擎对比与选型：架构 · 场景 · API
 
-被「KV 是行存、无法按列投影」的短板驱动，一个自然的想法是：把 Arrow 存进 KV 的 value。但这个想法的价值完全取决于**一个先决条件——粒度**。Arrow 是列式内存格式，列式收益只有在一个 key 对应**多行批量**时才兑现。按此切两半，结论完全不同：
+四款嵌入式/周边键值存储（Fjall、SlateDB、redb、SurrealKV）与 Redis、SQLite 的对比与选型，从三根轴展开：**架构**（引擎如何组织与部署）、**场景**（何时选谁）、**API**（开发者接口形态）。
 
-**解读 A：key → 单行（value = Arrow 序列化的一行）**——这就是普通 KV 行存，Arrow 只是换了个序列化格式。列式收益 ≈ 0，每行一个 1-row batch，还要额外背 Arrow 的 schema 头。纯赔本。
-
-**解读 B：key → 列式批量（value = N 行 Arrow IPC buffer）**——这才是真正的设计。key = 段 id，value = 一个列式 chunk。读入 DataFrame 直接得到列式内存布局，**零行列转置**；段内可按列压缩（zstd/lz4），schema 自带在 buffer 里。但解读 B 本质是**把 KV 改造成了一个列式批存**，代价是放弃 KV 最值钱的东西：
-
-1. **点查（OLTP）废了**——一个逻辑记录埋在 batch 里，要读整段才能拿到。KV 原本的「嵌入式零 RTT 行级定位」优势被批量粒度掐死。
-2. **行级更新是重写**——Arrow buffer 近似不可变，给 batch 追加/改一行要重写整段。这天然是追加优先的形态，契合 LSM 的 append 特性，但和行级 update 背道而驰。
-3. **跨段扫描仍要读全量**——要聚合所有段的某列，必须 range scan 读每个 value 的**全部字节**再做解释。KV 层不懂 Arrow，无法把「只投影某列」下推到存储。省掉了转置，但没省掉读全量。
-
-**内存模型错配（进程内零序列化哲学）**：若架构的进程内表示是 `ciborium::Value`（零序列化），存储层存 Arrow、读出来转回 ciborium，转置代价只是挪了个位置又回来了。Arrow-as-value 只有存储与内存都用 Arrow（直通 DataFrame）才成立——那意味着整个数据路径绑定 Arrow 内存模型，放弃进程内零序列化哲学。两条路只能选一条。
-
-**格式选型**：若真要存列式批量，应选 **Parquet** 而非 Arrow IPC——Arrow IPC 是传输/内存格式（面向零拷贝流式搬移），Parquet 才是存储格式（列式 + 行组统计 + 谓词下推）。但有个尴尬：标准 KV 返回**整个 value**，「value 内部按列跳过」的 Parquet 优势在单 value 层面是废的——反正读全量字节。这更说明批量粒度下 KV 只是「装字节的桶」，列式智能全在 value 格式里，KV 本体毫无贡献。
-
-**诚实结论**：这是列式存储在 KV 上的伪装，服务的是「内部、分析为主、追加优先、单机中规模」的负载。主导负载是分析 → 直接上真列式（Parquet/S3/DuckDB），别在有行级访问包袱的 KV 上绕；需要行级访问/点更新 → 别批量化，回到普通行存 KV。Arrow-as-value 把「KV 是行存、不能列投影」这个短板补了，补法却是把它改造成列式批存——代价是丢掉 KV 行级访问的立身之本，等于换了个赛道。
-
-### value 打包粒度：整行 vs 每字段一个 key
-
-OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，改几个字段再写回"。因此默认应把一行**整行打包**（如 postcard 序列化）填入 value：读整行 1 次点查 + 1 次反序列化，完美匹配。
-
-每字段一个 key 在 OLTP 下是灾难：
-
-| 操作 | 整行打包 | 每字段一个 key |
-|:---|:---|:---|
-| 读整行 | 1 次点查 | N 次点查（或 1 次 scan + 拼装） |
-| 改 3 个字段 | 读 1 + 写 1 | 先读 N + 写 3，且跨 key 要事务 |
-| 写放大 | 1 行 1 次写 | 每字段一次写，N 倍放大 |
-| 单字段点查 | 读整行反序列化（浪费） | 1 次点查（最优） |
-
-**关键的纠偏**："每字段一个 key"**不是 DDL 的解药**，它只是把 DDL 的痛换成四个新痛——整行读 N 次往返、scan 拼行、写放大、多 key 原子性。要解决加字段的痛，**不该换存储布局，而该让序列化格式本身可演进**。整行打包对 DDL"不友好"的根因，不是"整行打包"这个决定错，而是**用了不可演进的序列化格式**（postcard 定长、无 field tag、自描述性弱）。
-
-**DDL 真正解法：可演进序列化，而非换布局**
-
-1. **版本化 payload（最简）**：value 头带 `schema_version`。加字段 = 新版本，旧行按旧版本读，用懒迁移（读时/写时升级），Key 不变、零 DDL。字段仍按位置，新字段只能追加在尾部。
-2. **Tagged/TLV 编码（推荐）**：payload 改为 `field_id + len + bytes`。加字段 = 新增一个 field_id，旧 reader **跳过未知 field_id**，旧行不用迁移、新老行共存。这是 Cap'n Proto / SBE / FlatBuffers 的核心能力（schema evolution + 兼容，详见 [序列化协议分析对比](serialization-protocol-comparison.md) 的「半动态层」）。代价是比纯 postcard 略大，换取加字段零迁移。
-3. **热/冷分仓**：核心热字段用定长紧凑区（固定偏移），新字段/冷字段走 tagged 扩展区。读老行：热字段直接读、扩展区可空。折中：热路径零解析、演进路径全兼容。
-
-**推荐**：2 做主轴（可演进），需要极致 O(1) 单字段读时再补 3。
-
-**字段级辅助索引（按实测引入，非默认）**：若整行为主、但偶有高频单字段热路径（如 `get(id) -> name`），可双轨：主 value = 整行 blob，辅助 key = `field_idx:{id} → 单字段值`。读单字段走辅助 key，写时同步更新主行 + 受影响的辅助 key。但**辅助索引 = 写放大**，是优化而非默认——只有实测确出现单字段热路径才引入，别为想象的热路径提前付（每加一条 = 和每字段 key 同一种代价）。
-
-## 引擎 API 对比：Fjall / SlateDB / redb / SurrealKV
-
-四个纯 Rust 嵌入式引擎虽然目标场景相似，但底层数据结构与「第一公民」完全不同，导致 API 表达方式、事务设计哲学和状态控制存在本质代差——其中 Fjall / SlateDB / SurrealKV 是 LSM-Tree，redb 是 Copy-on-Write B-tree（见 [设计模式 · 键空间模式](#键空间模式逻辑编码层-vs-物理分区)）。
-
-### API 伪代码视感
-
-#### Fjall：传统工业级级联 API
-
-追求对本地物理盘的极致颗粒度控制。引入 `Keyspace`（大命名空间）和 `Partition`（物理隔离分区）概念。
-
-```rust
-// 1. 打开本地大磁盘空间
-let keyspace = fjall::Config::new(db_path).open()?;
-
-// 2. 开辟独立物理分区（等价于 RocksDB 的 Column Family）
-let user_table = keyspace.open_partition("users", fjall::PartitionCreateOptions::default())?;
-
-// 3. 经典的原子 Batch 批量写入
-let mut batch = keyspace.batch();
-batch.insert(&user_table, b"cfg:app:1", b"payload_bytes");
-batch.commit()?;
-```
-
-#### SlateDB：云原生全异步 API
-
-核心灵魂是 S3，所有 API 天生彻底异步化（`async/await`），初始化直接绑定网络对象桶。
-
-```rust
-// 1. 初始化云端对象存储驱动
-let object_store = object_store::aws::AmazonS3Builder::from_env().build()?;
-let path = "my_agent_bucket/db_root".to_string();
-
-// 2. 打开云原生 KV 实例
-let db = slatedb::Db::open_with_opts(path, slatedb::DbOptions::default(), Arc::new(object_store)).await?;
-
-// 3. 彻底异步的读写 API
-db.put(b"cfg:app:1", b"payload_bytes").await?;
-```
-
-#### SurrealKV：激进的 ACID 事务级 API
-
-为大数据库事务而生。所有读写 API 必须包裹在严格的 `Transaction`（事务闭包）中。
-
-```rust
-// 1. 打开纯 Rust 嵌入式本地引擎
-let kv = surrealkv::Store::new(surrealkv::Options::new(db_path))?;
-
-// 2. 显式开启可写事务
-let mut tx = kv.begin_rw()?;
-
-// 3. 所有操作绑定在 tx 事务上下文上
-tx.set(b"cfg:app:1", b"payload_bytes")?;
-
-// 4. 显式提交。失败时自动物理回滚
-tx.commit()?;
-```
-
-#### redb：B-tree 事务域 API
-
-纯 Rust Copy-on-Write B-tree。无后台 compaction、读路径确定，天然适合「点查/范围扫描优先、写非海量」的负载。逻辑多表（TableDefinition）组织命名空间，事务用借用生命周期表达单写者约束。
-
-```rust
-// 1. 打开 B-tree 数据库（同一 db 内可定义多个逻辑表）
-let db = redb::Database::create(db_path)?;
-
-// 2. 定义逻辑数据表（每个 TableDefinition 独立一棵 B-tree）
-let user_table: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
-
-// 3. 读写事务，借用生命周期保证单写者
-let write_tx = db.begin_write()?;
-{
-    let mut table = write_tx.open_table(user_table)?;
-    table.insert(b"cfg:app:1".as_slice(), b"payload_bytes")?;
-}
-write_tx.commit()?;
-```
-
-### 核心 API 特性对比
-
-| 特性维度 | Fjall（3.x） | SlateDB | redb | SurrealKV |
-|:--|:--|:--|:--|:--|
-| **数据结构** | LSM-Tree | LSM-Tree | Copy-on-Write B-tree | LSM-Tree |
-| **异步** | ❌ 纯同步，需 `spawn_blocking` | 🚀 纯异步 `.await`，融合 Tokio | ❌ 纯同步 | ❌ 纯同步 |
-| **多空间隔离** | 🥇 Partitions 物理分区 | ◐ 扁平（无物理分区） | ◐ 逻辑多表（TableDefinition，非物理分区） | ◐ 扁平（无物理分区） |
-| **事务** | WriteBatch 原子批量 | 基础批量原子写 | 可串行化（借用生命周期单写者） | 🥇 严格 MVCC 事务 |
-| **大 Value** | 🥇 WiscKey KV 分离 | 早期演进 | ⚠️ 无 KV 分离 | 🥇 Blob Log 大对象分离 |
-| **时间旅行** | ❌ | ❌ | ❌ | 🥇 Versioned Queries |
-
-### 选型指南
-
-| 场景 | 推荐 | 理由 |
-|:--|:--|:--|
-| API 网关、高并发中间件 | **Fjall** | Partition 物理分区精确划分，本地盘爆发力达硬件极限 |
-| Serverless AI Agent、云原生知识库 | **SlateDB** | 纯异步融入 Tokio，攒批推 S3，缩容至零 |
-| 读确定、免后台停顿的本地服务 | **redb** | COW B-tree 无 compaction，点查/范围扫描读路径确定 |
-| 并发账务、历史版本回滚 | **SurrealKV** | MVCC 事务 + 时间戳查询，省千行应用层版本维护 |
-
-### 统一抽象
-
-四个引擎的 API 差异可通过统一 Trait 抽象屏蔽（见 §5.1 `AuraStorage` trait）。关键决策点：异步 `async`（→ SlateDB）、事务块同步（→ SurrealKV）、免停顿本地读确定（→ redb）。统一 Trait 让一套复合 Key 结构体在四引擎间无缝切换。
-
-## §10. 单机场景选型指南
-
-### 10.1 成本对比
-
-**硬件成本（2026 市场价格）**：
-
-| 资源类型 | 单价 | Redis 典型占用 | Fjall 典型占用 | 成本差异 |
-|---------|------|---------------|---------------|---------|
-| DRAM | ~$5/GB | 100GB 数据集 = 500GB RAM（含复制缓冲区、过期键） | 100GB 数据集 = 30-50GB RAM（索引 + 缓存） | **10x** |
-| SSD | ~$0.10/GB | 不适用（纯内存） | 100GB 数据集 = 30-50GB 磁盘（LZ4 压缩） | **N/A** |
-| CPU | ~$50/core | 单线程模型，高并发需垂直扩展 | 多线程并发，水平扩展 | **5-10x** |
-
-**TCO 分析（3 年周期，100GB 数据集）**：
-
-| 成本项 | Redis | Fjall |
-|--------|-------|-------|
-| 硬件（服务器） | $15,000（512GB RAM） | $2,000（64GB RAM + 1TB NVMe） |
-| 运维人力 | $30,000（配置 RDB/AOF、监控大 Key、故障恢复） | $5,000（零配置，自动 compaction） |
-| 网络带宽 | $10,000（跨进程通信、集群同步） | $0（进程内调用） |
-| **总计** | **$55,000** | **$7,000** |
-
-**结论**：Fjall 的 TCO 是 Redis 的 **1/8**。
-
-### 10.2 运维复杂度对比
-
-| 维度 | Redis | Fjall |
-|------|-------|-------|
-| **部署** | 独立进程 + 配置文件 + 持久化策略 | 嵌入应用，零配置 |
-| **持久化** | 需手动选择 RDB/AOF，配置 save 策略，处理 fork 阻塞 | 自动 WAL + SSTable，后台 compaction |
-| **监控** | 需监控内存使用率、大 Key、慢查询、连接数 | 无独立进程，应用级监控即可 |
-| **故障恢复** | RDB 恢复慢（分钟级），AOF 有数据丢失风险 | WAL + SSTable 自动恢复，秒级 |
-| **扩容** | 需手动 reshard，集群不稳定 | 集群模式自动数据同步（跨节点需配合共识，见 §分布式 KV） |
-| **大 Key 问题** | 单线程阻塞，需拆分或异步删除 | 多线程并发，无阻塞风险 |
-
-**运维负担量化**：
-
-- Redis：每周 2-4 小时（监控告警处理、持久化调优、大 Key 清理）
-- Fjall：每月 1 小时（日志检查、磁盘空间监控）
-
-### 10.3 选型决策表
-
-| 场景特征 | 推荐方案 | 理由 |
-|---------|---------|------|
-| **数据量 < 10GB，读多写少** | Fjall | 进程内零 RTT，内存占用可控 |
-| **数据量 > 100GB，需要持久化** | Fjall | LZ4 压缩，SSD 成本远低于 DRAM |
-| **高并发（>10K QPS）** | Fjall | 多线程并发，Redis 单线程瓶颈 |
-| **需要分布式锁** | Fjall + 共识层 | 进程内原子操作 + 共识层强一致（见 §分布式 KV），Redlock 数学不安全 |
-| **跨进程共享状态（多语言）** | Redis 或 SurrealDB | Fjall 是嵌入式库，无法跨进程 |
-| **缓存场景（允许丢失）** | 应用内 HashMap / Caffeine | 比 Redis 更快，比 Fjall 更简单 |
-| **需要 Pub/Sub、Streams** | NATS / Kafka | Redis 消息功能弱，无持久化 |
-| **需要复杂数据结构（Geo、HLL）** | PostGIS / 专用库 | Redis 内存成本过高 |
-| **开源框架/CLI 内部状态管理** | Fjall | 见 §10.6 SQLite 对比；C 依赖/写锁/双重缓存是系统性磨损 |
-
-**决策流程图**：
-
-```
-需要跨进程/跨语言共享？
-├─ 是 → Redis 或 SurrealDB
-└─ 否 → 数据量 > 100GB？
-         ├─ 是 → Fjall（SSD 成本优势）
-         └─ 否 → 需要持久化？
-                  ├─ 是 → Fjall（自动 WAL）
-                  └─ 否 → 允许丢失？
-                           ├─ 是 → HashMap / Caffeine
-                           └─ 否 → Fjall（内存模式）
-```
-
-### 10.4 性能陷阱警示
-
-**Redis 的隐形成本**：
-
-1. **序列化开销**：每次请求 1-5μs（JSON/Protocol Buffers），10K QPS = 10-50ms/s CPU 时间
-2. **上下文切换**：进程间通信触发内核态切换，~1μs/次
-3. **网络栈**：TCP/IP 协议栈处理 ~10-50μs/包
-4. **内存碎片**：Redis 使用 jemalloc，长期运行后内存碎片率 10-30%
-
-**Fjall 的优势**：
-
-1. **零序列化**：进程内直接传递 Rust 结构体引用
-2. **零上下文切换**：函数调用，无内核态切换
-3. **零网络栈**：无 TCP/IP 处理
-4. **压缩存储**：LZ4 压缩后数据量减少 50-70%，磁盘 I/O 更少
-
-**实测数据（100GB 数据集，10K QPS）**：
-
-| 指标 | Redis | Fjall |
-|------|-------|-------|
-| P50 延迟 | 0.8ms | 0.05ms |
-| P99 延迟 | 5ms | 0.2ms |
-| CPU 使用率 | 80%（单线程饱和） | 30%（多线程分散） |
-| 内存占用 | 120GB | 8GB |
-| 磁盘占用 | 0GB | 35GB（压缩后） |
-
-### 10.5 迁移成本评估
-
-**从 Redis 迁移到 Fjall 的工作量**：
-
-| 任务 | 工作量 | 风险 |
-|------|--------|------|
-| 键编码方案实现 | 1-2 天（AI 生成） | 低（模式化代码） |
-| 状态机 `apply` 逻辑 | 2-3 天（AI 生成 + Review） | 中（需验证边界情况） |
-| 数据迁移脚本 | 1 天（Redis DUMP → Fjall import） | 低（一次性任务） |
-| 集成测试 | 2-3 天（AI 生成用例） | 中（需覆盖所有 Redis 命令） |
-| 生产部署 | 1 天（替换启动脚本） | 低（嵌入式，零运维） |
-| **总计** | **7-10 天** | **可控** |
-
-**迁移收益（3 年 TCO）**：
-
-- 硬件成本节省：$13,000 × 3 = $39,000
-- 运维成本节省：$25,000 × 3 = $75,000
-- **总计节省：$114,000**
-
-**ROI**：迁移成本 $5,000（人力） → 3 年收益 $114,000，**ROI = 22.8x**。
-
-### 10.6 SQLite vs 嵌入式 KV：开源项目的隐形代价
-
-SQLite 是软件工程的奇迹，但大量项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。当查询模式可预测时，嵌入式 KV 在三个维度上产生系统性优势：
-
-**C 语言依赖与交叉编译**。SQLite 是 C 写的。Rust 项目引入 rusqlite 绑定后，用户机器必须安装 C 编译器（gcc/clang）。交叉编译（Mac → Linux ARM64）时 C 工具链是主要阻塞源。纯 Rust KV 引擎（Fjall）几秒内编译出静态链接的单一二进制，零外部依赖。
-
-**双重缓存与内存浪费**。SQLite 内部有 Page Cache。数据从磁盘 → SQLite Page Cache → SQL 解析行结构 → 二次复制到 Rust 对象内存。纯 KV 引擎的 LSM-Tree Block Cache 直接映射到应用层，读取路径更短，内存占用更低。
-
-**写锁线程阻塞**。SQLite 使用数据库级排他锁写入。高并发多线程场景（网关、Agent 服务）频繁触发 `SQLITE_BUSY`，线程挂起等待。纯 Rust KV 引擎通过无锁 MemTable（跳表/基数树）吸收并发写，多核并行无阻塞。
-
-#### CLI 工具场景：Fjall vs SQLite
-
-| | Fjall | SQLite |
-|:---|:---|:---|
-| 嵌入式 | ✅ 进程内，零配置 | ✅ 进程内，零配置 |
-| 单文件 | ❌ 目录（多个 SSTable） | ✅ 单个 .db 文件 |
-| ACID | ✅ WAL | ✅ WAL |
-| 写性能 | 更好（LSM-Tree，无写锁） | 较差（B-Tree，写锁竞争） |
-| 并发写 | 好（多线程无锁） | 差（单写者） |
-| SQL | ❌ 纯 KV | ✅ |
-| 跨语言 | Rust only | C/Python/Go/Node 所有语言 |
-| 备份 | 复制目录 | 单文件复制 |
-
-**选 Fjall 的场景**：纯 Rust CLI、数据是 key-value（缓存/索引/配置/状态）、写入密集。LSM-Tree 的写入性能比 SQLite 的 B-Tree + 写锁高一个数量级。
-
-**仍选 SQLite 的场景**：需要 SQL 查询（JOIN/聚合）、需要单文件（`.db` 拷贝即备份）、需要跨语言绑定、需要成熟生态（ORM/GUI 客户端/迁移工具）。
-
-**判定**：纯 Rust CLI 工具，Fjall 是 SQLite 的更好替代——零 C 依赖、无写锁、写入更快。如果不是纯 Rust、需要 SQL 或跨语言，SQLite 仍是更务实的选择。
-
-#### 开源基础设施案例
-
-| 项目 | 选择 | 理由 |
-|:--|:--|:--|
-| **Docker / containerd** | bbolt（Go KV） | 容器元数据查询固定（Container_ID → metadata），KV 足够，SQL 是多余开销 |
-| **K3s（边缘端）** | 从 SQLite 向 etcd 嵌入式 KV 收敛 | 边缘节点 CPU/内存敏感，SQL 解析器的抖动不可容忍 |
-| **3D 资产管线（orbsh/wiki）** | LanceDB（列式/KV） | 资产元数据路径查找模式可预测，关系型多表解析是性能陷阱 |
-
-**重构示范**：SQLite 配置表 `configs(app_name, config_key, config_value)` → KV 复合键：
-
-```
-Key: cfg:{app_name}:{config_key}  →  Value: [原始二进制]
-```
-
-`save_config` = 一次 `put`，无 SQL 解析。`get_all_app_configs` = 一次 `prefix_scan("cfg:{app_name}:")`，无查询计划生成。代码即最高效的执行计划——LSM-Tree 的字典序迭代器直接在 SSTable 上顺序扫描。
-
-**判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。纯 Rust CLI 工具选 Fjall，跨语言/需要 SQL 选 SQLite。
-
-## 11. 两条架构路径：Fjall vs SlateDB
+### 架构
 
 Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数学逻辑相似。但它们在真理源（Source of Truth）和网络拓扑上走向了相反的极端，对应两种完全不同的部署模式。
 
-### 引擎定位对比
+#### 引擎定位对比（Fjall vs SlateDB）
 
 | 维度 | Fjall | SlateDB |
 |:--|:--|:--|
@@ -1715,7 +1454,8 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 | **ACID 事务** | 成熟（3.0+ WriteBatch/Transactions） | 快速演进中，高级事务控制补全中 |
 | **设计目标** | 单机 bare-metal，极致延迟 | 云原生，节点无状态化 |
 
-### 路径一：Fjall（单机本地部署）
+
+#### 路径一：Fjall（单机本地部署）
 
 ```
 [应用层] → [Fjall 引擎] → [本地 NVMe] → 返回
@@ -1725,7 +1465,7 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 **真理源在本地磁盘**。进程内直接写入 Fjall，无网络损耗，写入完毕立刻返回。延迟由 NVMe 物理特性决定（μs 级），不受网络波动影响。
 
-**本地路径的 B-tree 备选**：本地部署若以点查/范围扫描为主、且要消除后台 compaction 停顿，可在 Fjall 与 redb 之间二选一——Fjall（LSM，写密集）或 redb（COW B-tree，读确定），能力差异见 §9 对比表。
+**本地路径的 B-tree 备选**：本地部署若以点查/范围扫描为主、且要消除后台 compaction 停顿，可在 Fjall 与 redb 之间二选一——Fjall（LSM，写密集）或 redb（COW B-tree，读确定），能力差异见下文「核心 API 特性对比」。
 
 **ACID 批处理**：AI Agent 场景频繁需要原子修改多个复合 Key（更新对话主表 + 更新排行索引 + 更新标签索引）。Fjall 3.0 的 WriteBatch 在 WAL 中一次原子提交，崩溃时整体回滚，保证索引一致性。
 
@@ -1733,7 +1473,8 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 **集群部署**：多节点场景下，元数据共识由独立的共识层处理（见 §分布式 KV 章节及其引用的 [共识协议文档](consensus-protocol.md)）。Fjall 本身专注本地存储引擎职责。
 
-### 路径二：SlateDB + S3
+
+#### 路径二：SlateDB + S3
 
 ```
 [gRPC 计算节点（无状态）] → [SlateDB] → [S3 桶] → 返回
@@ -1745,7 +1486,8 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 **计算节点无状态**：多个 Rust gRPC 服务连同一个 S3 桶。节点崩溃后在新机器重启，挂载同一 S3 路径，几秒内复活接客。这就是 Scale-to-Zero 的物理基础——S3 是持久的，计算可以随时生灭。
 
-### Fjall vs SlateDB：写入与读取路径对比
+
+#### Fjall vs SlateDB：写入与读取路径对比
 
 **写入路径**：
 
@@ -1776,7 +1518,204 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 | 复制 | 需自己处理（Lakehouse 落湖备份；元数据共识见 §分布式 KV） | S3 内部处理 |
 | 运维 | 自管磁盘 | 无状态计算 + S3 |
 
-### 选择标准
+
+#### Fjall 的差异化优势（即使 SlateDB 支持本地存储）
+
+即使 SlateDB 未来完美支持本地存储，Fjall 在以下方面仍有结构性优势：
+
+**1. KV 分离（Value Log）**：Fjall 内置 `value-log` 组件（灵感来自 RocksDB 的 BlobDB/Titan）。写入大 Value（图片/文档/音频）时，Value 分离存储到单独文件，LSM-Tree 只保留 Key + 指针。极大降低写放大，大对象场景本地写入和 Compaction 性能远超 SlateDB。
+
+**2. 更成熟的事务支持**：Fjall 内置可串行化事务（Serializable Transactions）及乐观/单写者事务模型（`OptimisticTxDatabase` / `SingleWriterTxDatabase`）。多并发本地事务控制、多 Keyspace 跨空间原子提交方面，更接近成熟本地 RDBMS 核心。
+
+**3. 极致本地优化**：Fjall 3.0 对本地磁盘 Block 格式彻底重构——稀疏索引（Sparse Indexing）、前缀截断、布隆过滤器分区、可选哈希索引（Hash Index）。未命中缓存时，本地磁盘随机点查和范围扫描快 2-100 倍，内存开销极低。
+
+**4. 基因纯正**：SlateDB 的核心设计是 "Zero-Disk"（零本地盘依赖），并发锁、Fencing、Flush 策略都围绕网络对象存储延迟优化。即使支持本地写入，这些架构包袱（如因适配网络而做的激进 Batching 导致的即时持久化延迟）很难完全抹除。Fjall 100% 为本地 NVMe/SSD 吞吐量和 OS 文件系统设计。
+
+
+#### Fjall 的 S3 计划
+
+**官方没有原生 S3 支持计划**。Fjall 定位为嵌入式单机存储引擎（纯 Rust 版 RocksDB/LevelDB），保持核心库轻量、确定性、100% Safe Rust。社区有间接方案：通过 VFS 对接 Apache OpenDAL 或 `s5_store_fjall` 将底层存储映射到 S3。
+
+
+### 场景
+
+
+#### 四引擎横向选型（Fjall / SlateDB / redb / SurrealKV）
+
+| 场景 | 推荐 | 理由 |
+|:--|:--|:--|
+| API 网关、高并发中间件 | **Fjall** | Partition 物理分区精确划分，本地盘爆发力达硬件极限 |
+| Serverless AI Agent、云原生知识库 | **SlateDB** | 纯异步融入 Tokio，攒批推 S3，缩容至零 |
+| 读确定、免后台停顿的本地服务 | **redb** | COW B-tree 无 compaction，点查/范围扫描读路径确定 |
+| 并发账务、历史版本回滚 | **SurrealKV** | MVCC 事务 + 时间戳查询，省千行应用层版本维护 |
+
+
+#### 单机部署：成本对比
+
+**硬件成本（2026 市场价格）**：
+
+| 资源类型 | 单价 | Redis 典型占用 | Fjall 典型占用 | 成本差异 |
+|---------|------|---------------|---------------|---------|
+| DRAM | ~$5/GB | 100GB 数据集 = 500GB RAM（含复制缓冲区、过期键） | 100GB 数据集 = 30-50GB RAM（索引 + 缓存） | **10x** |
+| SSD | ~$0.10/GB | 不适用（纯内存） | 100GB 数据集 = 30-50GB 磁盘（LZ4 压缩） | **N/A** |
+| CPU | ~$50/core | 单线程模型，高并发需垂直扩展 | 多线程并发，水平扩展 | **5-10x** |
+
+**TCO 分析（3 年周期，100GB 数据集）**：
+
+| 成本项 | Redis | Fjall |
+|--------|-------|-------|
+| 硬件（服务器） | $15,000（512GB RAM） | $2,000（64GB RAM + 1TB NVMe） |
+| 运维人力 | $30,000（配置 RDB/AOF、监控大 Key、故障恢复） | $5,000（零配置，自动 compaction） |
+| 网络带宽 | $10,000（跨进程通信、集群同步） | $0（进程内调用） |
+| **总计** | **$55,000** | **$7,000** |
+
+**结论**：Fjall 的 TCO 是 Redis 的 **1/8**。
+
+
+#### 单机部署：运维复杂度
+
+| 维度 | Redis | Fjall |
+|------|-------|-------|
+| **部署** | 独立进程 + 配置文件 + 持久化策略 | 嵌入应用，零配置 |
+| **持久化** | 需手动选择 RDB/AOF，配置 save 策略，处理 fork 阻塞 | 自动 WAL + SSTable，后台 compaction |
+| **监控** | 需监控内存使用率、大 Key、慢查询、连接数 | 无独立进程，应用级监控即可 |
+| **故障恢复** | RDB 恢复慢（分钟级），AOF 有数据丢失风险 | WAL + SSTable 自动恢复，秒级 |
+| **扩容** | 需手动 reshard，集群不稳定 | 集群模式自动数据同步（跨节点需配合共识，见 §分布式 KV） |
+| **大 Key 问题** | 单线程阻塞，需拆分或异步删除 | 多线程并发，无阻塞风险 |
+
+**运维负担量化**：
+
+- Redis：每周 2-4 小时（监控告警处理、持久化调优、大 Key 清理）
+- Fjall：每月 1 小时（日志检查、磁盘空间监控）
+
+
+#### 单机部署：选型决策
+
+| 场景特征 | 推荐方案 | 理由 |
+|---------|---------|------|
+| **数据量 < 10GB，读多写少** | Fjall | 进程内零 RTT，内存占用可控 |
+| **数据量 > 100GB，需要持久化** | Fjall | LZ4 压缩，SSD 成本远低于 DRAM |
+| **高并发（>10K QPS）** | Fjall | 多线程并发，Redis 单线程瓶颈 |
+| **需要分布式锁** | Fjall + 共识层 | 进程内原子操作 + 共识层强一致（见 §分布式 KV），Redlock 数学不安全 |
+| **跨进程共享状态（多语言）** | Redis 或 SurrealDB | Fjall 是嵌入式库，无法跨进程 |
+| **缓存场景（允许丢失）** | 应用内 HashMap / Caffeine | 比 Redis 更快，比 Fjall 更简单 |
+| **需要 Pub/Sub、Streams** | NATS / Kafka | Redis 消息功能弱，无持久化 |
+| **需要复杂数据结构（Geo、HLL）** | PostGIS / 专用库 | Redis 内存成本过高 |
+| **开源框架/CLI 内部状态管理** | Fjall | 见下文「SQLite vs 嵌入式 KV」；C 依赖/写锁/双重缓存是系统性磨损 |
+
+**决策流程图**：
+
+```
+需要跨进程/跨语言共享？
+├─ 是 → Redis 或 SurrealDB
+└─ 否 → 数据量 > 100GB？
+         ├─ 是 → Fjall（SSD 成本优势）
+         └─ 否 → 需要持久化？
+                  ├─ 是 → Fjall（自动 WAL）
+                  └─ 否 → 允许丢失？
+                           ├─ 是 → HashMap / Caffeine
+                           └─ 否 → Fjall（内存模式）
+```
+
+
+#### 单机部署：性能陷阱
+
+**Redis 的隐形成本**：
+
+1. **序列化开销**：每次请求 1-5μs（JSON/Protocol Buffers），10K QPS = 10-50ms/s CPU 时间
+2. **上下文切换**：进程间通信触发内核态切换，~1μs/次
+3. **网络栈**：TCP/IP 协议栈处理 ~10-50μs/包
+4. **内存碎片**：Redis 使用 jemalloc，长期运行后内存碎片率 10-30%
+
+**Fjall 的优势**：
+
+1. **零序列化**：进程内直接传递 Rust 结构体引用
+2. **零上下文切换**：函数调用，无内核态切换
+3. **零网络栈**：无 TCP/IP 处理
+4. **压缩存储**：LZ4 压缩后数据量减少 50-70%，磁盘 I/O 更少
+
+**实测数据（100GB 数据集，10K QPS）**：
+
+| 指标 | Redis | Fjall |
+|------|-------|-------|
+| P50 延迟 | 0.8ms | 0.05ms |
+| P99 延迟 | 5ms | 0.2ms |
+| CPU 使用率 | 80%（单线程饱和） | 30%（多线程分散） |
+| 内存占用 | 120GB | 8GB |
+| 磁盘占用 | 0GB | 35GB（压缩后） |
+
+
+#### 单机部署：迁移成本
+
+**从 Redis 迁移到 Fjall 的工作量**：
+
+| 任务 | 工作量 | 风险 |
+|------|--------|------|
+| 键编码方案实现 | 1-2 天（AI 生成） | 低（模式化代码） |
+| 状态机 `apply` 逻辑 | 2-3 天（AI 生成 + Review） | 中（需验证边界情况） |
+| 数据迁移脚本 | 1 天（Redis DUMP → Fjall import） | 低（一次性任务） |
+| 集成测试 | 2-3 天（AI 生成用例） | 中（需覆盖所有 Redis 命令） |
+| 生产部署 | 1 天（替换启动脚本） | 低（嵌入式，零运维） |
+| **总计** | **7-10 天** | **可控** |
+
+**迁移收益（3 年 TCO）**：
+
+- 硬件成本节省：$13,000 × 3 = $39,000
+- 运维成本节省：$25,000 × 3 = $75,000
+- **总计节省：$114,000**
+
+**ROI**：迁移成本 $5,000（人力） → 3 年收益 $114,000，**ROI = 22.8x**。
+
+
+#### SQLite vs 嵌入式 KV
+
+SQLite 是软件工程的奇迹，但大量项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。当查询模式可预测时，嵌入式 KV 在三个维度上产生系统性优势：
+
+**C 语言依赖与交叉编译**。SQLite 是 C 写的。Rust 项目引入 rusqlite 绑定后，用户机器必须安装 C 编译器（gcc/clang）。交叉编译（Mac → Linux ARM64）时 C 工具链是主要阻塞源。纯 Rust KV 引擎（Fjall）几秒内编译出静态链接的单一二进制，零外部依赖。
+
+**双重缓存与内存浪费**。SQLite 内部有 Page Cache。数据从磁盘 → SQLite Page Cache → SQL 解析行结构 → 二次复制到 Rust 对象内存。纯 KV 引擎的 LSM-Tree Block Cache 直接映射到应用层，读取路径更短，内存占用更低。
+
+**写锁线程阻塞**。SQLite 使用数据库级排他锁写入。高并发多线程场景（网关、Agent 服务）频繁触发 `SQLITE_BUSY`，线程挂起等待。纯 Rust KV 引擎通过无锁 MemTable（跳表/基数树）吸收并发写，多核并行无阻塞。
+
+##### CLI 工具场景：Fjall vs SQLite
+
+| | Fjall | SQLite |
+|:---|:---|:---|
+| 嵌入式 | ✅ 进程内，零配置 | ✅ 进程内，零配置 |
+| 单文件 | ❌ 目录（多个 SSTable） | ✅ 单个 .db 文件 |
+| ACID | ✅ WAL | ✅ WAL |
+| 写性能 | 更好（LSM-Tree，无写锁） | 较差（B-Tree，写锁竞争） |
+| 并发写 | 好（多线程无锁） | 差（单写者） |
+| SQL | ❌ 纯 KV | ✅ |
+| 跨语言 | Rust only | C/Python/Go/Node 所有语言 |
+| 备份 | 复制目录 | 单文件复制 |
+
+**选 Fjall 的场景**：纯 Rust CLI、数据是 key-value（缓存/索引/配置/状态）、写入密集。LSM-Tree 的写入性能比 SQLite 的 B-Tree + 写锁高一个数量级。
+
+**仍选 SQLite 的场景**：需要 SQL 查询（JOIN/聚合）、需要单文件（`.db` 拷贝即备份）、需要跨语言绑定、需要成熟生态（ORM/GUI 客户端/迁移工具）。
+
+**判定**：纯 Rust CLI 工具，Fjall 是 SQLite 的更好替代——零 C 依赖、无写锁、写入更快。如果不是纯 Rust、需要 SQL 或跨语言，SQLite 仍是更务实的选择。
+
+##### 开源基础设施案例
+
+| 项目 | 选择 | 理由 |
+|:--|:--|:--|
+| **Docker / containerd** | bbolt（Go KV） | 容器元数据查询固定（Container_ID → metadata），KV 足够，SQL 是多余开销 |
+| **K3s（边缘端）** | 从 SQLite 向 etcd 嵌入式 KV 收敛 | 边缘节点 CPU/内存敏感，SQL 解析器的抖动不可容忍 |
+| **3D 资产管线（orbsh/wiki）** | LanceDB（列式/KV） | 资产元数据路径查找模式可预测，关系型多表解析是性能陷阱 |
+
+**重构示范**：SQLite 配置表 `configs(app_name, config_key, config_value)` → KV 复合键：
+
+```
+Key: cfg:{app_name}:{config_key}  →  Value: [原始二进制]
+```
+
+`save_config` = 一次 `put`，无 SQL 解析。`get_all_app_configs` = 一次 `prefix_scan("cfg:{app_name}:")`，无查询计划生成。代码即最高效的执行计划——LSM-Tree 的字典序迭代器直接在 SSTable 上顺序扫描。
+
+**判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。纯 Rust CLI 工具选 Fjall，跨语言/需要 SQL 选 SQLite。
+
+
+#### 选择标准（Fjall vs SlateDB）
 
 ```
 能用 S3 吗？
@@ -1792,23 +1731,8 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 强一致分布式的需求（「分片 + Raft」）**不自建**——用 FoundationDB / TiKV，原理与选型见上文 **§分布式 KV** 章节。
 
-### Fjall 的差异化优势（即使 SlateDB 支持本地存储）
 
-即使 SlateDB 未来完美支持本地存储，Fjall 在以下方面仍有结构性优势：
-
-**1. KV 分离（Value Log）**：Fjall 内置 `value-log` 组件（灵感来自 RocksDB 的 BlobDB/Titan）。写入大 Value（图片/文档/音频）时，Value 分离存储到单独文件，LSM-Tree 只保留 Key + 指针。极大降低写放大，大对象场景本地写入和 Compaction 性能远超 SlateDB。
-
-**2. 更成熟的事务支持**：Fjall 内置可串行化事务（Serializable Transactions）及乐观/单写者事务模型（`OptimisticTxDatabase` / `SingleWriterTxDatabase`）。多并发本地事务控制、多 Keyspace 跨空间原子提交方面，更接近成熟本地 RDBMS 核心。
-
-**3. 极致本地优化**：Fjall 3.0 对本地磁盘 Block 格式彻底重构——稀疏索引（Sparse Indexing）、前缀截断、布隆过滤器分区、可选哈希索引（Hash Index）。未命中缓存时，本地磁盘随机点查和范围扫描快 2-100 倍，内存开销极低。
-
-**4. 基因纯正**：SlateDB 的核心设计是 "Zero-Disk"（零本地盘依赖），并发锁、Fencing、Flush 策略都围绕网络对象存储延迟优化。即使支持本地写入，这些架构包袱（如因适配网络而做的激进 Batching 导致的即时持久化延迟）很难完全抹除。Fjall 100% 为本地 NVMe/SSD 吞吐量和 OS 文件系统设计。
-
-### Fjall 的 S3 计划
-
-**官方没有原生 S3 支持计划**。Fjall 定位为嵌入式单机存储引擎（纯 Rust 版 RocksDB/LevelDB），保持核心库轻量、确定性、100% Safe Rust。社区有间接方案：通过 VFS 对接 Apache OpenDAL 或 `s5_store_fjall` 将底层存储映射到 S3。
-
-### 选择标准（更新）
+#### 选择标准（更新）
 
 ```
 能用 S3 吗？
@@ -1826,6 +1750,100 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 ```
 
 强一致分布式（分片 + Raft / FDB / TiKV）的原理与选型统一在上文 **§分布式 KV** 章节；此处只保留嵌入式两件套（Fjall vs SlateDB）的对比。Agent 记忆系统落地见 [§12 用例](#12-用例agent-记忆系统的-kv-落地)，网关落地见 [§13 用例](#13-用例openresty--kv-网关)。
+
+
+### API
+
+
+#### API 伪代码视感
+
+##### Fjall：传统工业级级联 API
+
+追求对本地物理盘的极致颗粒度控制。引入 `Keyspace`（大命名空间）和 `Partition`（物理隔离分区）概念。
+
+```rust
+// 1. 打开本地大磁盘空间
+let keyspace = fjall::Config::new(db_path).open()?;
+
+// 2. 开辟独立物理分区（等价于 RocksDB 的 Column Family）
+let user_table = keyspace.open_partition("users", fjall::PartitionCreateOptions::default())?;
+
+// 3. 经典的原子 Batch 批量写入
+let mut batch = keyspace.batch();
+batch.insert(&user_table, b"cfg:app:1", b"payload_bytes");
+batch.commit()?;
+```
+
+##### SlateDB：云原生全异步 API
+
+核心灵魂是 S3，所有 API 天生彻底异步化（`async/await`），初始化直接绑定网络对象桶。
+
+```rust
+// 1. 初始化云端对象存储驱动
+let object_store = object_store::aws::AmazonS3Builder::from_env().build()?;
+let path = "my_agent_bucket/db_root".to_string();
+
+// 2. 打开云原生 KV 实例
+let db = slatedb::Db::open_with_opts(path, slatedb::DbOptions::default(), Arc::new(object_store)).await?;
+
+// 3. 彻底异步的读写 API
+db.put(b"cfg:app:1", b"payload_bytes").await?;
+```
+
+##### SurrealKV：激进的 ACID 事务级 API
+
+为大数据库事务而生。所有读写 API 必须包裹在严格的 `Transaction`（事务闭包）中。
+
+```rust
+// 1. 打开纯 Rust 嵌入式本地引擎
+let kv = surrealkv::Store::new(surrealkv::Options::new(db_path))?;
+
+// 2. 显式开启可写事务
+let mut tx = kv.begin_rw()?;
+
+// 3. 所有操作绑定在 tx 事务上下文上
+tx.set(b"cfg:app:1", b"payload_bytes")?;
+
+// 4. 显式提交。失败时自动物理回滚
+tx.commit()?;
+```
+
+##### redb：B-tree 事务域 API
+
+纯 Rust Copy-on-Write B-tree。无后台 compaction、读路径确定，天然适合「点查/范围扫描优先、写非海量」的负载。逻辑多表（TableDefinition）组织命名空间，事务用借用生命周期表达单写者约束。
+
+```rust
+// 1. 打开 B-tree 数据库（同一 db 内可定义多个逻辑表）
+let db = redb::Database::create(db_path)?;
+
+// 2. 定义逻辑数据表（每个 TableDefinition 独立一棵 B-tree）
+let user_table: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+
+// 3. 读写事务，借用生命周期保证单写者
+let write_tx = db.begin_write()?;
+{
+    let mut table = write_tx.open_table(user_table)?;
+    table.insert(b"cfg:app:1".as_slice(), b"payload_bytes")?;
+}
+write_tx.commit()?;
+```
+
+
+#### 核心 API 特性对比
+
+| 特性维度 | Fjall（3.x） | SlateDB | redb | SurrealKV |
+|:--|:--|:--|:--|:--|
+| **数据结构** | LSM-Tree | LSM-Tree | Copy-on-Write B-tree | LSM-Tree |
+| **异步** | ❌ 纯同步，需 `spawn_blocking` | 🚀 纯异步 `.await`，融合 Tokio | ❌ 纯同步 | ❌ 纯同步 |
+| **多空间隔离** | 🥇 Partitions 物理分区 | ◐ 扁平（无物理分区） | ◐ 逻辑多表（TableDefinition，非物理分区） | ◐ 扁平（无物理分区） |
+| **事务** | WriteBatch 原子批量 | 基础批量原子写 | 可串行化（借用生命周期单写者） | 🥇 严格 MVCC 事务 |
+| **大 Value** | 🥇 WiscKey KV 分离 | 早期演进 | ⚠️ 无 KV 分离 | 🥇 Blob Log 大对象分离 |
+| **时间旅行** | ❌ | ❌ | ❌ | 🥇 Versioned Queries |
+
+
+#### 统一抽象
+
+四个引擎的 API 差异可通过统一 Trait 抽象屏蔽（见 `AuraStorage` trait）。关键决策点：异步 `async`（→ SlateDB）、事务块同步（→ SurrealKV）、免停顿本地读确定（→ redb）。统一 Trait 让一套复合 Key 结构体在四引擎间无缝切换。
 
 ## 12. 用例：Agent 记忆系统的 KV 落地
 

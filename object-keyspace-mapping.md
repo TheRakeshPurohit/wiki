@@ -211,7 +211,7 @@ Namespace 3 → logs
 - **namespace = 表/集合（KV 母语）**：此处的 namespace 不是"容器/作用域"，而是 KV/noSQL 里"表/集合"的标准同义词（Cassandra 的 keyspace 同理）——它只是 key 前缀的判别位，本身不存在逻辑意义上的"表"（无表级 schema 约束、无列/类型），故叫 namespace 在 KV 母语里最准。
 - **多租户键结构**
   - **key 形状**：若有多个租户，key 形如 `[ns_id/表][tenant_id]…`——表/ns 在最外层，后跟 tenant_id。
-  - **没有 `tenant_ns_id` 一层**：本系统**不暴露"用户可编程的查询/schema 面"**（多租户由 API 网关承载、租户共享同一套表），不存在租户自定义 namespace 需求。这不是"KV 不如 SQL 动态"——**SQL 在程序内部同样是写死的代码**，即席动态来自对外暴露的查询面，而非存储本身更动态（论证见 [kv-storage-engine](kv-storage-engine.md) 核心论点）。
+  - **没有 `tenant_ns_id` 一层**：本系统**不暴露"用户可编程的查询/schema 面"**（多租户由 API 网关承载、租户共享同一套表），不存在租户自定义 namespace 需求。这不是"KV 不如 SQL 动态"——**SQL 在程序内部同样是写死的代码**，即席动态来自对外暴露的查询面，而非存储本身更动态（论证见 [kv-storage-engine](kv-storage-engine.md)「什么时候用 SQL」）。
   - **不在最外层另套 tenant_id**：即便对 SaaS 应用，按租户做外层隔离也是过度隔离——租户共享同一套表/schema，多租户由 API 网关承载；tenant_id 只是 key 里的一个判别字段，不是分区/表边界。
 
 ## DDL 结构体：全定长、零浪费
