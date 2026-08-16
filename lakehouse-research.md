@@ -66,6 +66,30 @@ MPP 的专用集群存储在成本和扩展性上无法与之竞争。**Lakehous
 
 **OSS Tables / S3 Tables 的价值**：把 Catalog 做成对象存储的原生能力——存储桶自身化身元数据服务中心，用户不用部署任何额外服务。S3 Tables 改变了选型权重：此前 Iceberg 最大痛点是"需要自建 Catalog"，现在 Catalog 被内化为存储原生能力。
 
+### Catalog 的本质：系统表，可以非关系化（甚至无状态）
+
+REST Catalog（Lakekeeper/Polaris）的元数据后端常用 PostgreSQL，但这只是实现惯性，不是结构必需——Catalog 存的本质是一组「系统表」：
+
+- **表元数据**：schema、分区、排序
+- **当前有效快照**：manifest 文件列表
+- **事务日志**：并发提交的指针切换
+
+三层的共同特征是**数据量极小**（每表几 KB ~ 几 MB）、**访问模式固定**（点查 `table → 快照` + 范围扫描 `快照 → 文件列表`）、**强一致**——正落在 [KV 存储引擎](kv-storage-engine.md) 的可预测查询域，嵌入式 KV（Fjall）可行，且比 PostgreSQL 少了解析器/优化器/授权那一整套运行时。
+
+更彻底一层是 **Catalog 无状态化**：
+
+- **Iceberg 的哲学**：「元数据即数据」——`metadata/*.json` 本身就在 S3 上，Catalog 只做 `table → current_snapshot` 的快速索引，**不是数据源头**。
+- **KV 只是缓存**：坏了、丢了、重启，扫 S3 前缀重建（读 `version-hint.text` 或排序 `v{N}.metadata.json` 取最新），几百上千张表的重建耗时在**几百毫秒量级**。
+- **降级为无状态索引**：Catalog 从「有状态服务」降为「无状态索引」，与应用进程同生共死，应用挂了扫一遍就回来。
+
+这与上文 OSS/S3 Tables 把 Catalog 内化为存储原生能力是同一收敛方向：一个落在云端存储桶，一个落在应用进程内。
+
+权限边界随之挪到对象存储：**Catalog 不设防**，数据安全由存储层承载——应用 IAM Role 只有写（`PutObject`），DuckDB/BI 引擎的 Role 只有读（`GetObject`）。控制 S3 的写策略即控制数据安全，替换 Catalog 内部维护的 ACL/RBAC。
+
+#### 无锁并发提交：S3 条件写原子性
+
+Iceberg 的指针切换也可下沉到对象存储条件写，避免外部锁服务（DynamoDB/Zookeeper）：用 `If-None-Match: *` 写 `v{N}.metadata.json`，成功即抢到提交权，`PreconditionFailed` 即冲突——拉最新元数据、合并 manifest、以 `v{N+1}` 重试。**注记**：该头部是 AWS S3 / MinIO 语义；阿里云 OSS 不支持（见 §7——Delta 在 OSS 上卡住的正是同一个 `If-None-Match`），仅标准 S3 兼容栈成立。
+
 ---
 
 ## 4. 表格式选型
