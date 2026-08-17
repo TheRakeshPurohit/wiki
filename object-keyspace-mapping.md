@@ -238,6 +238,42 @@ pub struct UserSessionKey {
 // 物理总长度 = 2(ns) + 16 + 8 + 16 = 42 字节，零字节浪费
 ```
 
+对照**二级索引可变长**：姓名→id 索引用变长 key——判别文本放最前、UTF-8 原样存储即天然字典序扫描序；连续多个字符串字段同样支持（每个字段独立 `[len: u16]` 长度前缀 + UTF-8 字节，宏逐个推进 offset 游标）。索引 key 的末尾**挟带主表主键**，value 留空——前缀扫到索引条目后，从 key 尾部提出 `user_id` 回查主表：
+
+```rust
+/// User 表按 (name, city) 组合字段的二级索引：
+/// [索引字段…]@[主表主键 user_id]，Value 留空（锚点位，仅作前缀扫描回查）
+#[derive(KvEncode)]
+#[kv_ns(2)]  // 编译期翻译为 [0x00, 0x02]
+pub struct UserIndexNameCityKey {
+    pub name: String,    // 变长索引字段 1：[len: u16] + UTF-8 字节
+    pub city: String,    // 变长索引字段 2：同样 [len: u16] + UTF-8 字节
+    pub user_id: [u8; 16], // 主表主键：前缀扫到此处后提出该 id 回查 User 主表
+}
+// 物理布局 = 2(ns) + (2+len(name)) + (2+len(city)) + 16(user_id) 字节；
+// 变长在前 ⇒ user_id 前的偏移须运行期游标推进（消除 compile-time 偏移死锁，零解析让位于扫描能力）
+```
+
+- 命名 `UserIndexNameCityKey` = 主表 `User` + 索引标记 `Index` + 索引字段 `NameCity`，一眼看出它是什么表、什么字段的副索引。
+- **统一策略：ID 一律放 Key 末尾，搜索用前缀扫描**。`user_id` 作末尾锚点（Value 留空），`scan(idx, scan_fn)` 以"前 idx 个字段"为扫描前缀、把命中 key 逐一 decode 成 `Vec<Self>`；是否唯一（Vec 长度）由调用方判断，不必在布局上切换 unique/非 unique 两套。只有纯粹的点查热路径（索引字段业务唯一、从不扫多条）才值得把 ID 移入 Value 让 get 单发。完整论证见 [kv-storage-engine](kv-storage-engine.md)「索引主键 ID：统一放 Key 末尾，Value 留空」。
+- 索引字段（`name`/`city`，变长）放**最前**参与前缀扫描；主表主键 `user_id`（定长 16B）放**末尾**作回查锚点——扫到即提 id，value 留空不占索引格子。
+- 本结构体**没有**尾随的 `Ok(Self { … })` 环形字段——变量部分只有两个 `String`，尾部 `user_id` 为定长。连续多字符串不冲突：`let _len` 可被同名 shadow、不同字段名天然各异、`offset += 2 + _len` 把游标推进到下一字段起点；也演示了**变长字段之后跟定长字段**——此时该定长字段偏移只能靠运行期游标推进（先累加各 `2+len` 到它，再 `+= 16`），这正是"变长之后的字段失去编译期偏移"的实例。`scan(idx, scan_fn)` 的前缀扫描调用见下文[运行时模块 + 测试](#运行时模块--测试kv_codecsrclibrs)的测试用例。
+
+**定宽的边界：主键定宽、索引可变长**
+
+- **定宽针对"结构"，不针对"数据"**：定宽说的是 key 的**结构**（几个字段、什么类型），不是字段里的**数据**。姓名等文本是数据，天生不定长——拿定宽去装它，"不够"或"浪费"是把定宽这个外来约束强加给本该自由的字段，自找别扭。
+- **判据是访问模式**：
+  - **只需精确点查**（给键 → 拿值，永不前缀/范围扫描）→ 可 hash 成定宽 key，整套定宽方案保留；代价是拿不回原值、不再按文本字典序、极端情形需防碰撞（128-bit 可忽略）。仅在 100% 点查时才选。
+  - **需要前缀/范围扫描**（如"查所有姓 Zha 的"、按名排序）→ **绝不能 hash**，须保留原始文本作**变长 key**。LSM 天然按 key 字节排序，UTF-8 原样存储即免费获得字典序范围扫描——这是 hash 永远给不回来的能力，此时该 keyspace 整体放弃定宽。
+- **姓名→id 之类的索引几乎必然走变长**：它当索引就是为了回答前辍/范围查询，纯点查不如下游直接查文件。故姓名类索引用变长布局是主流情形。
+- **变长布局编码**：
+  - **长度前缀** `[len: u16][name bytes]`：最通用，能装任意二进制、无转义负担；长度字节参与排序但无害（前缀稳定字段挡在前面）。
+  - **NUL 结尾** `[name bytes][0x00]`：省一字节，但需处理内嵌 NUL 的转义正确性。
+  - **倾向长度前缀**：通用、可测、不引入转义新负担；姓名这点长度开销不值得换 NUL 方案。
+- **Rust offset 算术的部分放宽**：定宽字段在变长字段**之前**时，前面的偏移仍是编译期已知、仍零解析——只有变长之后的字段落到运行期。故"定宽前缀 + 末尾变长尾缀"保留大部分零解析收益。但姓名索引的文本是判别位、要放最前参与扫描，变长在最开头，此放宽对它不适用，需整键变长。
+- **定宽是主键空间的资产，不是全局教条**："零解析零浪费"值得付 offset 算术成本，因为主键结构刚硬、且在热路径；姓名类索引扫描导向、读取热度次于主键，解析代价是一次读长度，微不足道，为它强行 padding/截断是在优化错的维度。**正确模型是两套布局 regime 并存**：主键定宽 + 索引可变长，不是互相否定、是各归其位。
+- **hex 稳定性测试不丢**：变长锁的不再是"具体文本的字节"（本无固定字节），而是**编码方案本身**——长度前缀布局、长度字节端序、`len` 取值上限等，用固定样本锁住，防止日后无意改编码致旧 key 失联。防线照旧，只是锁的对象变了。
+
 ## 过程宏实现源码
 
 ### 宏编译器驱动（`kv_codec_derive/src/lib.rs`）
@@ -268,22 +304,60 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
     let mut encode_tokens = TokenStream2::new();
     let mut decode_tokens = TokenStream2::new();
     let mut capacity_tokens = TokenStream2::new();
+    let mut encode_prefix_tokens = TokenStream2::new(); // search 用：编码前 N 个字段做扫描前缀
     let mut current_offset = 2; // 前缀永远锁死在 2 字节位置
+    let mut field_idx = 0usize;
+
+    // 检测结构体是否含变长字段（当前仅 String）；决定容量预算与解码偏移策略
+    let has_var = fields.iter().any(|f| match &f.ty {
+        Type::Path(tp) => tp.path.is_ident("String"),
+        _ => false,
+    });
 
     for field in fields {
         let field_name = &field.ident;
         let field_type = &field.ty;
 
         match field_type {
+            Type::Path(tp) if tp.path.is_ident("String") => {
+                // 变长：长度前缀 [len: u16] 大端序 + UTF-8 字节
+                encode_tokens.extend(quote! {
+                    let _s: &[u8] = self.#field_name.as_bytes();
+                    buf.extend_from_slice(&(_s.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(_s);
+                });
+                // search 前缀：仅当该字段被纳入前缀（idx < n）时编码，否则到此截断
+                encode_prefix_tokens.extend(quote! {
+                    if idx > #field_idx {
+                        let _s: &[u8] = self.#field_name.as_bytes();
+                        buf.extend_from_slice(&(_s.len() as u16).to_be_bytes());
+                        buf.extend_from_slice(_s);
+                    }
+                });
+                decode_tokens.extend(quote! {
+                    // `offset` 由 decode 函数体顶部 `let mut offset = 2usize` 提供（见下节 expanded 的 decode）
+                    let _len = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+                    let #field_name = String::from_utf8(
+                        bytes[offset + 2..offset + 2 + _len].to_vec()
+                    ).map_err(|_| "UTF-8 解码失败")?;
+                    offset += 2 + _len;
+                });
+            }
             Type::Array(type_array) => {
                 let len = &type_array.len;
                 encode_tokens.extend(quote! {
                     buf.extend_from_slice(&self.#field_name);
                 });
+                encode_prefix_tokens.extend(quote! {
+                    if idx > #field_idx {
+                        buf.extend_from_slice(&self.#field_name);
+                    }
+                });
                 capacity_tokens.extend(quote! { + #len });
                 decode_tokens.extend(quote! {
                     let mut #field_name = [0u8; #len];
-                    #field_name.copy_from_slice(&bytes[#current_offset..#current_offset + #len]);
+                    #field_name.copy_from_slice(&bytes[offset..offset + #len]);
+                    offset += #len;
                 });
                 current_offset += syn_parse_len(len);
             }
@@ -291,11 +365,17 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
                 encode_tokens.extend(quote! {
                     buf.extend_from_slice(&self.#field_name.to_be_bytes());
                 });
+                encode_prefix_tokens.extend(quote! {
+                    if idx > #field_idx {
+                        buf.extend_from_slice(&self.#field_name.to_be_bytes());
+                    }
+                });
                 capacity_tokens.extend(quote! { + 8 });
                 decode_tokens.extend(quote! {
                     let #field_name = #field_type::from_be_bytes(
-                        bytes[#current_offset..#current_offset + 8].try_into().unwrap()
+                        bytes[offset..offset + 8].try_into().unwrap()
                     );
+                    offset += 8;
                 });
                 current_offset += 8;
             }
@@ -303,35 +383,78 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
                 encode_tokens.extend(quote! {
                     buf.extend_from_slice(&self.#field_name.to_be_bytes());
                 });
+                encode_prefix_tokens.extend(quote! {
+                    if idx > #field_idx {
+                        buf.extend_from_slice(&self.#field_name.to_be_bytes());
+                    }
+                });
                 capacity_tokens.extend(quote! { + 4 });
                 decode_tokens.extend(quote! {
                     let #field_name = #field_type::from_be_bytes(
-                        bytes[#current_offset..#current_offset + 4].try_into().unwrap()
+                        bytes[offset..offset + 4].try_into().unwrap()
                     );
+                    offset += 4;
                 });
                 current_offset += 4;
             }
-            _ => panic!("OKM 键空间只接受 [u8; N] 和基础数值类型（全定长）"),
+            _ => panic!("OKM 键空间只接受 [u8; N]、基础数值类型和 String（String 为变长字段）"),
         }
+        field_idx += 1;
     }
+
+    // 含变长字段时无法编译期预算精确容量，退回无预分配；纯定长保留 with_capacity
+    let capacity_or_plain = if has_var {
+        quote! { Vec::new() }
+    } else {
+        quote! { Vec::with_capacity(2 #capacity_tokens) }
+    };
 
     let expanded = quote! {
         impl #name {
             pub const NAMESPACE_ID: u16 = #ns_id;
 
             pub fn encode(&self) -> Vec<u8> {
-                let mut buf = Vec::with_capacity(2 #capacity_tokens);
+                let mut buf = #capacity_or_plain;
                 buf.extend_from_slice(&[#(#ns_bytes),*]);
                 #encode_tokens
                 buf
             }
 
             pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
-                if bytes.len() != #current_offset || bytes[0..2] != [#(#ns_bytes),*] {
+                if bytes.len() < 2 || bytes[0..2] != [#(#ns_bytes),*] {
                     return Err("数据损坏或 Namespace 契约冲突");
                 }
+                // 运行期偏移游标；纯定长结构体下每次递增都是编译期常量，LLVM 折叠后仍为立即数寻址（零解析保留）
+                let mut offset = 2usize;
                 #decode_tokens
+                if bytes.len() != offset {
+                    return Err("数据长度与 Schema 不符");
+                }
                 Ok(Self { #( #fields ),* })
+            }
+
+            /// 编码"前 n 个字段"作为扫描前缀（n=索引字段个数）；
+            /// 变长字段仅在自己被纳入前缀（idx < n）时才写出长度前缀与字节，之后字段截断。
+            /// 由 search 调用，构造 LSM 前缀扫描范围。
+            pub fn encode_prefix(&self, n: usize) -> Vec<u8> {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&[#(#ns_bytes),*]);
+                #encode_prefix_tokens
+                buf
+            }
+
+            /// 前缀扫描：对 `encode_prefix(idx)` 命中的所有 key 逐一 decode 成 Self 收集进 Vec。
+            /// `idx`（索引字段个数）决定编码前缀到第几个字段；`scan_fn` 由 KV 层注入（如 `kv.scan(prefix)` 返回 key 集合）。
+            /// ID 一般编码在 Key 末尾，用户自行从 Vec 尾项取最后一字段。
+            pub fn scan<F>(&self, idx: usize, scan_fn: F) -> Vec<Self>
+            where
+                F: FnOnce(&[u8]) -> Vec<Vec<u8>>,
+            {
+                let prefix = self.encode_prefix(idx);
+                scan_fn(&prefix)
+                    .iter()
+                    .filter_map(|k| Self::decode(k).ok())
+                    .collect()
             }
         }
     };
@@ -416,6 +539,43 @@ mod tests {
         let expected = "000101010101010101010101010101010101000000000000003202020202020202020202020202020202";
         assert_eq!(hex::encode(key.encode()), expected);
     }
+
+    // 二级索引：ID 统一放 Key 末尾，Value 留空；前缀扫描返回 Vec<Self>
+    #[derive(KvEncode, Clone)]
+    #[kv_ns(2)]
+    pub struct UserIndexNameCityKey {
+        pub name: String,     // 变长索引字段（长度前缀 [len: u16] + UTF-8）
+        pub city: String,     // 变长索引字段
+        pub user_id: [u8; 16], // 主表主键：放末尾作判别位与回查锚点
+    }
+
+    #[test]
+    fn test_scan_prefix() {
+        let a = UserIndexNameCityKey { name: "zhang".into(), city: "sh".into(), user_id: [0u8; 16] };
+        let b = UserIndexNameCityKey { name: "zhang".into(), city: "sh".into(), user_id: [1u8; 16] };
+        let c = UserIndexNameCityKey { name: "li".into(), city: "sh".into(), user_id: [2u8; 16] };
+
+        // 构造"按 name+city 前缀扫描"：idx=2 把 name、city 纳入前缀，user_id 截断成尾部判别位
+        let probe = UserIndexNameCityKey { name: "zhang".into(), city: "sh".into(), user_id: [0u8; 16] };
+        let prefix = probe.encode_prefix(2);
+        assert!(a.encode().starts_with(&prefix));
+        assert!(b.encode().starts_with(&prefix));
+        assert!(!c.encode().starts_with(&prefix));   // 不同 city 不在该前缀下
+
+        // scan(2)：KV 侧按前缀命中 a、b 两条，decode 成 Vec<Self>，user_id 从末尾提出
+        let scan_fn = |p: &[u8]| {
+            [&a, &b, &c]
+                .iter()
+                .filter(|k| k.encode().starts_with(p))
+                .map(|k| k.encode())
+                .collect::<Vec<_>>()
+        };
+        let matches = probe.scan(2, scan_fn);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].user_id, [0u8; 16]);
+        assert_eq!(matches[1].user_id, [1u8; 16]);
+        // 唯一性由调用方判断：length>1 即非唯一，无需切换布局
+    }
 }
 ```
 
@@ -426,6 +586,9 @@ mod tests {
 | `[u8; N]` | `Type::Array` | `extend_from_slice(&self.field)` | N（固定） |
 | `u64` / `i64` | `Type::Path` | `extend_from_slice(&self.field.to_be_bytes())` | 8（固定） |
 | `u32` / `i32` | `Type::Path` | `extend_from_slice(&self.field.to_be_bytes())` | 4（固定） |
+| `String` | `Type::Path`（`is_ident("String")`） | 长度前缀 `[len: u16]` + `extend_from_slice(bytes)` | 2 + len（**变长**） |
+
+说明：定长字段在变长字段**之前**时，其偏移仍是编译期常量、运行期游标仅做常量累加（LLVM 折叠为立即数寻址，零解析保留）；变长字段之后的字段偏移必须运行期推进。判别位文本放最前（姓名索引）时整键变长、无编译期偏移可言。
 
 ## OKM 的物理收益
 
