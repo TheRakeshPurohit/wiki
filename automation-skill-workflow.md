@@ -199,7 +199,7 @@ if __name__ == "__main__":
 
 **SurrealDB 实现**：
 
-```surql
+```SurrealQL
 -- 凭证存储在 config 表，不在 Skill 里
 DEFINE TABLE IF NOT EXISTS legacy_auth SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS system_name ON legacy_auth TYPE string;
@@ -235,7 +235,7 @@ DEFINE FUNCTION fn::legacy::auth($system: string) -> string {
 
 **Skill 只调用 `fn::legacy::auth()`，不接触凭证**：
 
-```surql
+```SurrealQL
 -- Skill 示例：查询订单（认证由框架处理）
 DEFINE FUNCTION fn::legacy::list_orders(
     $system: string,

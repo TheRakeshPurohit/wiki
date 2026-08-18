@@ -109,7 +109,7 @@ SQL 的关系模型建立在一个刚性假设上：每张表有固定的列结�
 
 **SurrealDB 的路径一：Record ID 指针**——每行数据有全局唯一的 Record ID（如 `person:alice`），其他表直接把这个指针存入字段。底层像走内存指针一样定位，无需显式 JOIN：
 
-```surql
+```SurrealQL
 CREATE person:alice SET name = 'Alice';
 CREATE orders SET order_no = 1001, buyer = person:alice;
 CREATE comments SET content = '太棒了', author = person:alice;
@@ -118,7 +118,7 @@ SELECT * FROM orders WHERE buyer = person:alice;
 
 **SurrealDB 的路径二：图的边（RELATE）**——不在下游表建字段，而是用 `RELATE` 拉出真正的图边。边是一等公民，可以带自己的属性（时间、状态），查询时支持双向箭头穿透：
 
-```surql
+```SurrealQL
 RELATE person:alice -> bought -> product:iphone SET at = time::now();
 SELECT ->bought->product.name AS purchases FROM person:alice;   -- 正向
 SELECT <-wrote<-person.name AS author FROM article:news;        -- 逆向
@@ -126,7 +126,7 @@ SELECT <-wrote<-person.name AS author FROM article:news;        -- 逆向
 
 **SurrealDB 的路径三：多态引用**——一个字段可以动态指向任何表。SQL 中一个外键列只能指向一张固定表，处理"点赞"（用户可能赞了商品、文章或评论）时被迫用多表继承或多个 nullable FK。SurrealDB 的 `liked_item.*` 直接解构，省掉应用层的 if-else：
 
-```surql
+```SurrealQL
 CREATE likes SET user = person:alice, liked_item = product:iphone;  -- 指向商品
 CREATE likes SET user = person:alice, liked_item = article:news;    -- 指向文章
 SELECT liked_item.* FROM likes WHERE user = person:alice;           -- 自动解构
@@ -140,7 +140,7 @@ SQL 的多对多是三张表的物理结构——两张实体表加一张中间�
 
 **路径一：图的边（RELATE）**——关系有属性时的唯一正确选择。边作为独立的图物理表存在，可以附加选课时间、使用状态等元数据。查询无论多少跳都是一行箭头语法：
 
-```surql
+```SurrealQL
 -- 边自带属性
 RELATE student:alice -> enrollment -> course:math SET date = time::now();
 -- 正向：Alice 选了哪些课
@@ -151,7 +151,7 @@ SELECT <-enrollment<-student.name AS students FROM course:math;
 
 **路径二：文档数组指针**——纯关联、无属性时的极简方案。直接在文档内存储 Record ID 数组，彻底消除中间表。但数组只能存 ID，无法为某一个 ID 绑定额外属性，反向全局检索（`CONTAINS`）走全表扫描：
 
-```surql
+```SurrealQL
 CREATE student:alice SET
     name = 'Alice',
     my_courses = [course:math, course:cs];
@@ -367,7 +367,7 @@ Python 调用 Ollama API → 获取 embedding → 写入 SurrealDB
 2. **多消费方维护成本**：记忆检索、Session RAG、Consolidation 等多个消费方都需要 embedding。embedding 生成逻辑封装在 SurrealDB 的 `fn::ollama::embed` 中，应用层零感知，各消费方共享同一个函数，无需各自维护。
 
 **路径 B（SurQL 内部生成，正确做法）**：
-```surql
+```SurrealQL
 CREATE memories SET
     content = $content,
     embedding = (fn::ollama::embed('bge-m3', $content)).embeddings[0];

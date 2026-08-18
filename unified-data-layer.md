@@ -74,7 +74,11 @@ PostgreSQL 的泛化能力使它成为探索期的最优默认：
 
 ## 为什么路径 B 也不选单引擎（SurrealDB）
 
-路径 B 收敛进一个多模型单引擎（如 SurrealDB）是**已评估、未采用**的路线。马太效应决定挑战者必须在足够多维度形成压倒性优势才能克服生态惯性——SurrealDB 在语言设计、多态关联、计算下推上碾压，但在生态、工具链、云支持、数据一致性上全面劣势，**互有胜负 = 挑战失败**。且两件套在任意单引擎都达不到的尺度上拆分 OLTP 与 OLAP：图/多模型需求被 KV 用多模型编码吸收，分析负载归 DuckDB·Lakehouse。完整评估见 [SurrealDB 评估档案](query-language-design.md)。
+路径 B 收敛进一个多模型单引擎（如 SurrealDB）是**已评估、未采用**的路线。马太效应决定挑战者必须在足够多维度形成压倒性优势才能克服生态惯性——SurrealDB 在语言设计、多态关联、计算下推上碾压，但在生态、工具链、云支持、数据一致性上全面劣势，**互有胜负 = 挑战失败**。
+
+SurrealDB 的杀招「计算下推」本身也不免费——它把执行拆成两个世界：基础查询交给声明式 SurrealQL（底层核心直接调度、走原生索引），密集算法交给预编译 WASM 扩展（Surrealism，近原生机器码）；两者之间每次交换数据都要经 Host Bridge 序列化与内存复制，海量遍历时边界跨越开销显著。而嵌入式 KV 的「计算贴着数据」是起点属性：同进程、同二进制，`embed` 就是一次原生调用，零序列化、零边界、天然原子（机制详解见 [KV 存储引擎](kv-storage-engine.md)「坚守纯 KV 的理由」）。这一维度从「碾压」降格为「互有胜负」，天平进一步倒向两件套。
+
+且两件套在任意单引擎都达不到的尺度上拆分 OLTP 与 OLAP：图/多模型需求被 KV 用多模型编码吸收，分析负载归 DuckDB·Lakehouse。完整评估见 [SurrealDB 评估档案](query-language-design.md)。
 
 ## OLTP 与 OLAP 的边界
 
@@ -96,6 +100,6 @@ PostgreSQL 的泛化能力使它成为探索期的最优默认：
 
 - **[KV 存储引擎](kv-storage-engine.md)**：嵌入式 KV 与分布式共识（Fjall + Openraft）设计；可预测查询模式与大规模场景下 KV 替代 PostgreSQL 的论证。
 - **[Lakehouse 研究](lakehouse-research.md)**：分析层选型——Delta/Iceberg/Lance、对象存储、落地模式、Catalog 无状态化。
-- **[SurrealDB 评估档案](query-language-design.md)**：SurQL 语言哲学、图建模、挑战者逻辑的完整评估（为何未进核心）。
+- **[SurrealDB 评估档案](query-language-design.md)**：SurrealQL 语言哲学、图建模、挑战者逻辑的完整评估（为何未进核心）。
 - **[Redis 批判](redis-critique.md)**：网络 RTT 陷阱与缓存分层。
 - **[Aura 架构 §5](aura-architecture.md)**：需要完全嵌入式 KV 与共识时的轻量方案。
