@@ -503,7 +503,7 @@ return 1
 | 会话 Hash | 单 Key 省内存 | 纯内存，数据量大时 RAM 成本线性增长 |
 | 熔断 Lua | 原子状态翻转 | 单线程瓶颈，高并发上游时 Lua 排队 |
 
-成熟方案榨干了 Redis 的每一滴能力——Hash Tag、Hash ziplist、Lua 原子脚本、索引 Key 规避 SCAN。但它在物理上无法突破单线程和纯内存的硬限制。→ KV Sidecar 方案保留同样的 Key 编排思想，底层引擎从单线程网络 RAM 变为多线程磁盘优先 LSM-Tree，消除上述全部天花板。→ 完整设计见 [用例：OpenResty + KV 网关](kv-storage-engine.md#12-用例openresty--kv-网关)
+成熟方案榨干了 Redis 的每一滴能力——Hash Tag、Hash ziplist、Lua 原子脚本、索引 Key 规避 SCAN。但它在物理上无法突破单线程和纯内存的硬限制。→ KV Sidecar 方案保留同样的 Key 编排思想，底层引擎从单线程网络 RAM 变为多线程磁盘优先 LSM-Tree，消除上述全部天花板。→ 完整设计见 [用例：OpenResty + KV 网关](kv-storage-engine.md#用例openresty--kv-网关)
 
 **判定**：选择 Redis 而非嵌入式 KV 的理由缩减为两个——(1) 作为缓存层配合数据库使用，且不需要事务回滚；(2) 需要开箱即用的排行榜（ZSET）而不想写编码逻辑。这两个理由在现代架构下都越来越站不住：缓存可用 CDN/L1 就绪集合替代（§5），排行榜可用 200 行 KV 编码实现且支持磁盘持久化和多线程并发。
 
