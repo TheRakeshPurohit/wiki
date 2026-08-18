@@ -1,10 +1,10 @@
-# SurrealDB 评估档案：SurQL 与查询语言设计
+# SurrealDB 评估档案：SurrealQL 与查询语言设计
 
-> 核心架构**未采用** SurrealDB（见 [统一数据层架构](unified-data-layer.md)）——其图/多模型/计算下推需求被 PG（JSONB/扩展）与 KV 吸收，分析负载归 DuckDB·Lakehouse。但 SurQL 承载的查询语言洞见——原生组合性、计算下推、反 ORM——独立于 SurrealDB 而成立：即便 SurrealDB 不进核心，这些关于「查询语言应该长什么样」的论证依然有效。以下为完整评估。
+> 核心架构**未采用** SurrealDB（见 [统一数据层架构](unified-data-layer.md)）——其图/多模型/计算下推需求被 PG（JSONB/扩展）与 KV 吸收，分析负载归 DuckDB·Lakehouse。但 SurrealQL 承载的查询语言洞见——原生组合性、计算下推、反 ORM——独立于 SurrealDB 而成立：即便 SurrealDB 不进核心，这些关于「查询语言应该长什么样」的论证依然有效。以下为完整评估。
 
 ## SQL 的根本性缺陷
 
-SurQL 是 SurrealDB 最大的劣势同时也是优势。劣势是学习成本（但保留类 SQL 模式降低门槛），优势是**对查询语言的重新定义**。
+SurrealQL 是 SurrealDB 最大的劣势同时也是优势。劣势是学习成本（但保留类 SQL 模式降低门槛），优势是**对查询语言的重新定义**。
 
 SQL 最初定位给业务分析师和 DBA 使用，模仿英语自然语言的声明式语法，让不懂编程的人也能查询数据。但当它被拽进应用开发领域后，这套为"非程序员"设计的语法就成了开发者的噩梦。数学内核虽然完备，工程外壳却灾难性地对开发人员不友好。
 
@@ -26,7 +26,7 @@ ORM 之于 SQL，就像 Go 之于系统编程——通过阉割对底层关系�
 
 ---
 
-## SurQL 的架构级解决方案
+## SurrealQL 的架构级解决方案
 
 ### 1. 消除应用层编排与数据搬运（计算下推 Compute Pushdown）
 
@@ -34,7 +34,7 @@ ORM 之于 SQL，就像 Go 之于系统编程——通过阉割对底层关系�
 
 ### 2. 原生可组合性（一等公民查询 First-Class Queries）
 
-SurQL 解决了 SQL 长期缺乏组合性的工程痛点。它将查询视为**值**（values）而非文本。变量可以直接管道传入后续操作（`LET $x = SELECT ...; $x | update...`），消除了危险的字符串插值，确保类型安全。
+SurrealQL 解决了 SQL 长期缺乏组合性的工程痛点。它将查询视为**值**（values）而非文本。变量可以直接管道传入后续操作（`LET $x = SELECT ...; $x | update...`），消除了危险的字符串插值，确保类型安全。
 
 ### 3. 多模型统一与图遍历免 JOIN
 
@@ -50,15 +50,15 @@ SurQL 解决了 SQL 长期缺乏组合性的工程痛点。它将查询视为**�
 
 ### 6. 现代语法（泛 Rust 血统 Pan-Rust Lineage）
 
-SurQL 与 **Nushell**、**Moonbit** 等现代系统语言共享 DNA。简洁、符合人体工程学，避免 SQL 冗长的声明式样板，允许自然集成命令式逻辑（循环、条件判断）。详见 [现代编程语言设计](modern-language-design.md)。
+SurrealQL 与 **Nushell**、**Moonbit** 等现代系统语言共享 DNA。简洁、符合人体工程学，避免 SQL 冗长的声明式样板，允许自然集成命令式逻辑（循环、条件判断）。详见 [现代编程语言设计](modern-language-design.md)。
 
 ---
 
-## 数据交互参照系：SQL / DataFrame / SurQL / KV 键空间
+## 数据交互参照系：SQL / DataFrame / SurrealQL / KV 键空间
 
 四种数据交互方式的本质差异在于组合位置和通用性：
 
-| 维度 | SQL | DataFrame | SurQL | KV（键空间设计） |
+| 维度 | SQL | DataFrame | SurrealQL | KV（键空间设计） |
 |:---|:---|:---|:---|:---|
 | 载体 | 字符串 | 方法链（计算图惰性实现） | 一等公民值 | 复合键编码 + 前缀扫描 |
 | 组合性 | 无（CTE 是补丁） | 有（方法链可分叉/合并） | 有（变量管道传递） | 无——访问路径在键设计时定死 |
@@ -72,7 +72,7 @@ SurQL 与 **Nushell**、**Moonbit** 等现代系统语言共享 DNA。简洁、�
 
 **SQL**：字符串声明式。查询是文本，交给优化器解析+优化+执行。组合性差——没有控制流，不能变量传递。书写顺序和执行顺序相悖（SELECT 在前，FROM 在后）。优化器是黑盒，执行路径开发者无法显式控制。
 
-**SurQL**：一体化融合语言。查询是**值**不是文本——`LET $x = SELECT ...; $x | update...`，变量直接管道传递。图灵完备，内置控制流。不依赖优化器猜测——开发者可以显式规划查询逻辑。关键优势是**无缝组合**——查询、控制流、变量在同一个语法空间，无切换摩擦，且逻辑在 DB 内执行无数据搬运。代价是只能在 DB 环境运行，不通用。"不能调外部库"不是固有限制——取决于安全策略：`plpython3u` 同样可以调任意库，SurQL 可以访问 HTTP，Wasm 插件（Surrealism）可以调用其他语言的库并精确控制权限。
+**SurrealQL**：一体化融合语言。查询是**值**不是文本——`LET $x = SELECT ...; $x | update...`，变量直接管道传递。图灵完备，内置控制流。不依赖优化器猜测——开发者可以显式规划查询逻辑。关键优势是**无缝组合**——查询、控制流、变量在同一个语法空间，无切换摩擦，且逻辑在 DB 内执行无数据搬运。代价是只能在 DB 环境运行，不通用。"不能调外部库"不是固有限制——取决于安全策略：`plpython3u` 同样可以调任意库，SurrealQL 可以访问 HTTP，Wasm 插件（Surrealism）可以调用其他语言的库并精确控制权限。
 
 **DataFrame**：表格操作的语义层。方法链构建数据流，有类型检查、IDE 补全、可组合。和 SQL 共享同一层（声明式+逻辑优化器），但用编程语言语法替代字符串——有类型安全，无字符串注入风险。关键优势是**通用性**——运行在宿主语言内（Python/Rust/Scala），能调任意外部库（sklearn、网络、文件系统）。方法链与宿主控制流的语法空间切换摩擦存在，但仍是程序内一等公民，比 SQL 那一整层字符串更直白。真正的痛点在宿主语言本身——Python 的强制缩进与 fluent API 的方法链天然亲和性差，长链调用在缩进规则下难以排版，这是语言层而非查询层的约束。备注：DataFrame 语义本身不区分行列——列式存储是 Polars 的实现选择而非语义（Pandas 即行存）。Polars、Pandas、Spark 均实现该语义层；Spark 还提供 RDD、Dataset 等其他编程模型，这里取其中的 DataFrame 部分。其底层常以**计算图 API**（方法链构建 DAG、惰性求值、collect 时优化器看到完整图后整体优化）区别于 eager 实现（如 Pandas）。
 
@@ -82,7 +82,7 @@ SurQL 与 **Nushell**、**Moonbit** 等现代系统语言共享 DNA。简洁、�
 
 **KV + DataFrame 组合**：载荷分工而非替代。KV 做持久化 + 行级访问（点查 / 固定前缀扫描 = OLTP），DataFrame 做内存分析层（读出 → 多维聚合）——KV 提供 DF 缺的持久性，DF 提供 KV 缺的分析能力，正好互补。这是「SQL 是 KV 的上层封装」的同构论证，但在这半边比 SQL 更优：类型安全（编译期）、可分步（先 scan KV 再 `df.xxx`，中间态是普通数据而非字符串黑盒）、宿主语言亲和。由此构成完整链条：查询模式可预测 + 内部 → 纯 KV（连封装都不需要）；内部灵活分析 → KV + DF；外部 / AdHoc / 需求不可控 → SQL + 列式（DuckDB）或完整数据库（见 [KV 存储引擎](kv-storage-engine.md)「什么时候必须蜕变为数据库」）。前两档都不需要 Parser + Optimizer——使用者在内部、模式可掌控，DF 的计算图就是够用的查询层。边界：DF 是内存态，数据量大到装不下就要分布式（Spark），KV 的嵌入式零 RTT 就消失——组合的天花板是单机中规模；且 KV 行存读入 DataFrame 有布局转换开销，大规模纯分析仍是 DuckDB 这类直接列存的更优。
 
-四者不是「纯声明式 vs 一体化」的二元对立，而是**组合位置和通用性的取舍**：SQL 不能组合（字符串），逻辑被迫搬到应用层；DataFrame 能组合（宿主语言），通用性强但受宿主语法约束（Python 缩进对 fluent API 不友好；实现需读入数据，分布式实现靠数据本地性就近计算但仍是独立计算引擎）；SurQL 能组合（一体化语法），无摩擦、逻辑在 DB 内，代价是运行环境限于 DB，但通过 HTTP 和 Wasm 插件可按需扩展外部能力；KV 是「无语言」的极端——访问路径在键设计时定死，通用性最强（任意宿主、零解析），代价是查询模式必须可预测并在设计期固化。
+四者不是「纯声明式 vs 一体化」的二元对立，而是**组合位置和通用性的取舍**：SQL 不能组合（字符串），逻辑被迫搬到应用层；DataFrame 能组合（宿主语言），通用性强但受宿主语法约束（Python 缩进对 fluent API 不友好；实现需读入数据，分布式实现靠数据本地性就近计算但仍是独立计算引擎）；SurrealQL 能组合（一体化语法），无摩擦、逻辑在 DB 内，代价是运行环境限于 DB，但通过 HTTP 和 Wasm 插件可按需扩展外部能力；KV 是「无语言」的极端——访问路径在键设计时定死，通用性最强（任意宿主、零解析），代价是查询模式必须可预测并在设计期固化。
 
 
 
@@ -205,14 +205,14 @@ PostgreSQL 不只是"关系型数据库"——它的"电池内置"哲学让一�
 | 特性 | PostgreSQL 方案 | SurrealDB 方案 | 判定 |
 |:---|:---|:---|:---|
 | **架构** | 可扩展单体（插件/扩展），40 年生态积累 | 统一多模型引擎，新生但演进快 | **PG 生态碾压** |
-| **图查询** | PG 19 预览 SQL/PGQ 标准支持，即将 GA 落地。当前生产可用的 PG（≤18）依赖 `AGE` 扩展或递归 CTE，体验臃肿。PG 19 落地后，SQL/PGQ 作为 SQL 标准附加层，与 SurQL 原生图语义的集成深度仍有差距，但"凑合够用"。| SurQL 原生图语义（`RELATE`、`->`、`<-`）是一等公民，集成深度更深。| **SurrealDB 体验更优，但 PG 19 后差距缩小** |
-| **GraphQL** | 与存储无关。GraphQL 是 API 查询语言（HTTP 层），通常位于 PG/SurrealDB *之上*。两者支持层次对称。| 同左：SurrealDB 通过网关层暴露 GraphQL 端点，原生引擎仍是 SurQL。| **持平** |
-| **脚本/逻辑** | `plpython3`、`plv8`。语法笨拙但生态厚——能调任意外部库，社区支持完善。| **SurQL**：图灵完备，内置，类 Rust/Nu 语法。符合人体工程学，但生态薄。| **PG 生态厚，SurQL 体验优** |
+| **图查询** | PG 19 预览 SQL/PGQ 标准支持，即将 GA 落地。当前生产可用的 PG（≤18）依赖 `AGE` 扩展或递归 CTE，体验臃肿。PG 19 落地后，SQL/PGQ 作为 SQL 标准附加层，与 SurrealQL 原生图语义的集成深度仍有差距，但"凑合够用"。| SurrealQL 原生图语义（`RELATE`、`->`、`<-`）是一等公民，集成深度更深。| **SurrealDB 体验更优，但 PG 19 后差距缩小** |
+| **GraphQL** | 与存储无关。GraphQL 是 API 查询语言（HTTP 层），通常位于 PG/SurrealDB *之上*。两者支持层次对称。| 同左：SurrealDB 通过网关层暴露 GraphQL 端点，原生引擎仍是 SurrealQL。| **持平** |
+| **脚本/逻辑** | `plpython3`、`plv8`。语法笨拙但生态厚——能调任意外部库，社区支持完善。| **SurrealQL**：图灵完备，内置，类 Rust/Nu 语法。符合人体工程学，但生态薄。| **PG 生态厚，SurrealQL 体验优** |
 | **schema-free** | JSONB 字段：一个表一个 JSONB 就能跳过 schema 设计。schema-first 是默认，JSONB 是逃生舱。| 默认 schema-free，可选添加 schema。schema-free 是一等公民。| **范式差异，非能力差异** |
 | **性能** | 成熟优化器，Index Scan / Bitmap Scan，40 年优化器积累。重型扩展堆叠时性能下降。| Rust 静态语义，KV 引擎点查快，计算下推减少 RTT。缺乏优化器积累。| **持平** |
 | **数据一致性** | ACID + 外键约束 + ON DELETE CASCADE，声明式，40 年验证。| 需手动 event 级联，数组模式有僵尸指针。| **PG 碾压** |
 | **工具链** | `pg_dump`、`pgbench`、`EXPLAIN ANALYZE`、慢查询日志、`pg_stat_statements`——全套运维工具开箱即用。| 慢查询日志是**企业版功能**。单节点部署为主。工具链不成熟。| **PG 碾压** |
-| **学习成本** | SQL 通用，开发者人人会。| SurQL 新语言，但对厌倦 SQL 的人是解放。| **PG 略优** |
+| **学习成本** | SQL 通用，开发者人人会。| SurrealQL 新语言，但对厌倦 SQL 的人是解放。| **PG 略优** |
 | **云厂商支持** | 所有主流云原生支持（RDS、Cloud SQL、Azure Database）。| 无主流云原生支持。| **PG 碾压** |
 
 **洞察**：要让 PG 做到 SurrealDB 开箱即用的功能，你需要安装、配置和维护多个扩展，每个都有各自的发布周期和兼容性矩阵。但 PG 的优势在于——即使不用任何扩展，它已经是一个完整的一站式数据库。SurrealDB 的优势是"开箱即用的多模型体验"，代价是生态和工具链的不成熟。
@@ -260,12 +260,12 @@ PG：       默认 schema-first → JSONB 字段可以绕过
 | 层次 | 维度 | PostgreSQL | SurrealDB | 判定 |
 |:---|:---|:---|:---|:---|
 | **下限（性能）** | 单模型查询 | 成熟优化器，Index Scan / Bitmap Scan | KV 引擎，点查快但缺乏 40 年优化器积累 | **持平** |
-| **上限（范式）** | 语言设计 | SQL：语法顺序与执行顺序相悖，缺乏模块化 | SurQL：可组合、表达力强、复杂逻辑成本与 Python 持平 | **SurrealDB 碾压** |
+| **上限（范式）** | 语言设计 | SQL：语法顺序与执行顺序相悖，缺乏模块化 | SurrealQL：可组合、表达力强、复杂逻辑成本与 Python 持平 | **SurrealDB 碾压** |
 | | 多态关联 | 多表继承或多个 nullable FK，笨重 | 字段直接指向任意表，零成本 | **SurrealDB 碾压** |
-| | 逻辑下沉 | 逻辑在应用层，ORM 是消除语言切换的补丁 | SurQL 原生可组合，数据库端直接写业务逻辑，ORM 失去存在理由 | **SurrealDB 碾压** |
+| | 逻辑下沉 | 逻辑在应用层，ORM 是消除语言切换的补丁 | SurrealQL 原生可组合，数据库端直接写业务逻辑，ORM 失去存在理由 | **SurrealDB 碾压** |
 | | RTT 成本 | 每次 Read-Modify-Write 都是网络往返 | 单个请求完成图遍历 + 业务逻辑，零额外 RTT | **SurrealDB 碾压** |
 | **生态** | 成熟度 | 40 年，工具链完备，云厂商原生支持，慢查询日志等运维工具开箱即用 | 新生，社区小，慢查询日志是企业版功能，工具链不成熟 | **PG 碾压** |
-| | 学习成本 | SQL 通用，开发者人人会 | SurQL 新语言，但对厌倦 SQL 的人是解放 | **PG 略优** |
+| | 学习成本 | SQL 通用，开发者人人会 | SurrealQL 新语言，但对厌倦 SQL 的人是解放 | **PG 略优** |
 | | 数据一致性 | ACID + 外键约束 + ON DELETE CASCADE | 需手动 event 级联，数组模式有僵尸指针 | **PG 碾压** |
 | | 云厂商支持 | 所有主流云原生支持 | 无主流云原生支持 | **PG 碾压** |
 
@@ -277,7 +277,7 @@ ArangoDB 在语言层面也是多模型 + 图查询，与 SurrealDB 的范式类
 
 ### 架构：查询层与存储层分离
 
-SurrealDB 将查询引擎（SurQL 解析、权限校验、事务协调）与存储引擎解耦。同一套查询语言和客户端 SDK 可以运行在嵌入式设备、单节点服务器、分布式集群和 SurrealDB Cloud 上，无需改写应用代码。
+SurrealDB 将查询引擎（SurrealQL 解析、权限校验、事务协调）与存储引擎解耦。同一套查询语言和客户端 SDK 可以运行在嵌入式设备、单节点服务器、分布式集群和 SurrealDB Cloud 上，无需改写应用代码。
 
 **单节点存储引擎**：
 
@@ -317,15 +317,15 @@ BSL 对用户更诚实——限制是显性的、一次性的；Open Core 的限
 
 ---
 
-## SurQL 作为交互范式
+## SurrealQL 作为交互范式
 
 ### 背景："字符串注入"陷阱
 
-即使在高级嵌入式架构中（如 PostgreSQL 的 `pl/python3u`），查询层对宿主语言仍然是异类的。pl/python3u 的问题不只是"外层 SQL 语法笨拙"——**内部也是合法的 Python 代码，但执行 SQL 查询时仍然是字符串形式**（通过内置的 `plpy` 客户端），被迫管理两棵语法树。而 SurQL 是**一体化融合语言**：变量、控制流、查询在同一个语法空间内，不存在"Python 调 SQL 字符串"的边界。
+即使在高级嵌入式架构中（如 PostgreSQL 的 `pl/python3u`），查询层对宿主语言仍然是异类的。pl/python3u 的问题不只是"外层 SQL 语法笨拙"——**内部也是合法的 Python 代码，但执行 SQL 查询时仍然是字符串形式**（通过内置的 `plpy` 客户端），被迫管理两棵语法树。而 SurrealQL 是**一体化融合语言**：变量、控制流、查询在同一个语法空间内，不存在"Python 调 SQL 字符串"的边界。
 
 ### 实现对比
 
-| 特性 | 遗留模式（Python/Pl-Python 中的 SQL）| SurQL 模式（数据库内逻辑）|
+| 特性 | 遗留模式（Python/Pl-Python 中的 SQL）| SurrealQL 模式（数据库内逻辑）|
 |:---|:---|:---|
 | **逻辑流** | 分散在应用和数据库层。| 在数据库内原子执行。|
 | **数据访问** | **不透明字符串注入**：`db.query("SELECT ...")` | **原生组合**：`LET $user = SELECT ...` |
@@ -340,14 +340,14 @@ BSL 对用户更诚实——限制是显性的、一次性的；Open Core 的限
   - **分布式逻辑**：与遗留单体数据库（Oracle/PG）不同，SurrealDB 天生是分布式的。逻辑随集群水平扩展（TiKV/FDB 后端）。
   - **Git 原生**：脚本版本化在 `.surql` 文件中，支持标准 CI/CD。
 
-**挑战：AI 不熟悉**：LLM 对 SurQL 的熟练度低于 SQL，可能拖慢初始开发或导致"幻觉"语法。
+**挑战：AI 不熟悉**：LLM 对 SurrealQL 的熟练度低于 SQL，可能拖慢初始开发或导致"幻觉"语法。
 
-- **防御**：SurQL 支持 **SQL 兼容语法模式**用于传统查询。这为 AI 辅助生成基础 CRUD 提供了安全的回退，而命令式逻辑保留在 SurQL 中。
+- **防御**：SurrealQL 支持 **SQL 兼容语法模式**用于传统查询。这为 AI 辅助生成基础 CRUD 提供了安全的回退，而命令式逻辑保留在 SurrealQL 中。
 - **行动项**：构建内部**代码片段和提示库**以弥合 AI 知识差距。
 
 ### 结论
 
-原生可组合性、减少网络开销和统一逻辑层带来的生产力收益超过了初始学习成本。SurQL 将范式从"应用编排数据"转变为"应用驻留在数据中"。
+原生可组合性、减少网络开销和统一逻辑层带来的生产力收益超过了初始学习成本。SurrealQL 将范式从"应用编排数据"转变为"应用驻留在数据中"。
 
 ### 案例：Embedding 生成的计算下推
 
@@ -362,31 +362,31 @@ Python 调用 Ollama API → 获取 embedding → 写入 SurrealDB
 | 路径 | 传输次数 | 存储位置 | 内存占用 |
 |------|----------|----------|----------|
 | Python 侧生成 | Ollama→Python + Python→SurrealDB = **2 次** | Python 进程 + SurrealDB = **2 处** | Python 持有 4KB/条（批量写入时成倍放大） |
-| SurQL 内部生成 | Ollama→SurrealDB = **1 次** | SurrealDB = **1 处** | Python 侧零占用 |
+| SurrealQL 内部生成 | Ollama→SurrealDB = **1 次** | SurrealDB = **1 处** | Python 侧零占用 |
 
 2. **多消费方维护成本**：记忆检索、Session RAG、Consolidation 等多个消费方都需要 embedding。embedding 生成逻辑封装在 SurrealDB 的 `fn::ollama::embed` 中，应用层零感知，各消费方共享同一个函数，无需各自维护。
 
-**路径 B（SurQL 内部生成，正确做法）**：
+**路径 B（SurrealQL 内部生成，正确做法）**：
 ```SurrealQL
 CREATE memories SET
     content = $content,
     embedding = (fn::ollama::embed('bge-m3', $content)).embeddings[0];
 ```
 
-**本质**：路径 A 是 SQL 时代的"应用编排数据"思维——应用层做计算，数据库做存储。路径 B 是 SurrealDB 的"计算下推"思维——embedding 生成是数据层的职责，不是应用层的。SQL 因为缺乏可组合性（无法在查询中调用外部函数），被迫选择路径 A；SurQL 的原生可组合性让路径 B 成为可能。
+**本质**：路径 A 是 SQL 时代的"应用编排数据"思维——应用层做计算，数据库做存储。路径 B 是 SurrealDB 的"计算下推"思维——embedding 生成是数据层的职责，不是应用层的。SQL 因为缺乏可组合性（无法在查询中调用外部函数），被迫选择路径 A；SurrealQL 的原生可组合性让路径 B 成为可能。
 
 ### 反驳："传统后端运维优势"的惯性思维
 
-在评估"是否应在 DB 层实现运维逻辑"时，常见的反对意见是 Python 后端在重试、并发控制、可观测性、模型切换等方面有天然优势。这些论点成立的前提是 SQL 的表达力不足——但 SurQL 不是 SQL。
+在评估"是否应在 DB 层实现运维逻辑"时，常见的反对意见是 Python 后端在重试、并发控制、可观测性、模型切换等方面有天然优势。这些论点成立的前提是 SQL 的表达力不足——但 SurrealQL 不是 SQL。
 
-| 反对意见 | 为何在 SurQL 中不成立 |
+| 反对意见 | 为何在 SurrealQL 中不成立 |
 |:---|:---|
-| **重试/circuit breaker** | SurQL 是图灵完备的 Rust-like 语言，写重试循环（`FOR` + `SLEEP` + 计数器）和降级逻辑（`TRY {} CATCH`）不比 Python 复杂。配置（`base_url`、`api_token`、`max_retries`）已在 `config` 表中，加字段即可。 |
+| **重试/circuit breaker** | SurrealQL 是图灵完备的 Rust-like 语言，写重试循环（`FOR` + `SLEEP` + 计数器）和降级逻辑（`TRY {} CATCH`）不比 Python 复杂。配置（`base_url`、`api_token`、`max_retries`）已在 `config` 表中，加字段即可。 |
 | **并发控制** | 这是**下游的职责**，不是 DB 层的。调用方根据响应时间做拥塞控制（AIMD），SurrealDB 暴露的系统表（`info()`）和 `/metrics` 端点比 Python 自己埋点更直接。 |
 | **可观测性** | SurrealDB 有 `/health`、`/metrics` 端点，系统表暴露内部状态。不需要 OpenTelemetry SDK 做中间层——直接从 DB 层获取，路径更短、更准确。 |
 | **模型热切换** | `UPSERT config SET value = { model: 'new-model' }`，所有消费方下次调用自动生效。比 Python 端改环境变量/重部署更干净，且支持灰度（按用户/租户路由到不同模型）。 |
 
-**本质**：这些"优势"是用 SQL 的能力边界去评估 SurQL 的产物。SurQL 的表达力已经覆盖了这些运维逻辑，而且因为紧贴数据层，实现更直接。Python 后端做这些反而多了一层间接性——数据在 DB，运维逻辑在 Python，两者通过网络通信，本质上是把简单问题复杂化。
+**本质**：这些"优势"是用 SQL 的能力边界去评估 SurrealQL 的产物。SurrealQL 的表达力已经覆盖了这些运维逻辑，而且因为紧贴数据层，实现更直接。Python 后端做这些反而多了一层间接性——数据在 DB，运维逻辑在 Python，两者通过网络通信，本质上是把简单问题复杂化。
 
 ### 并发控制与背压的组合设计
 
@@ -410,10 +410,10 @@ DB 层做背压反而引入震荡：`Ollama 过载 → SurrealDB 拒绝 → Pyth
 - **[KV 存储引擎](kv-storage-engine.md)**：大规模或可预测查询模式场景下 KV 替代 PG 的存储设计。
 - **[Lakehouse 研究](lakehouse-research.md)**：分析负载（OLAP）的列式选型与落地。
 - **[Redis 批判](redis-critique.md)**：网络 RTT 陷阱与缓存分层（SurrealDB 替代 Redis 的论证）。
-- **[嵌入式脚本语言选型](embedded-script-languages.md)**：SurQL 与 Rune/Steel/Koto 等的哲学一致性。
+- **[嵌入式脚本语言选型](embedded-script-languages.md)**：SurrealQL 与 Rune/Steel/Koto 等的哲学一致性。
 - **[Aura 架构 §5](aura-architecture.md)**：需要完全嵌入式 KV 与共识时的轻量方案。
 - **[MySQL 批判](mysql-critique.md)**：SQL 反模式与分片幻觉的对照。
 - **[反应式架构](flux-architecture.md)**：SurrealDB 的 Live Queries（WebSocket 实时推送）是反应式架构动态层的一个实现路径——客户端订阅数据变更事件，无需轮询。
-- **[现代编程语言设计](modern-language-design.md)**：SurQL 的泛 Rust 血统。
+- **[现代编程语言设计](modern-language-design.md)**：SurrealQL 的泛 Rust 血统。
 
 **统一的第一性原理**：不搞技术崇拜，只看真实的硬件物理限制与团队生产力。无论是数据库、脚本语言还是编辑器，都用同一把奥卡姆剃刀做决策。

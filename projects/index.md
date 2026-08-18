@@ -13,6 +13,6 @@
 | `architecture-choices.md` | 架构选择 | 网关选择、仓库策略（Zot+WG）、Redis/数据库批判 |
 | `kv-storage-engine.md` | KV 存储引擎架构 | 嵌入式 KV 架构设计、复合键编码与用例。交叉引用 redis-critique |
 | `../object-keyspace-mapping.md` | OKM：Object-Keyspace Mapping | 对标 ORM 的 KV 键空间映射过程宏。交叉引用 kv-storage-engine |
-| `../unified-data-layer.md` | SurrealDB 统一数据层 | 现代多模型引擎、SurQL 人体工程学、Redis/PG 插件的统一替代（根目录） |
+| `../unified-data-layer.md` | SurrealDB 统一数据层 | 现代多模型引擎、SurrealQL 人体工程学、Redis/PG 插件的统一替代（根目录） |
 | `skillforge.md` | SkillForge | 多引擎 Agent 框架（Agno + Hermes）：上下文传播、技能加载、工具格式化 |
 | `nixos-config.md` | NixOS 配置 | 基于 Flake 的 NixOS 主机（workstation、server、portable、qemu）、模块结构、便携更新工作流 |

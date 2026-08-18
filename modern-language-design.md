@@ -14,7 +14,7 @@ Python 看起来最短，但"短"不等于"简洁"。简洁的衡量标准是**�
 
 #### `let` 的清晰性
 
-Rust/Nushell/SurQL 等现代语言要求显式 `let` 声明变量。相比 Python 的隐式赋值 `x = 1`，多了一个关键字，但：
+Rust/Nushell/SurrealQL 等现代语言要求显式 `let` 声明变量。相比 Python 的隐式赋值 `x = 1`，多了一个关键字，但：
 
 - **语义明确**：`let x = 1` 一眼是变量绑定；Python 的 `x = 1` 在不同上下文可能是赋值、重绑定、属性设置
 - **模式匹配友好**：`let Some(x) = opt` 把解构和绑定融为一体，Python 做不到
@@ -24,7 +24,7 @@ Rust/Nushell/SurQL 等现代语言要求显式 `let` 声明变量。相比 Pytho
 
 #### 变量后置与类型推导
 
-现代语言普遍采用 `name: Type` 后置标注（Rust、Nushell、SurQL、TypeScript、Kotlin），而非 C 系的 `Type name`。原因：
+现代语言普遍采用 `name: Type` 后置标注（Rust、Nushell、SurrealQL、TypeScript、Kotlin），而非 C 系的 `Type name`。原因：
 
 1. **自动推导友好**：编译器从右值推导类型，后置标注让"先名字后类型"的阅读顺序与推导顺序一致——名字是语义主体，类型是可选补充
 2. **省略类型时自然**：`let x = 1` 省略类型完全无歧义；C 的 `int x = 1` 省略类型则语法不完整
@@ -32,7 +32,7 @@ Rust/Nushell/SurQL 等现代语言要求显式 `let` 声明变量。相比 Pytho
 
 C 系的前置声明 `int x` 是因为早期编译器需要单遍扫描、先知道类型再分配寄存器。这是 1970 年代硬件限制的遗产，不是好的设计。
 
-上面这些显式风格不是孤立的——SurQL、Nushell、Moonbit、Rust 等现代语言共享同一组设计基因：
+上面这些显式风格不是孤立的——SurrealQL、Nushell、Moonbit、Rust 等现代语言共享同一组设计基因：
 
 - **显式绑定**（`let`）而非隐式赋值
 - **类型后置 + 自动推导**
@@ -419,6 +419,6 @@ Rust 的多 trait 同名方法策略把这个差别钉死了（实测）：
 
 ## 交叉引用
 
-- **[统一数据层](unified-data-layer.md)**：SurQL 的"泛 Rust 血统"——与现代系统语言共享设计基因。
+- **[统一数据层](unified-data-layer.md)**：SurrealQL 的"泛 Rust 血统"——与现代系统语言共享设计基因。
 - **[Zig 与反智主义](go-zig-anti-intellectualism.md)**："简洁"的假象——通过阉割表达能力制造的幻觉。本文的反面论据来源。
 - **[ECS 实体组件系统](entity-component-system.md)**：ECS 作为"标签（一物多标签）"结构在游戏领域的干净例证——component 与 trait 同类。

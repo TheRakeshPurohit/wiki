@@ -388,4 +388,4 @@ Zig 当前的业界唯一不可替代价值，退守为基于 LLVM 的优秀 C/C
 ## 交叉引用
 
 - **[现代编程语言设计](modern-language-design.md)**：本文的反面论据来源——类型系统、抽象设施、复杂度守恒的正面论述。
-- **[统一数据层](unified-data-layer.md)**：SurQL 的"泛 Rust 血统"——与现代系统语言共享设计基因。
+- **[统一数据层](unified-data-layer.md)**：SurrealQL 的"泛 Rust 血统"——与现代系统语言共享设计基因。

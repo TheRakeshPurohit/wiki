@@ -57,7 +57,7 @@
 ## 3. 架构宪章 (Architecture Principles)
 * **考试工程 vs 范式转移 (Exam-Oriented Engineering vs Paradigm Shifts)**：
   * **拒绝**：靠“堆硬件”或“刷基准测试”（如 TPC-C, Dubbo 刷分）的技术。这些是“应试工程”，只在特定考卷上拿高分。
-  * **拥抱**：**范式转移**（如 SurQL 的一体化融合语言——查询、控制流、变量在同一个语法空间）。真正的一流工程是重新定义游戏，而不是在旧游戏中做到极致。但范式转移不等于无条件选择——SurrealDB 的分布式模式限制多、生态不成熟，详见 [统一数据层](unified-data-layer.md)。
+  * **拥抱**：**范式转移**（如 SurrealQL 的一体化融合语言——查询、控制流、变量在同一个语法空间）。真正的一流工程是重新定义游戏，而不是在旧游戏中做到极致。但范式转移不等于无条件选择——SurrealDB 的分布式模式限制多、生态不成熟，详见 [统一数据层](unified-data-layer.md)。
 * **一致性 > 可用性 (CP > AP)**：
   * 涉及事务日志、状态同步、数据血缘的核心路径，**必须**采用强一致性模型。
   * AP 模型的“最终一致性”（如基于 CRDT 的存储）往往是业务逻辑复杂度和数据损坏的万恶之源。
@@ -184,7 +184,7 @@
 * **AI-Native 知识策略 (The "Anti-Mainstream" Moat)**：
   * **不要记录主流知识**（如 "How to install Docker"）。AI 已经消化了海量公共 Token。
   * **只记录反主流知识 (Anti-Mainstream Knowledge)**：深水区的坑、内部“黑魔法”、工程真相（例如：为什么在图遍历场景下 SurrealDB 的 UX 碾压 PostgreSQL——但慢查询日志是企业版功能、分布式模式限制多）。
-  * **Wiki 是 AI 的盲区补充**：如果 Wiki 记录了"我们用 SurQL 解决 N+1 问题"，AI 就**绝不**再建议通用的 ORM。
+  * **Wiki 是 AI 的盲区补充**：如果 Wiki 记录了"我们用 SurrealQL 解决 N+1 问题"，AI 就**绝不**再建议通用的 ORM。
 
 ## 8. 经验法则 (Heuristics & Engineering Traps)
 * **网络 RTT > 引擎延迟**：

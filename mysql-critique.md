@@ -289,7 +289,7 @@ MySQL 是两个时代问题的叠加——初期是设计者在数据库领域�
 | **OLTP（事务密集）** | PostgreSQL | SSI 可序列化、JSONB、并行查询、原生分区 |
 | **嵌入式 / 单机** | SQLite | 零部署、ACID、窗口函数、FTS5 |
 | **分析型查询（OLAP）** | DuckDB | 列式存储、向量化执行、零部署 |
-| **多模型 / 图+文档+关系** | SurrealDB | SurQL 统一查询、图遍历、权限内置 |
+| **多模型 / 图+文档+关系** | SurrealDB | SurrealQL 统一查询、图遍历、权限内置 |
 | **分布式事务** | CockroachDB / TiDB | 默认可序列化、水平扩展 |
 | **遗留迁移** | PostgreSQL | 从 MySQL 迁移成本最低，生态兼容性最好 |
 

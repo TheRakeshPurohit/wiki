@@ -40,7 +40,7 @@
 |:--|:--|:--|
 | [AI 友好基础设施](ai-friendly-infrastructure.md) | | 声明式 OS、全链路排查、NixOS 为何最适合 AI |
 | [架构选择](architecture-choices.md) | | 网关选择、仓库策略（Zot+WG）、Redis/数据库批判 |
-| [统一数据层](unified-data-layer.md) | | SurrealDB 多模型引擎、SurQL 人体工程学、与 PG 的分层选型 |
+| [统一数据层](unified-data-layer.md) | | SurrealDB 多模型引擎、SurrealQL 人体工程学、与 PG 的分层选型 |
 | [湖仓研究](lakehouse-research.md) | | Iceberg/LanceDB/Delta Lake 选型 |
 | [HelixDB vs LanceDB](helixdb-vs-lancedb.md) | | 对象存储上 AI 数据栈的两种路线对比 |
 | [Aura 架构 §5](aura-architecture.md) | | Fjall + Openraft 分布式存算一体 |
