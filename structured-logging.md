@@ -96,11 +96,21 @@ infra.script-exec-start       ← skillforge.infra 模块
 
 ## 推荐的存储方案
 
-核心要求：**支持半结构化数据**（jsonb / variant / JSON 类型），主流关系型数据库都可以。
+核心原则：**存储与计算分离**。日志写入存储层（Postgres jsonb 或文件/对象存储），DuckDB 作为无状态查询层按需外挂。不需要 ETL 管道把数据搬运到专用分析引擎。
 
-### 第一选择：PostgreSQL (jsonb)
+### 架构总览
 
-PostgreSQL 的 jsonb 是日志存储的理想选择：
+| 方案 | 写入路径 | 查询路径 | 每日规模 | 运维成本 |
+|------|---------|---------|---------|---------|
+| Postgres + DuckDB 网关 | jsonb 盲插，ACID 保障 | DuckDB 远程下推，就地计算 | GB ~ 数百 GB | 低 |
+| JSONL/Parquet + DuckDB | 文件追加，零基础设施 | DuckDB 直接读文件 | GB ~ 几十 GB | 极低 |
+| ClickHouse | MergeTree 批量导入 | 内置列式 MPP | TB ~ PB | 高 |
+
+### 第一选择：PostgreSQL (jsonb) + DuckDB 网关
+
+PostgreSQL 负责写入，DuckDB 负责分析。两层各司其职，互不耦合。
+
+PostgreSQL 的 jsonb 是日志写入的理想选择：
 
 - **写入免解析**：JSON 对象直接插入，不需要预处理
 - **查询精确**：按任意字段精确匹配，支持 GIN 索引加速
@@ -108,6 +118,7 @@ PostgreSQL 的 jsonb 是日志存储的理想选择：
 - **主流成熟**：运维团队都熟悉，不需要额外学习
 
 ```sql
+-- Postgres: 写入侧 schema
 CREATE TABLE logs (
     id         bigserial PRIMARY KEY,
     ts         timestamptz NOT NULL DEFAULT now(),
@@ -125,7 +136,7 @@ CREATE INDEX idx_logs_ts ON logs (ts DESC);
 CREATE INDEX idx_logs_data ON logs USING gin (data);
 ```
 
-查询示例：
+日常精确查询走 Postgres：
 
 ```sql
 -- 某用户最近的错误日志
@@ -133,20 +144,61 @@ SELECT * FROM logs
 WHERE user_id = 'u_abc123' AND level = 'error'
 ORDER BY ts DESC LIMIT 50;
 
--- 某个事件的 P99 耗时
-SELECT percentile_cont(0.99) WITHIN GROUP (ORDER BY (data->>'duration_ms')::numeric)
-FROM logs
-WHERE event = 'engine.db-restore-context'
-  AND ts > now() - interval '1 hour';
-
 -- jsonb 按任意键查询
 SELECT * FROM logs
 WHERE data @> '{"model": "gpt-4"}';
 ```
 
-### 第二选择：ClickHouse
+重聚合分析走 DuckDB——通过 `postgres_scanner` 远程下推，就地消费 Postgres 数据：
 
-适合日志量极大（每天 TB 级）的场景。列式存储 + 向量化执行，聚合查询极快。
+```sql
+-- DuckDB 通过 ATTACH 连接 Postgres，下推聚合查询
+-- 某个事件的 P99 耗时（列式向量化，比 Postgres 原生快一个数量级）
+ATTACH 'dbname=myapp' AS pg (TYPE postgres);
+
+SELECT percentile_cont(0.99) WITHIN GROUP (ORDER BY (data->>'duration_ms')::double)
+FROM pg.logs
+WHERE event = 'engine.db-restore-context'
+  AND ts > now() - interval '1 hour';
+```
+
+DuckDB 作为无状态查询层的关键优势：
+
+- **零常驻开销**：无查询时近乎零资源消耗，有查询时按需启动
+- **高并发多租户**：可拉起多个隔离实例，天然适配 SaaS 多租户日志看板。Postgres 单点难以承受 1000 个并发分析查询，DuckDB 网关层轻松化解——每个租户一个轻量实例，各自隔离，各自下推
+- **不搬运数据**：通过远程下推就地计算，不需要 ETL 管道把数据导入专用分析库
+
+### 第二选择：JSONL/Parquet + DuckDB
+
+最简单的方案，适合开发和小规模部署。日志直接写 JSONL 或 Parquet 文件，DuckDB 直接查——本地或远端对象存储。
+
+```bash
+# 本地直接查
+duckdb -c "SELECT * FROM read_json('logs/*.jsonl') WHERE event = 'engine.db-restore-context'"
+```
+
+日志量大时，将 Parquet 文件放 S3/MinIO，DuckDB 通过 `httpfs` 直接读对象存储：
+
+```sql
+-- DuckDB 读 S3 上的 Parquet，按分区剪枝
+SELECT event, count(*) AS cnt,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99
+FROM read_parquet('s3://logs/2026/08/*.parquet', hive_partitioning=true)
+WHERE level = 'error' AND user_id = 'u_abc123'
+GROUP BY event;
+```
+
+### 第三选择：ClickHouse（极端规模专用）
+
+适合日志量极大（**每天 TB ~ PB 级**）的场景。分布式 MPP 架构 + 列式存储 + 向量化执行，聚合查询极快。
+
+但选择 ClickHouse 之前需要明确：每天数百 GB 以下的日志分析，Postgres + DuckDB 网关即可覆盖，不需要 ClickHouse 的运维复杂度。
+
+ClickHouse 的真正壁垒在于极端规模：
+
+- **分布式分片与副本**：集群级高可用与水平扩展，DuckDB 单机无法替代
+- **实时物化视图**：写入即聚合，适合需要亚秒级刷新的实时看板
+- **硬件级列式压缩**：MergeTree 的稀疏索引 + 压缩在 PB 级数据下无可替代
 
 ```sql
 CREATE TABLE logs (
@@ -161,17 +213,11 @@ ORDER BY (event, ts)
 PARTITION BY toYYYYMM(ts);
 ```
 
-### 第三选择：JSONL 文件
-
-最简单的方案，适合开发和小规模部署。查询用 `duckdb` 直接查：
-
-```bash
-duckdb -c "SELECT * FROM read_json('logs/*.jsonl') WHERE event = 'engine.db-restore-context'"
-```
+> ClickHouse 的硬伤是数据必须导入到它的私有存储格式（MergeTree）。存储与计算耦合——分析引擎同时绑定存储层。每天几百 GB 的日志分析不需要为此付出运维代价。
 
 ### Lakehouse
 
-同样可行，但需要持久服务进行攒批写入，否则存在数据丢失风险。适合已有 Lakehouse 基础设施的团队。
+同样可行，但需要持久服务进行攒批写入，否则存在数据丢失风险。适合已有 Lakehouse 基础设施的团队。详见 [Lakehouse 研究](lakehouse-research.md)。
 
 ### 不推荐的方案
 
@@ -203,6 +249,21 @@ logger.info("db-restore-context", session_id=sid, duration_ms=42)
 - 避免时区转换的歧义
 - 排序天然正确
 - 存储和传输无损
+
+### 为什么存储与计算分离
+
+传统日志分析架构的根本问题：存储引擎和分析引擎耦合在一起。ClickHouse 同时承担存储（MergeTree）和计算（向量化执行），数据必须导入到它的私有格式才能分析。这带来三个代价：
+
+1. **ETL 管道成本**：日志必须经过清洗、导入管道才能进入分析引擎，违背"存储免解析"原则
+2. **常驻资源浪费**：无论有无查询，分析引擎实例必须常驻，消耗内存和 CPU
+3. **并发瓶颈**：为重查询设计的引擎（如 ClickHouse）难以应对高并发多租户场景
+
+DuckDB 的 `postgres_scanner`（远程下推到 Postgres）和 `httpfs`（直读对象存储）使得存储与计算可以解耦：
+
+- **存储层**：Postgres jsonb（事务性写入）或 S3/Parquet（不可变冷存）
+- **计算层**：DuckDB 作为无状态网关，按需启动，就地消费存储层数据
+
+这符合本文档的核心原则"存储免解析"：日志写入存储时不需要预处理，DuckDB 查询时直接消费原始格式（jsonb / JSONL / Parquet），不需要 ETL 管道。详见 [统一数据层](unified-data-layer.md) 路径 B 的存算分离设计。
 
 ### 为什么不用结构化日志库的 JSON Schema
 
