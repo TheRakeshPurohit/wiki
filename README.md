@@ -98,6 +98,7 @@
 |:--|:--|:--|
 | [AI 时代组织](ai-era-organization-individual.md) | | 约束-解分析方法论、联邦化、个体崛起 |
 | [AI 时代商业模式](ai-era-business-models.md) | | AI 对商业模式的重塑 |
+| [市场形态全谱系](market-form-spectrum.md) | | 服务/产品/创作者/资产/投机/中介六形态与个人适配、认知操作系统轴、天赋勘探提示词 |
 | [AI 流动性](ai-liquidity-camp.md) | | AI 时代的流动性分析 |
 | [Karpathy AI 编码方法论](karpathy-ai-coding-methodology.md) | | Karpathy 的 AI 编码实践 |
 | [国内 AI 产业制度性缺陷](ai-industry-institutional-critique.md) | | 蒸馏/刷分现象、评审体制逆向选择、自由市场 vs 国家主导 |
