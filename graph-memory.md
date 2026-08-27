@@ -411,7 +411,31 @@ Prefix Checkpoint 方案下，压缩融入 Agent 的正常 turn——阈值到�
 
 提取机制不变（LLM 通过 `memory_store` tool call），只是输出格式从 flat 变为 structured。
 
-**可视化管线**：bracket 格式（`head[TYPE]RELATION[props]tail[TYPE]`）可确定性转换为 Mermaid 和 Cytoscape.js，不需要 LLM 参与。Mermaid 用 dagre 层次化布局（适合检查三元组提取是否正确），Cytoscape.js 用力导向布局（适合检查聚簇效果）。两者同一输入、两个输出。
+**序列化与可视化**：三元组权威格式为 **KDL**——每个 `triple` 一个节点，固定 `head`/`rel`/`tail` 三个角色子节点：
+
+```kdl
+triple {
+  head  <类型> <实体值> [head_props]
+  rel   <关系> [relation_arg] [relation_props]
+  tail  <类型> <实体值> [tail_props]
+}
+```
+
+- `head`/`tail`：arg0 = 类型标签（小写单 token），arg1 = 实体值（有空格才引号）；节点 props = 实体的属性
+- `rel`：arg0 = 关系（大写下划线）；节点 props = 关系的修饰（时间 / 条件 / 原因 / 强度）
+- **空 props 不写**；类型词表开放
+
+示例（`head_props`/`relation_props`/`tail_props` 全带 + 规则/逻辑类关系）：
+
+```kdl
+triple {
+  head  project "银河"  priority=high
+  rel   IMPLIES reason="受控写放大、保留因果链"  confidence=0.9
+  tail  architecture "事件溯源"  status=chosen since="2026-08"
+}
+```
+
+KDL 可确定性转换为 Mermaid 和 Cytoscape.js 渲染（不需要 LLM 参与；bracket `head[TYPE]RELATION[props]tail[TYPE]` 仅作线内展示）。Mermaid 用 dagre 层次化布局（适合检查三元组提取是否正确），Cytoscape.js 用力导向布局（适合检查聚簇效果）。两者同一输入、两个输出。
 
 #### 缓存利用
 
