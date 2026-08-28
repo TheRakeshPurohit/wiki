@@ -8,7 +8,9 @@
 
 ## 一、定位与动机
 
-要的是**一种「浏览器使用模式」，不是某一款浏览器**：在 Niri（或任意平铺 WM）下，复刻 qutebrowser "最大化 webview、最小化 UI" 的观感，同时满足非模态、全键盘、外部可控，并与 launcher（walker）工作流自洽。
+要的是**一种「浏览器使用模式」，不是某一款浏览器**：在 Niri 下，复刻 qutebrowser "最大化 webview、最小化 UI" 的观感，同时满足非模态、全键盘、外部可控，并与 launcher（walker）工作流自洽。
+
+**硬约束 · WM 可精细控制**：整套模式依赖 WM 提供**接口/CLI 级精细控制**（窗口移动 / 聚焦 / 设列宽 / workspace 路由等 IPC 动作）。**niri、hyprland 满足要求**；**cosmic-de 目前似乎还不满足**（窗口层控制能力不足以支撑此模式）。
 
 触发痛点有二：
 
@@ -115,6 +117,7 @@ qw close <name>            关该实例（窗口 + workspace 收起）
 qw rm <name>               删 session（+其 profile/workspace）
 qw goto <url> | back | forward | reload
 qw focus <page>
+qw yank                  复制当前聚焦窗口地址到剪贴板
 qw quit                    关全部实例
 qw daemon start|stop|status
 ```
@@ -123,6 +126,7 @@ qw daemon start|stop|status
 - 拉起：`chromium --app=<url> --remote-debugging-port=<动态端口> --user-data-dir=<该 session profile> --no-first-run`（profile 内预置 SurfingKeys）
 - 开页 `Target.createTarget` / 关页 `Page.close` → 事件同步
 - 导航 `Page.navigate` / `reload` / `getNavigationHistory` / `navigateToHistoryEntry` / 聚焦 `Target.activateTarget`
+- **新窗口拦截（级联）**：`--app` 里 `_blank`/`window.open` 默认开成 chrome 窗口；qwd 维护注入脚本（拦 `window.open` 与 `a[target=_blank]` → Image beacon → 本地 `/open` → 新 `--app`）。**必须在每个新 page target 出现时注入**（`Target.targetCreated` → `Page.addScriptToEvaluateOnNewDocument`），否则 qwd 自己开出的新 `--app` 窗口没带脚本，里面再点新窗口又退回 chrome 默认（非 `--app`）。
 - 按地址精确控标签：`Target.getTargets` 列所有 target（url/title/type）→ 按地址/标题搜 → 命中 → `Target.activateTarget` 激活；错误页亦可。
 
 ### 事件同步（核心）
@@ -131,6 +135,7 @@ qw daemon start|stop|status
 ### 实现备注
 - Python 依赖仅一个非标准库：**`websocket-client`**（CDP 走 WebSocket，标准库没有；其余 sqlite3 stdlib）。
 - CDP 即 JSON 消息，直接手写很轻，不需 jsonrpc 封装。
+- 剪贴板（`qw yank`）走 Wayland `wl-copy`：用 CDP 取聚焦窗口 URL → 管道到 `wl-copy`。
 
 ## 八、已验证 / 待验证
 
