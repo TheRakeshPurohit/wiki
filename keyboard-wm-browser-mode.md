@@ -62,6 +62,18 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
   - **workspace**：进程的窗口路由到专用 workspace（如 `web:<name>`），菜单按 workspace 过滤，兼具分组意义。
   - **url**：页面 url 实时记录，可按地址过滤（见 §七）。
 - **热键分配**（暂缓，先纯命令行）：`Mod+Space` → 浏览器窗口菜单；cwdhist 暂不动。
+- **walker 模式与切换（`@` / `#`）**：不用多个前缀；两个键 + 全局状态（`walker_mode`、`op_mod`）即可：
+  - `@` 在 **session ↔ tab** 间翻转——`state.walker_mode` 已记录当前模式，翻到另一种即可。
+  - `#` 切换**操作模式** `state.op_mod=1/0`——仅当**当前激活窗口是 tab** 时有效：不是 tab 则 `#`
+    **无效**；是 tab 则进操作模式（对当前 tab 展示关闭、导航等操作），再按一次回到原 session/tab 模式。
+  - **session**：切换 / 创建 / 删除 session；输入一个不存在的名字 → **直接创建并切换**（k8s `ns` 语义）；
+    `state.current_session` 持久化，后续 tab 操作都基于当前 session（namespace 语义）。
+  - **tab**：搜当前 session 的打开窗口，`Enter` 切过去（`activateTarget` + niri focus window）；
+    `#`(op_mod) 下提供关闭等快捷操作。
+  - **全局 tab**（RSS / IM 等非 session 内）：所有 session 里都可显示/访问，属一个单独的常驻全局实例
+    （`session_id` 为 NULL），不随 `current_session` 改变。
+- **关闭语义**：qw 主动关闭 → 从 session **删除**该页（不留痕）；通过 niri 关窗 / 意外（崩溃）关闭 →
+  **保留**（仅标 closed，不删）——主动关不留痕，外部/意外关不丢。
 
 ## 七、实现设计（`qw` CLI，方案已定 2026-08-28）
 
@@ -82,6 +94,7 @@ sessions(id, name UNIQUE, workspace TEXT, instance_id FK,
 pages(id, session_id FK CASCADE, target_id, url, title,
       position INT, opened_at INT, closed_at INT NULL)
 site_widths(site TEXT PRIMARY KEY, proportion REAL)           -- 网址→列宽比例(0~1)
+state(key TEXT PRIMARY KEY, value TEXT)                       -- 全局状态: current_session / walker_mode(session|tab) / op_mod(1|0)
 ```
 - `pages` 关联 `instances`（窗口属于哪个进程），`url` 由 CDP `infoChanged` **实时更新** → 可地址过滤。
 
