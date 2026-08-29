@@ -79,6 +79,8 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 **术语**：**tab → page**（标签条里的"标签"改名 page，避免与 tag 混淆）。
 
+**页面树（`parent_id`）**：一个页面里打开的另一个页面是**子页**（CDP `openerId`）——页与打开它的页形成**树**。既有标签森林（内容组织轴）之外，这是页面的**打开关系**轴：用于**链接挖掘**（从"高价值父页引出的子页"反向发现）与**分拣**。
+
 ## 七、窗口管理与热键
 
 窗口管理目标：浏览器窗口自成一组，既方便单独唤起，又不淹没通用窗口切换器。
@@ -92,9 +94,24 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 - **walker 模式与切换**：把"当前上下文"（situation）作为切换主键——在 `inbox / work / personal / privacy` 间切换（默认 inbox），列表按 situation 过滤对应实例的 open pages；`#` 进入**操作模式**（对当前聚焦 page 提供关闭、收藏、复制链接等）。**page** 搜索 = 当前上下文实例的打开窗口，`Enter` 切过去（`activateTarget` + niri focus window）。全局 page（IM 常驻）在任意上下文都可访问（pin 实例），不随 situation 改变。
 - **关闭语义**：mudra 主动关闭 → 从归档**删除**该页（不留痕）；通过 niri 关窗 / 意外（崩溃）关闭 → **保留**（仅标 closed，不删）——主动关不留痕，外部/意外关不丢。
 
+**分拣：页面树 → workspace**：把某个页面连同它的**整棵子树**移到独立 workspace，用于归类（WM 层操作）。
+
+**launcher 交互（walker `s`/`t`/`a`/`o`）**——实际页面管理操作都在 launcher 层做成列选动作：
+- `t` = 页面列表 → 聚焦 / 关闭；
+- `s` = situation（当前上下文）切换（inbox / work / personal / privacy）；
+- `a` = 当前聚焦页动作（关闭 / 复制链接 / 打标）；
+- `o` = 排序（MRU / 时间 / 星序 → 写 `state.sort`）。
+动作回调 `mudra CLI`；列表按 tag / situation 过滤。
+
 ## 八、实现设计（`mudra` CLI，方向 tag 森林）
 
 选型：**B（每 isolated 实例一实例/工作区）并发版 + Python + 命令名 `mudra`**。
+
+### 交互分层（设计主线）
+交互分三层，职责分离、各自可脚本化/接入：
+1. **接口 / CLI（核心操作）**：`mudra` 命令——数据与页面操作的事实源（open / ls / focus / tag / star / col），无 UI 假设。
+2. **Launcher（实际的页面管理操作）**：walker 菜单——`s`/`t`/`a`/`o` 列选动作，选中回调 `mudra CLI`。
+3. **WM（展示相关）**：niri——workspace 布局、列宽、窗口映射；**页面树 → workspace** 移动（分拣）。
 
 ### 组件
 - **`mudra`**（CLI，Python）：命令入口，读 sqlite + 把控制命令发给 daemon。
@@ -104,14 +121,16 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 ### 数据模型
 ```sql
-tag(id, parent_id, name, isolated, required, rank, note)      -- 邻接表; 递归 CTE 查树
+tag(id, parent_id, name, alias, isolated, required, rank, hidden, note)  -- 邻接表; 递归 CTE 查树
 page_tag(page_id, tag_id)                                      -- 树间多行=多选; 树内单选 app 约束
 instances(id, profile TEXT, port INT, pid INT, running INT,    -- 隔离实例(1 isolated tag ↔ 1 instance)
          proxy TEXT, extensions TEXT)
-pages(id, instance_id FK, target_id, url, title,
-      position INT, opened_at INT, closed_at INT NULL)
+pages(id, instance_id FK, target_id, url, title, position INT,
+      opened_at INT, closed_at INT NULL,
+      parent_id INT REFERENCES pages(id))                     -- 页面树: 子页 = 由它打开的页(openerId)
 site_widths(site TEXT PRIMARY KEY, proportion REAL)           -- 网址→列宽比例(0~1)
 state(key TEXT PRIMARY KEY, value TEXT)                       -- current_context(situation) / sort / ...
+**DB 迁移策略（原型阶段）**：schema 变更直接删除 `mudra.sqlite` 重建，不做 ALTER 迁移——原型数据无持久价值。
 ```
 - `pages` 关联 `instances`（窗口属于哪个实例），`url` 由 CDP `infoChanged` **实时更新** → 可地址过滤。
 - `current_context` 取代 `current_session`（situation，默认 inbox）。
