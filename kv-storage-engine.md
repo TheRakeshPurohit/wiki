@@ -2,8 +2,8 @@
 
 **Status:** 持续演进
 **覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、redb（本地 B-tree）、SQLite 对比
-**架构：** [Aura 架构 §5](../aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
-**Cross-ref:** [Redis 批判](../redis-critique.md) — Redis 为何被 KV 替代
+**架构：** [Aura 架构 §5](aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
+**Cross-ref:** [Redis 批判](redis-critique.md) — Redis 为何被 KV 替代
 
 ## 核心论点
 
@@ -2021,7 +2021,7 @@ PG 退化为**元数据安全闸**——只管用户账户、组织权限、购�
 
 ## 交叉引用
 
-[Redis 批判](../redis-critique.md) 论证了 **Redis 在每个层面为何失败**：
+[Redis 批判](redis-critique.md) 论证了 **Redis 在每个层面为何失败**：
 - L0（进程内）：Redis 比本地内存慢 200-50,000 倍 → **Fjall 就是带持久化的 L0 实现**
 - L3（分布式协调）：Redis 没有共识 → **共识协议方案见 [共识协议文档](consensus-protocol.md)**
 

@@ -22,7 +22,7 @@
 - **改为 title 识别**：
   - ghostty 用 `window-title` 配置或用 OSC 2 把窗口标题钉成固定值：`printf '\033]2;ai-chat-float\007'`。
   - niri `window-rule match title="^ai-chat-float$"`；脚本里 `win.get("title") == "ai-chat-float"` 判等。
-- 与 `keyboard-wm-browser-mode.md` 的窗口过滤同思路：原生 Wayland 窗口可判元数据 = `app_id` 与 `title`；当 app_id 不可控时，title 前缀/全等是最稳的受控身份。
+- 与 [浏览器键盘模式](keyboard-wm-browser-mode.md) 的窗口过滤同思路：原生 Wayland 窗口可判元数据 = `app_id` 与 `title`；当 app_id 不可控时，title 前缀/全等是最稳的受控身份。
 
 ## 四、脚本
 

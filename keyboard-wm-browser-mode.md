@@ -4,7 +4,7 @@
 > **触发**: qutebrowser 的 modal 输入法痛点 → 一种"非模态、最小 UI、全键盘、外部可控"的浏览器使用方式
 > **定位**: 从全键盘 UX 工具升级为**信息流精炼**——浏览器是信息的主要流入途径
 > **上游参考**: qutebrowser/qutebrowser#3444（OPEN）
-> **通用内容组织模型**: 见 `tag-forest.md`
+> **通用内容组织模型**: 见 [标签森林](tag-forest.md)
 
 ---
 
@@ -67,7 +67,7 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 ## 六、内容组织：tag 森林（取代 session）
 
-页面不再按单归属的 session 组织，而是落进**标签森林**（多棵树、树间不互斥、树内单选、无单一根；退化情形覆盖普通多标签与传统分类两端。完整模型见 `tag-forest.md`）。
+页面不再按单归属的 session 组织，而是落进**标签森林**（多棵树、树间不互斥、树内单选、无单一根；退化情形覆盖普通多标签与传统分类两端，完整模型见 [标签森林](tag-forest.md)）。
 
 - **situation 树（必选、单选、默认 inbox）**：`inbox / work / personal / privacy`。决定**当前上下文**与隔离。新信息默认落 `inbox`，处理后移到对应维度值——**inbox 分流**。
 - **importance / urgency 树（两级、rank 排序）**：叶节点 `☆..☆☆☆☆☆`。评分即树，不是独立字段——`importance` 表示内容质量/价值，`urgency` 表示时效。域名/子域名规则表给叶 tag 打默认分（如 infoq 高重要、其用户贡献子域名低重要），手动覆盖。

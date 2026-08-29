@@ -137,7 +137,7 @@ returning id;
 
 ## 与现有实现的一致性
 
-- **scratch**（任务管理）已用标签树（邻接表）组织任务——本模型是其泛化与命名。见 `task-management.md`。
+- **scratch**（任务管理）已用标签树（邻接表）组织任务——本模型是其泛化与命名，见 [任务管理](task-management.md)。
 - **mudra**（浏览器会话管理）：用标签森林组织页面，`importance/urgency` 即重要性/紧急性树。见具体应用文档。
 
 ## 去 session：mudra 的应用

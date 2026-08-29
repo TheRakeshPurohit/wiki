@@ -82,6 +82,7 @@
 | [序列化协议分析对比](serialization-protocol-comparison.md) | | 序列化格式选型 |
 | [文档格式对比](document-format-comparison.md) | | Markdown 与下一代纯文本标记语言：按笔记/排版/出版用途分轴对比 Neorg、Org-mode、Typst、AsciiDoc |
 | [KDL vs 配置格式](kdl-vs-config-formats.md) | | 语义树 vs 数据网络：KDL 节点模式与 TOML/YAML/JSON/HTML 全景对比、工程坑点；KDL 作为配置生成中间层的复用价值 |
+| [标签森林](tag-forest.md) | | 多棵树互斥维度组成的内容组织：situation/importance·urgency 评分树、隔离实例、邻接表+递归CTE查询 |
 
 ## 工作流与技能
 
@@ -92,6 +93,7 @@
 | [Nushell 介绍](nushell-introduction.md) | | Nushell 入门 |
 | [Loop 工程分析](loop-engineering-analysis.md) | | Loop 工程方法论框架 |
 | [迭代闭环](iteration-closed-loop.md) | | 行动、复盘、转向：迭代闭环的结构骨架、心理阻塞与元能力 |
+| [信息流精炼](infoflow-refinement.md) | | 信息流管道捕获→属性化→精炼→消费：NB 评分·标题党一致性检测、html→md·链接挖掘、RSS、聚合摘要/态势感知 |
 
 ## AI 时代思考
 
@@ -119,6 +121,7 @@
 | [P2P 网格对比](p2p-mesh-networking-comparison.md) | | P2P 网状网络方案对比 |
 | [无状态认证选型](stateless-auth-selection.md) | | 无状态认证方案 |
 | [Gateway API 迁移](gateway-api-migration.md) | | Istio 到 Envoy HTTPRoute 迁移 |
+| [浏览器键盘模式](keyboard-wm-browser-mode.md) | | Niri + chromium --app + CDP 的全键盘浏览器模式：信息流精炼定位、tag 森林组织、mudra 底座 |
 
 ## 其他
 

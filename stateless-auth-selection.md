@@ -144,5 +144,5 @@ SSH 证书（不是 SSH key）是另一个被低估的无状态认证方案：
 
 | 文档 | 关联 |
 |:---|:---|
-| `architecture-choices.md` | 认证是架构选型的一部分 |
-| `ai-friendly-infrastructure.md` | 声明式配置与证书管理 |
+| [架构选择](architecture-choices.md) | 认证是架构选型的一部分 |
+| [AI 友好基础设施](ai-friendly-infrastructure.md) | 声明式配置与证书管理 |

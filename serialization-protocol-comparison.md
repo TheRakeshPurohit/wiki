@@ -221,7 +221,7 @@ IDL 本身没有问题——问题在 **IDL 是不是"标准数据格式"、能�
 
 **结论修正**：告别"专有语法 IDL"，走向两条路其中之一——要么 `postcard`（纯 Rust 内部，derive，类型即定义），要么 `Avro`（若需标准、程序可操作的 IDL + 跨语言 + 演进，JSON schema 是样板），以及 `CBOR`（跨语言/WASM，serde + 自描述）。**Avro 不该与 PB/Cap'n/FlatBuffers 归为一档**——它用标准 JSON 定义 schema，程序可方便操作，恰好规避了你反感的问题。
 
-**与 KV 的 DDL 呼应**：Cap'n / SBE 这种"字段 ID + 跳未知"的编码，正是 kv-storage-engine.md 里"整行打包用 Tagged/TLV 可演进序列化"的同一种思想——字段 ID 寻址 = KV DDL 的 TLV 方案。谱系上它是 postcard（静态）与 CBOR（动态）之间的合理折中：比 postcard 多了演进能力，比 CBOR 少了字段名开销。若剖到 schema 层面，"标准 vs 专有"同样适用：Avro 的 JSON schema 程序可操作，.proto 的专有语法则不行。
+**与 KV 的 DDL 呼应**：Cap'n / SBE 这种"字段 ID + 跳未知"的编码，正是 [KV 存储引擎](kv-storage-engine.md) 里"整行打包用 Tagged/TLV 可演进序列化"的同一种思想——字段 ID 寻址 = KV DDL 的 TLV 方案。谱系上它是 postcard（静态）与 CBOR（动态）之间的合理折中：比 postcard 多了演进能力，比 CBOR 少了字段名开销。若剖到 schema 层面，"标准 vs 专有"同样适用：Avro 的 JSON schema 程序可操作，.proto 的专有语法则不行。
 
 ### 方案 B3：零拷贝格式——rkyv / Arrow / Avro 的实际分工
 
