@@ -274,6 +274,39 @@ pub struct UserIndexNameCityKey {
 - **定宽是主键空间的资产，不是全局教条**："零解析零浪费"值得付 offset 算术成本，因为主键结构刚硬、且在热路径；姓名类索引扫描导向、读取热度次于主键，解析代价是一次读长度，微不足道，为它强行 padding/截断是在优化错的维度。**正确模型是两套布局 regime 并存**：主键定宽 + 索引可变长，不是互相否定、是各归其位。
 - **hex 稳定性测试不丢**：变长锁的不再是"具体文本的字节"（本无固定字节），而是**编码方案本身**——长度前缀布局、长度字节端序、`len` 取值上限等，用固定样本锁住，防止日后无意改编码致旧 key 失联。防线照旧，只是锁的对象变了。
 
+## 编码 Wrapper 类型：字段级压缩（声明即自动编解码）
+
+`KvEncode` 把 kv-storage-engine 的编码原理封装成**字段级 wrapper 类型**——字段类型本身即契约，声明即自动编解码：
+
+```rust
+#[derive(KvEncode)]
+#[kv_ns(4)]  // logs
+pub struct LogEntryKey {
+    pub ts_offset: Offset<i32>,   // 分布集中 → 基准 + 有符号偏移（事件时间）
+    pub err_type:   Enum<u8>,     // 低基数 → 枚举编号（日志错误类型）
+}
+
+#[derive(KvEncode)]
+#[kv_ns(5)]  // metrics（append-only 序列）
+pub struct MetricKey {
+    pub seq_delta: Delta<i32>,    // 序列相邻差 → 常为正小值，配 VarInt 更省
+    pub kind:      Enum<u16>,     // 低基数指标种类
+}
+```
+
+| wrapper | 维度 | 编码 | 读路径 |
+|:--|:--|:--|:--|
+| `Enum<T>` | 基数 | 值 → 编号（`T` 位宽 = ⌈log₂基数⌉，映射为编译期常量，见命名空间字典） | O(1) 查表回译 |
+| `Offset<T>` | 分布 | `值 − 基准`（有符号；基准取近今，负偏移表达更早值） | 基准 + 偏移 |
+| `Delta<T>` | 序列 | 与前值差（可变长更省） | 顺序累加（随机/乱序访问须顺序重建） |
+| `VarInt<T>` | 位宽 | 常见小值 1 字节、大值扩展（LEB128） | 逐字节 continuation bit |
+| `Rle<T>` | 重复 | 连续相同 → `(值, 次数)` | 展开 |
+| `Quant<T>` | 量纲 | 时间降精度 / 归桶（ns→ms / 小时桶） | 放缩 |
+
+**宏只生成对应 wrapper 的编解码**：字段类型即契约——`Enum<u8>` 告诉框架"这字段只存 1 字节编号"，`Offset<i32>` 告诉框架"存有符号相对值"，`Delta<i32>` 告诉框架"与前值求差"。原理与取舍见 [kv-storage-engine](kv-storage-engine.md)「编码优化」。
+
+与**键布局（字段顺序/主键定宽 vs 索引变长）正交**：wrapper 是**压缩语义**（怎么存），不是**结构语义**（放哪个位置）；两者可叠加（`Offset<i32>` 字段本身仍参与前缀扫描、`Enum` 字段可作索引判别位）。
+
 ## 过程宏实现源码
 
 ### 宏编译器驱动（`kv_codec_derive/src/lib.rs`）
@@ -397,7 +430,17 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
                 });
                 current_offset += 4;
             }
-            _ => panic!("OKM 键空间只接受 [u8; N]、基础数值类型和 String（String 为变长字段）"),
+            Type::Path(tp) if is_coding_wrapper(&tp.path) => {
+                // 编码 wrapper（Enum / Offset / Delta / VarInt / Rle / Quant，见「编码 Wrapper 类型」）：
+                // 字段类型即契约，编解码统一由 emit_wrapper_codec 生成；定宽字段在变长字段之前仍保留编译期偏移
+                let (enc, dec, cap, width) = emit_wrapper_codec(&tp.path, quote! { #field_name });
+                encode_tokens.extend(enc.clone());
+                encode_prefix_tokens.extend(quote! { if idx > #field_idx { #enc } });
+                capacity_tokens.extend(cap);
+                decode_tokens.extend(dec);
+                current_offset += width;
+            }
+            _ => panic!("OKM 键空间只接受 [u8; N]、基础数值类型、编码 wrapper 和 String（String 为变长字段）"),
         }
         field_idx += 1;
     }
@@ -484,6 +527,55 @@ fn syn_parse_len(expr: &syn::Expr) -> usize {
         }
     }
     panic!("无法解析数组长度");
+}
+
+/// 编码 wrapper 类型（压缩语义，非结构语义）：Enum / Offset / Delta / VarInt / Rle / Quant，见「编码 Wrapper 类型」。
+fn is_coding_wrapper(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .map(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "Enum" | "Offset" | "Delta" | "VarInt" | "Rle" | "Quant"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 编码 wrapper → (encode, decode, capacity, 字节宽)。
+/// 字段类型即契约：Enum 存 u8 编号、Offset 存有符号基准差（基准近今）、Delta 存相邻差……（原理见 kv-storage-engine「编码优化」）
+fn emit_wrapper_codec(
+    path: &syn::Path,
+    field: proc_macro2::TokenStream,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream, usize) {
+    let w = path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+    match w.as_str() {
+        "Enum" => (
+            quote! { buf.extend_from_slice(&[#field]); },       // 低基数：值 → u8 编号（映射为编译期常量）
+            quote! { let #field = bytes[offset]; offset += 1; }, // 回译：编号 → 枚举值由外层 value 类型查表
+            quote! { + 1 },
+            1,
+        ),
+        "Offset" => (
+            quote! { buf.extend_from_slice(&(#field as i32).to_be_bytes()); }, // 有符号基准差
+            quote! {
+                let #field = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+            },
+            quote! { + 4 },
+            4,
+        ),
+        "Delta" => (
+            quote! { buf.extend_from_slice(&(#field as i32).to_be_bytes()); }, // 相邻差（配 VarInt 更省，示意为 i32）
+            quote! {
+                let #field = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+            },
+            quote! { + 4 },
+            4,
+        ),
+        _ => panic!("未知编码 wrapper: {w}"),
+    }
 }
 ```
 
