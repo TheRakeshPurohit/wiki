@@ -96,11 +96,11 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 **分拣：页面树 → workspace**：把某个页面连同它的**整棵子树**移到独立 workspace，用于归类（WM 层操作）。
 
-**launcher 交互（walker `s`/`t`/`a`/`o`）**——实际页面管理操作都在 launcher 层做成列选动作：
-- `t` = 页面列表 → 聚焦 / 关闭；
-- `s` = situation（当前上下文）切换（inbox / work / personal / privacy）；
-- `a` = 当前聚焦页动作（关闭 / 复制链接 / 打标）；
-- `o` = 排序（MRU / 时间 / 星序 → 写 `state.sort`）。
+**launcher 交互（walker `p`/`t`/`a`/`s`，键位定稿）**——实际页面管理操作都在 launcher 层做成列选动作：
+- `p` = **Page 模式**：页面列表 → 聚焦 / 关闭 / 移动到当前窗口 / 交换；
+- `t` = **tag 模式**：默认 situation 树（当前上下文）；**跨树可多选 / 树内单选**（situation / importance / urgency 单选、topic 可多选）；多选实现 = **累积缓冲（A，`keyboardShortcut`）** / **文本分隔（B 兜底）**；
+- `a` = **Action 模式**：当前聚焦页动作（关闭 / 复制链接 / 打标 / 评分 / 隔离）；
+- `s` = 排序（MRU / 时间 / 星序 → 写 `state.sort`）。
 动作回调 `mudra CLI`；列表按 tag / situation 过滤。
 
 ## 八、实现设计（`mudra` CLI，方向 tag 森林）
@@ -110,7 +110,7 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 ### 交互分层（设计主线）
 交互分三层，职责分离、各自可脚本化/接入：
 1. **接口 / CLI（核心操作）**：`mudra` 命令——数据与页面操作的事实源（open / ls / focus / tag / star / col），无 UI 假设。
-2. **Launcher（实际的页面管理操作）**：walker 菜单——`s`/`t`/`a`/`o` 列选动作，选中回调 `mudra CLI`。
+2. **Launcher（实际的页面管理操作）**：walker 菜单——`p`/`t`/`a`/`s` 列选动作，选中回调 `mudra CLI`。
 3. **WM（展示相关）**：niri——workspace 布局、列宽、窗口映射；**页面树 → workspace** 移动（分拣）。
 
 ### 组件

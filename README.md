@@ -133,6 +133,7 @@
 | [坐姿工作范式](seated-work-paradigm.md) | | 坐姿与工作方式 |
 | [工程思维与工程素养](engineering-mindset-and-competence.md) | | 工程师双核心能力：认知决策模型（思维）与职业行为规范（素养） |
 | [可视化迷思](visual-myth.md) | [The Myth of Visualization](visual-myth-en.md) | 可视化形式的结构性批判 |
+| [图形语法与 AI 可视化](grammar-of-graphics.md) | | 图形语法理论（Data→Scale→Aesthetics→Geom→Coord）+ AI 出图选型（Vega-Lite vs AntV F2 vs ApexCharts）|
 | [Qwen 到 MiMo 迁移](qwen-to-mimo-migration.md) | | 模型迁移记录 |
 | [Neovim AI 规则](neovim-0.12-ai-rules.md) | | Neovim 0.12 AI 辅助规则 |
 
