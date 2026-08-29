@@ -96,12 +96,12 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 **分拣：页面树 → workspace**：把某个页面连同它的**整棵子树**移到独立 workspace，用于归类（WM 层操作）。
 
-**launcher 交互（walker `p`/`t`/`a`/`s`，键位定稿）**——实际页面管理操作都在 launcher 层做成列选动作：
-- `p` = **Page 模式**：页面列表 → 聚焦 / 关闭 / 移动到当前窗口 / 交换；
-- `t` = **tag 模式**：默认 situation 树（当前上下文）；**跨树可多选 / 树内单选**（situation / importance / urgency 单选、topic 可多选）；多选实现 = **累积缓冲（A，`keyboardShortcut`）** / **文本分隔（B 兜底）**；
-- `a` = **Action 模式**：当前聚焦页动作（关闭 / 复制链接 / 打标 / 评分 / 隔离）；
-- `s` = 排序（MRU / 时间 / 星序 → 写 `state.sort`）。
-动作回调 `mudra CLI`；列表按 tag / situation 过滤。
+**launcher 交互（walker）**——launcher 层承载**热路径单动作**，富交互交给面板：
+- `p` = **Page 模式**（保留）：页面列表 → 聚焦 / 关闭 / 移动到当前窗口 / 交换。
+- **tag 富操作（评分轴、tag 多选批量、排序）移交给管理面板**（`mudra ui`，solidjs）。
+  早期草案的 `t`（tag）/`a`（Action）/`s`（sort）三模式被面板吸收，launcher 不再承担。
+  面板规格见 mudra 仓 `docs/PANEL.md`。
+动作回调 `mudra CLI`；`p` 列表按 tag / situation 过滤。
 
 ## 八、实现设计（`mudra` CLI，方向 tag 森林）
 
