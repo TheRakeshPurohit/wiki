@@ -14,14 +14,14 @@
 写时重 ─────────────────────────────────── 读时重
 
 LLM Wiki        KG (属性图)      KV 模式        向量模式
-记忆宫殿        SurrealDB         SurrealDB       SurrealDB + RAG
-                (graph records)   (KV records)    (embedding index)
+记忆宫殿        PGQ               Postgres        Postgres + pgvector
+                (property graph)  (relation)      (embedding index)
 
 写: 整理/嵌入/拓扑推断      写: 简单切分/存储
 读: 直接载入/遍历           读: 匹配/排序/向量搜索
 ```
 
-光谱上的位置不代表不同的存储产品——SurrealDB 的多模型架构覆盖全部区间。位置取决于**使用方式**：graph record 走写时重，KV record 走读时重，embedding index 在中间。
+光谱上的位置不代表不同的存储产品——Postgres 通过图/关系/向量三种形态覆盖全部区间。位置取决于**使用方式**：property graph（PGQ）走写时重，关系表走读时重，embedding index 在中间。
 
 ### 写时计算（Write-Time Heavy）
 
@@ -51,7 +51,7 @@ LLM Wiki        KG (属性图)      KV 模式        向量模式
 
 写入时建立实体关系和属性，但不做深度拓扑推断。读取时支持精确遍历和路径查询，但不需要向量匹配的计算开销。
 
-**代表**：SurrealDB（graph records）、属性图数据库、带权重的三元组存储。
+**代表**：PGQ（`CREATE PROPERTY GRAPH`）、属性图数据库、带权重的三元组存储（详见 [property-graph-queries](property-graph-queries.md)）。
 
 **优势**：写入成本适中（建立关系即可），读取确定性高（图遍历是确定性的）。支持多跳推理（A → B → C 的传递关系），这是向量检索做不到的。
 
@@ -167,7 +167,7 @@ Agent 记忆需要同时满足两个矛盾的需求：
 |:---|:---|:---|
 | **事实** | `(entity, relation, entity)` | `(Postgres, supports, pgvector)` |
 | **规律** | `(condition, implies, result)` | `(高并发+写密集, implies, 用PG不用SQLite)` |
-| **逻辑** | `(premise, therefore, conclusion)` | `(cognee不支持SurrealDB, therefore, 统一栈选Postgres)` |
+| **逻辑** | `(premise, therefore, conclusion)` | `(权限 = 图可达性, therefore, 用 PGQ 属性图查询做剪枝)` |
 | **偏好** | `(user, prefers, thing)` | `(user, prefers, 保守操作)` |
 
 偏好的权重处理特殊：`tool_invoke_count` 不适用（偏好不是工具调用），但 `read_count` 会很高（每轮注入）。偏好的 `time_decay` 应该更慢——偏好是稳定的。
@@ -227,12 +227,12 @@ Cognee 确实有类似的 framing 步骤——它在提取图之前先做一层 
 按"为什么"的推理链分组。不是按实体（谁）、不是按时间（何时），而是按因果逻辑（为什么）。
 
 ```
-判断节点 "SurrealDB 架构选型"
-├── 边: SurrealDS = 分布式事务引擎
-├── 边: RocksDB = 单节点存储
-├── 边: 查询层与存储层分离 → 对上层透明
-├── 边: Object storage = Scale 付费特性
-└── 边: BSL 许可证 → 社区版可用但无 S3
+判断节点 "权限可达性选型"
+├── 边: 权限 = 图可达性剪枝
+├── 边: 属性图用 PGQ 声明 (CREATE PROPERTY GRAPH)
+├── 边: 一图多关系 → 同信任域并入一张图
+├── 边: GRAPH_TABLE 混合遍历 → 沿 membership+hierarchy 到 skill
+└── 边: 严格边用表权限锁死 → 用户-组织关系只人工写
 ```
 
 这条链的每条边单独检索出来都意义有限，但作为因果链放在一起，就是一个完整的技术判断。
@@ -692,6 +692,7 @@ LLM Wiki 是写时计算的极端——人工整理，结构固定，读取确�
 
 ## 交叉引用
 
+- **[Property Graph Queries](property-graph-queries.md)**：图在关系库里的定义与查询落地——以 SQL/PGQ 为标准，一图多关系、多图判据、跨图走底层表、严格性按边分、关系类型的动态化。
 - **[Agent 记忆选型](agent-memory.md)**：现有方案分析（agentmemory vs cognee、四象限全景、与本文档的逐项对照）。
 - **[Agent 复利](agent-compound-interest.md)**：复利机制中"记忆积累"在属性图中的具体实现路径。
 - **[知识三元组抽取技能](../skills/knowledge-triplets/SKILL.md)**：抽取格式定义，本文档的写入层规范。
