@@ -1442,10 +1442,33 @@ Realm 分发时，对每个匹配的 Route 按 mode 分别处理：On 直接投�
 | **Orleans Virtual Actor** | Actor 按需激活，"一直存在" | .NET 运行时；Grain 间通信是直接方法调用，不是事件总线；无嵌入式 KV |
 | **Proto.Actor** | Go 实现，有 EventStream | Go runtime；事件总线是辅助；无嵌入式存储 |
 | **Actix（Rust）** | Rust Actor 框架 | 无事件总线（Actor 间直发）；无分布式；无嵌入式脚本/沙箱；无共识 |
+| **tellus（Rust）** | 经典近距离 Actor：状态机建模，`Message/State/Error` 三关联类型 | 无事件总线、无分布式、无嵌入式存储；但状态机建模的多处设计值得借鉴（见下） |
 
 没有现有框架同时做到：事件总线作为主通信原语 + 嵌入式多语言 + 嵌入式 KV（Scale-to-Zero）+ Raft 共识跨节点 + 无外部消息队列。
 
+### 5.9.1 tellus 状态机建模的可借鉴之处
+
+tellus 的核心立场是**「actor 是状态机，而不是带可变字段的对象」**——`State` 作为关联类型按值传入 `receive(state, msg) -> Control::Continue(next)/Stop`，可变数据全塞进 State 跨消息传递，actor 值本身只是 unit struct。这与 Aura 的 `ctx.state`（统一状态树、handler 内原地可变）是两个极端。Aura 不照搬其按值传递（多语言脚本 + KV 持久化下状态是跨语言 blob，无法也不应在 handler 间整体 move）。逐条权衡：
+
+**错误建模（tellus 的 `Error` 关联类型）——不引入第二条错误通道。**
+
+tellus 的 `Error` 是单一语言（Rust）类型系统的产物：同一种语言有统一错误表示，`Result<T, E>` 能全程静态检查。这条在 Aura 不成立，是**语言级事实，不是架构可选**：
+
+- **失败已经是返回值的一部分**：handler 的 `returns` 就是业务值，失败作为带 `error` 字段的对象返回，或 emit 一个专用 error 对象，均属"返回值即唯一结果通道"，已是干净设计，无须第二条错误通道。
+- **跨语言不存在统一错误类型**：Python 异常、Steel 结构、Rust Result，语法与检查机制各异，Aura 没有营造"语言统一错误模型"的空间。
+- **强行统一要在 JSON 边界做错误协议**：序列化 + 判别 + 反序列化，正常路径也被污染，成本远大于收益。
+
+因此 Error 建模差异是语言机制差异，不照搬是正确取舍，而非能力缺失。
+
+**不值得借鉴的部分**：`State` 按值整体传递与显式 `Control::Stop` 指令——前者与 KV 增量落盘冲突（会放大 I/O、破坏 WAL 写模型），后者已被 supervisor 与 passivation 接管，照搬属过度借用。tellus 的 `Nothing`（无消息 supervisor）在 Aura 没有对应落点——Aura 的无状态不在 actor 层而在运维层（API 有状态、运维无状态：actor 开发者按有状态变量编程，状态持久化/恢复/scale-to-zero 全程由底层接管），引入"无状态 actor"类别与系统本质目标相反。
+
 ### 5.10 Aura 的根本区别
+
+**先定性：既非传统 Actor 模型，也非 CSP——是「场域化事件总线的 actor 封装」的混合体。**
+
+传统 Actor 模型的三根支柱——actor 树（监管层级）、ActorRef 一等收件箱、tell/ask 直发——Aura 都没有（或只有退化形态）：无监管树（仅保留崩溃重启式 supervision，§5.8）、无 ActorRef 一等收件箱（内部 bounded mailbox 只是路由之下的串行化 + 背压实现细节，不可寻址）、通信靠匿名事件总线而非直发。它不是 CSP：没有显式类型化 channel，也没有同步会合（rendezvous）——`emit` 是 fire-and-forget 的 pub/sub。
+
+Aura 从 actor 保留下来的是**封装性**：state 按 partition key 隔离、单线程串行消费、实例状态自持。真正的新东西是把**事件总线升格为主通信原语**（见第 1 条），用一个共享场域（Event Realm）替代 per-entity 的寻址队列——一片匿名 pub/sub 黑板，不关心谁发射、谁处理。
 
 **1. 事件总线是主通信原语，不是辅助**
 
