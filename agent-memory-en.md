@@ -78,7 +78,7 @@ Prefix Checkpoint works differently:
 
 The summary is the "prefix" (Prefix), fixed and immutable; "Checkpoint" is the save point. After each new checkpoint, old messages are cleared and accumulation restarts.
 
-**Why traditional compression can't use cache**: The traditional approach sends 100 messages to a separate model (or makes a separate API call) to generate a summary. This call has no cache relationship with previous conversations — even with the same model, it sees entirely new text, KV cache computes from scratch, cache hit rate 0%.
+**Why traditional compression can't use cache**: The traditional approach sends 100 messages to a separate model (or makes a separate API call) to generate a summary. This call has no cache relationship with previous conversations — even with the same model, it sees entirely new text, Context Cache computes from scratch, cache hit rate 0%.
 
 Prefix Checkpoint is different: those 100 messages are already in cache (used in every previous turn). The compression instruction is just a small piece of new text appended at the end. When the model processes it, 99% of tokens hit cache directly, only the final instruction + user question requires new computation.
 
@@ -169,7 +169,7 @@ These are the memory system's five complementary trigger methods:
 
 | Method | Mechanism | Cache Friendliness |
 |:--|:--|:--|
-| **Full Injection** | Inject all history every turn | Poor (content changes each turn, KV cache invalidation) |
+| **Full Injection** | Inject all history every turn | Poor (content changes each turn, Context Cache invalidation) |
 | **top-K Retrieval** | Retrieve relevant memories each turn | Medium (retrieval results may change) |
 | **Checkpoint + Increment** | Immutable checkpoint + recent N messages | High (checkpoint fixed, permanently cacheable) |
 
@@ -193,7 +193,7 @@ Messages are appended one by one to the prompt (not reassembled each time). The 
 
 ```
 Turn 1: [ckpt] + [msg_101]
-Turn 2: [ckpt] + [msg_101] + [msg_102]       ← Previous tokens use KV cache
+Turn 2: [ckpt] + [msg_101] + [msg_102]       ← Previous tokens use Context Cache
 Turn 3: [ckpt] + [msg_101] + [msg_102] + [msg_103]
 ...
 Turn N: Reaching threshold → Integrate into next Agent turn for compression
@@ -208,7 +208,7 @@ Turn N+1: [ckpt_1] + [User question X] + [Agent answer Y]
 **Prefix Checkpoint**: After threshold is reached, on the next user question, the memory system appends a special message (not system prompt) at prompt end:
 
 ```
-KV cache (unchanged):
+Context Cache (unchanged):
   [ckpt] + [msg_101..msg_150]
 
 Newly appended message (only uncached part):
@@ -240,14 +240,14 @@ Even if the prompt modifies the user message to trigger compression (appending i
 
 **Why this design**:
 - **No Agent loop modification** — Compression through normal tool calls, memory system fully controls
-- **No separate LLM call** — Reuses Agent's normal turn, answer + compress share KV cache
+- **No separate LLM call** — Reuses Agent's normal turn, answer + compress share Context Cache
 - **Cache naturally hits** — History fully cached, only compression instruction + user question are new tokens
 - **User experience seamless** — Answers user normally, behind-the-scenes completes compression and memory extraction
 - **History auto-cleanup** — After turn ends old messages no longer needed, history becomes `checkpoint_1 + X + Y`
 
 **Why cache-friendly**: Checkpoint is immutable once written, all subsequent turns share the same checkpoint text. LLM API's prompt caching stores checkpoint in GPU VRAM, only the increment changes each time. As increment messages grow and next checkpoint triggers, increment is compressed into new fixed summary, cache hits again.
 
-**Comparison with Agno sliding window**: Agno's `add_history_to_context` reads the last N complete messages from DB each time. As new messages arrive, N's composition constantly changes (old dropped, new added), KV cache invalidates each turn. In checkpoint mode, history is compressed into fixed summary, only the uncompressed increment part changes, cache continuously hits.
+**Comparison with Agno sliding window**: Agno's `add_history_to_context` reads the last N complete messages from DB each time. As new messages arrive, N's composition constantly changes (old dropped, new added), Context Cache invalidates each turn. In checkpoint mode, history is compressed into fixed summary, only the uncompressed increment part changes, cache continuously hits.
 
 ### Framework Adaptation
 
@@ -290,14 +290,14 @@ Both formats can be output simultaneously in a single LLM call (dual-layer outpu
 
 Instruct LLM in system prompt to simultaneously output user response and extract triple function calls, completing two things in one response.
 
-Problems: (1) Requires Agent framework modification; (2) Function calls interfere with LLM attention on user response; (3) New function call tokens each turn, KV cache hit rate low. → See [Graph Memory](graph-memory.md) §Parallel Extraction Mechanism
+Problems: (1) Requires Agent framework modification; (2) Function calls interfere with LLM attention on user response; (3) New function call tokens each turn, Context Cache hit rate low. → See [Graph Memory](graph-memory.md) §Parallel Extraction Mechanism
 
 **Approach B': Pure append instruction (⚠️ Deprecated, replaced by B)**
 
 After threshold reached, append compression instruction at prompt end, LLM directly outputs checkpoint + memories (not through tool call).
 
 ```
-Turn 1..N: Normal conversation, [ckpt] + increment appended each turn, KV cache continuously hits
+Turn 1..N: Normal conversation, [ckpt] + increment appended each turn, Context Cache continuously hits
               ↓ Reaching threshold
 Turn N+1:  Prompt end appends "Analyze the above conversation, output checkpoint and memories"
            → LLM directly outputs results, instruction itself not written to session
@@ -313,7 +313,7 @@ Problems: (1) Requires Agent loop modification (identify special output and proc
 Replaces Approach B'. Compression is not a separate operation, but integrated into Agent's normal conversation turn — on next user question, append compression instruction (not system prompt) at prompt end. Agent completes extraction and answer in one turn:
 
 ```
-Turn 1..N: Normal conversation, [ckpt] + increment appended each turn, KV cache continuously hits
+Turn 1..N: Normal conversation, [ckpt] + increment appended each turn, Context Cache continuously hits
               ↓ Reaching threshold
 Turn N+1:  User asks question X
            Prompt end appends: "Analyze the above conversation, call memory_store to extract
@@ -322,7 +322,7 @@ Turn N+1:  User asks question X
 Turn N+2:  History becomes [ckpt_1] + [X] + [Y], restart
 ```
 
-Advantages: (1) No Agent loop modification; (2) answer + compress share KV cache; (3) User experience seamless; (4) Compression fully controlled by memory system (through tool calls).
+Advantages: (1) No Agent loop modification; (2) answer + compress share Context Cache; (3) User experience seamless; (4) Compression fully controlled by memory system (through tool calls).
 
 | Dimension | A (Parallel Extraction) | B' (Pure Append) | B (Integrated Agent Turn) |
 |:--|:--|:--|:--|
@@ -396,7 +396,7 @@ Three: `store` / `search` / `forget`. Auxiliary interfaces `list_all` (export/ba
 
 | Decision | Reason |
 |:--|:--|
-| LLM unaware within 100 messages | Doesn't bloat prompt, doesn't break KV cache |
+| LLM unaware within 100 messages | Doesn't bloat prompt, doesn't break Context Cache |
 | Checkpoint immutable | Fixed after writing, permanently cacheable |
 | Don't depend on framework MemoryManager | Black-box extraction uncontrollable, framework-bound, extra LLM call per turn |
 | Embedding generated inside SurrealDB | Zero transmission and storage on Python side |

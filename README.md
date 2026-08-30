@@ -6,7 +6,7 @@
 
 | 文档 | English | 内容 |
 |:--|:--|:--|
-| [图谱化记忆](graph-memory.md) | | **设计文档**：计算时机光谱、属性图定位、原子三元组、双层模型、聚簇策略、权重系统、原位检查点压缩（KV Cache 复用）、编码场景 |
+| [图谱化记忆](graph-memory.md) | | **设计文档**：计算时机光谱、属性图定位、原子三元组、双层模型、聚簇策略、权重系统、原位检查点压缩（上下文缓存复用）、编码场景 |
 | [记忆架构](agent-memory.md) | [Memory Architecture](agent-memory-en.md) | **架构设计**：Surface/Engine 两层分离、Prefix Checkpoint、记忆控制、主动触发、三方案对比 |
 | [Agent 复利](agent-compound-interest.md) | | 持久化如何改变 AI 工具本质：memory/skill/cron 的累积效应、跨项目联动 |
 
@@ -31,7 +31,7 @@
 | [LLM 过度思考批判](llm-overthinking-critique.md) | | 表演拟人 vs 真正推理、草稿本纠偏 |
 | [LLM 缓存破坏模式](llm-caching-destruction-patterns.md) | | Prompt Caching 生效条件、前缀稳定性、IDE/Agent 场景的缓存杀手 |
 | [LLM 隐藏行为模式](llm-hidden-behavior-patterns.md) | | 模型未显式表达但影响输出的行为模式 |
-| [缓存树和尾提示词优化](tail-prompt-optimization.md) | [Tail Prompt Optimization](tail-prompt-optimization-en.md) | KV cache 旁路分支机制，用于压缩/汇总/提取 |
+| [缓存树和尾提示词优化](tail-prompt-optimization.md) | [Tail Prompt Optimization](tail-prompt-optimization-en.md) | 上下文缓存旁路分支机制，用于压缩/汇总/提取 |
 | [认知心理学](cognitive-psychology.md) | | 认知科学框架在 AI Agent 设计中的应用 |
 
 ## 架构与基础设施

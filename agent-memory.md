@@ -8,7 +8,7 @@
 
 ### 尾提示词
 
-详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用 KV cache 旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
+详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用上下文缓存（Context Cache）旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
 
 ## 一、两层架构
 
@@ -82,7 +82,7 @@ Prefix Checkpoint 的做法不同：
 
 摘要就是"前缀"（Prefix），固定不变；"Checkpoint"是存档点。每次新存档后，旧存档清空，重新累积。
 
-**为什么传统压缩无法利用缓存**：传统做法是把 100 条消息发给一个单独的模型（或单独发起一次 API 调用）来生成摘要。这个调用和之前的对话没有缓存关系——即使你用同一个模型，它看到的是一段全新的文本，KV cache 从零开始计算，缓存命中率 0%。
+**为什么传统压缩无法利用缓存**：传统做法是把 100 条消息发给一个单独的模型（或单独发起一次 API 调用）来生成摘要。这个调用和之前的对话没有缓存关系——即使你用同一个模型，它看到的是一段全新的文本，上下文缓存从零开始计算，缓存命中率 0%。
 
 Prefix Checkpoint 不同：100 条消息已经在缓存中（之前每轮对话都在用）。尾提示词只是在末尾追加了一小段新文本。模型处理时，前面 99% 的 token 直接走缓存，只有最后的提示词 + 用户问题是新计算。
 
@@ -177,7 +177,7 @@ LLM 不主动捕捉执行过程中产生的知识——它用判断力筛选，�
 
 | 方式 | 机制 | cache 友好度 |
 |:--|:--|:--|
-| **全量注入** | 每轮把所有历史注入 prompt | 差（内容每轮变化，KV cache 失效） |
+| **全量注入** | 每轮把所有历史注入 prompt | 差（内容每轮变化，上下文缓存失效） |
 | **top-K 检索** | 每轮检索相关记忆注入 | 中（检索结果可能变化） |
 | **checkpoint + 增量** | 不可变 checkpoint + 最近 N 条消息 | 高（checkpoint 固定，可永久缓存） |
 
@@ -202,7 +202,7 @@ msg_151 ...            ← 新的增量
 
 ```
 Turn 1: [ckpt] + [msg_101]
-Turn 2: [ckpt] + [msg_101] + [msg_102]       ← 前面的 tokens 走 KV cache
+Turn 2: [ckpt] + [msg_101] + [msg_102]       ← 前面的 tokens 走上下文缓存
 Turn 3: [ckpt] + [msg_101] + [msg_102] + [msg_103]
 ...
 Turn N: 达到阈值 → 融入下一个 Agent turn 完成压缩
@@ -217,7 +217,7 @@ Turn N+1: [ckpt_1] + [用户问题 X] + [Agent 回答 Y]
 **Prefix Checkpoint**：阈值到达后，下一个用户提问时，记忆系统注入尾提示词（不是 system prompt）：
 
 ```
-KV cache 中（不变）：
+上下文缓存中（不变）：
   [ckpt] + [msg_101..msg_150]
 
 新追加的消息（唯一未缓存的部分）：
@@ -249,14 +249,14 @@ session 中存储的：
 
 **为什么这样设计**：
 - **不改 Agent loop** — 压缩通过正常 tool call 完成，记忆系统完全控制
-- **不单独调 LLM** — 复用 Agent 的正常 turn，answer + compress 共享 KV cache
+- **不单独调 LLM** — 复用 Agent 的正常 turn，answer + compress 共享上下文缓存
 - **cache 天然命中** — 历史部分全部缓存，只有尾提示词 + 用户问题是新 token
 - **用户体验无感** — 正常回答用户，同时后台完成压缩和记忆提取
 - **历史自动清理** — turn 结束后旧消息不再需要，历史变为 `checkpoint_1 + X + Y`
 
 **为什么 cache 友好**：checkpoint 一旦写入不可变，后续所有 turn 共享同一个 checkpoint 文本。LLM API 的 prompt caching 将 checkpoint 部分缓存在 GPU 显存中，只有增量部分每次变化。随着增量消息增多、下一次 checkpoint 触发，增量被压缩为新的固定摘要，缓存再次命中。
 
-**与 Agno 滑动窗口的对比**：Agno 的 `add_history_to_context` 每次从 DB 读最近 N 条完整消息。随着新消息到来，N 条的组成不断变化（旧的被挤出、新的被加入），KV cache 每轮失效。checkpoint 模式下，历史被压缩为固定摘要，只有未压缩的增量部分变化，cache 持续命中。
+**与 Agno 滑动窗口的对比**：Agno 的 `add_history_to_context` 每次从 DB 读最近 N 条完整消息。随着新消息到来，N 条的组成不断变化（旧的被挤出、新的被加入），上下文缓存每轮失效。checkpoint 模式下，历史被压缩为固定摘要，只有未压缩的增量部分变化，cache 持续命中。
 
 ### 框架适配
 
@@ -302,14 +302,14 @@ memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pend
 
 在 system prompt 中指示 LLM 同时输出用户回复和抽取三元组的函数调用，一次响应完成两件事。
 
-问题：(1) 需要改造 Agent 框架；(2) 函数调用干扰 LLM 对用户回复的注意力；(3) 每轮引入新的函数调用 token，KV cache 命中率低。→ 详见 [图谱化记忆](graph-memory.md) §并行提取机制
+问题：(1) 需要改造 Agent 框架；(2) 函数调用干扰 LLM 对用户回复的注意力；(3) 每轮引入新的函数调用 token，上下文缓存命中率低。→ 详见 [图谱化记忆](graph-memory.md) §并行提取机制
 
 **方案 B'：纯追加指令（⚠️ 过时，被 B 替代）**
 
 阈值到达后，在 prompt 末尾追加压缩指令，LLM 直接输出 checkpoint + memories（不通过 tool call）。
 
 ```
-Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，KV cache 持续命中
+Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，上下文缓存持续命中
               ↓ 达到阈值
 Turn N+1:  prompt 末尾追加 "分析以上对话，输出 checkpoint 和 memories"
            → LLM 直接输出结果，指令本身不写入 session
@@ -324,7 +324,7 @@ Turn N+2:  新 checkpoint + 新增量，重新开始
 替代方案 B'。压缩不是单独的操作，而是融入 Agent 的正常对话 turn——下一个用户提问时，注入尾提示词（不是 system prompt）。Agent 一次 turn 同时完成提取和回答：
 
 ```
-Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，KV cache 持续命中
+Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，上下文缓存持续命中
               ↓ 达到阈值
 Turn N+1:  用户提问 X
            prompt 末尾追加: "先回答用户的问题，然后调用
@@ -334,7 +334,7 @@ Turn N+1:  用户提问 X
 Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 ```
 
-优势：(1) 不改 Agent loop；(2) answer + compress 共享 KV cache；(3) 用户体验无感；(4) 压缩完全由记忆系统控制（通过 tool call）。
+优势：(1) 不改 Agent loop；(2) answer + compress 共享上下文缓存；(3) 用户体验无感；(4) 压缩完全由记忆系统控制（通过 tool call）。
 
 | 维度 | A（并行提取） | B'（纯追加指令） | B（融入 Agent turn） |
 |:--|:--|:--|:--|
@@ -353,7 +353,7 @@ Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 - **时序与状态更迭**——保留版本轨迹，后期推翻前期以 latest-wins 覆盖，最新需求最高权重。
 - **决策依据**——不只留"最终结论"，还要留"为什么这么决定"；过度剔除工具中间输出会切断因果链。
 
-**调用方式（Surface·触发与注入）**：规格不决定经济性，调用方式才决定。压缩须跑在 [Prefix Checkpoint](#prefix-checkpoint) 的**原地生成**上（历史已在 KV cache），不得把 `{RAW_DIALOGUE}` 原样重发给一次独立调用——后者缓存命中率 0%，即传统压缩。
+**调用方式（Surface·触发与注入）**：规格不决定经济性，调用方式才决定。压缩须跑在 [Prefix Checkpoint](#prefix-checkpoint) 的**原地生成**上（历史已在上下文缓存），不得把 `{RAW_DIALOGUE}` 原样重发给一次独立调用——后者缓存命中率 0%，即传统压缩。
 
 **写入语义（Engine·存储）**：状态更迭必须"数据上生效"，而非"文本上的更强"。跨多个 checkpoint 后"当前最新状态"要为真，须按 session/实体**物化 latest-wins 的当前状态**（由 DB 派生，类比任务完成判定），而非每次新 checkpoint 在文本里重述。规格须先声明：append-only 不可变 checkpoint，还是逐键覆盖。
 
@@ -433,7 +433,7 @@ SurrealDB graph  SurrealDB KV      SQLite + vector
 
 | 决策 | 原因 |
 |:--|:--|
-| 100 条以内 LLM 无感知 | 不膨胀 prompt，不破坏 KV cache |
+| 100 条以内 LLM 无感知 | 不膨胀 prompt，不破坏上下文缓存 |
 | Checkpoint 不可变 | 写入后固定，可永久缓存 |
 | 不依赖框架 MemoryManager | 黑盒提取不可控、框架绑定、每 turn 额外 LLM 调用 |
 | Embedding 在 SurrealDB 内部生成 | Python 侧零传输零存储 |

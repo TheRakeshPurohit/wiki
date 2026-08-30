@@ -2,7 +2,7 @@
 
 ## 1. Cache Tree (Cache Tree)
 
-Multiple turns share a common KV cache prefix, forming a tree structure:
+Multiple turns share a common Context Cache prefix, forming a tree structure:
 
 ```
                     [system prompt + conversation history]    ← trunk (shared cache)
@@ -11,7 +11,7 @@ Multiple turns share a common KV cache prefix, forming a tree structure:
 ```
 
 Core properties:
-- **Shared trunk**: All branches reuse the parent's KV cache, no redundant computation
+- **Shared trunk**: All branches reuse the parent's Context Cache, no redundant computation
 - **Independent branches**: Each branch's new tokens are computed independently
 - **Cache reuse**: When switching branches, the common prefix cache remains available (within TTL)
 
@@ -30,7 +30,7 @@ Each thread's cost ≈ task description tokens (project context uses cache).
 
 ## 2. Tail Prompt Optimization
 
-*A temporary instruction injected at the end of a prompt, leveraging the KV cache bypass branch mechanism to perform specific tasks.*
+*A temporary instruction injected at the end of a prompt, leveraging the Context Cache bypass branch mechanism to perform specific tasks.*
 
 Tail prompts are a variant of cache trees — **Cache Vine**. One main trunk grows continuously, with leaves sprouting periodically; after leaves fall, the trunk continues growing.
 
@@ -58,20 +58,20 @@ Differences from cache trees:
 | Controller | User selects branch | System decides when to sprout leaves |
 | Typical use | Multi-topic parallelism | Background tasks (compression, extraction, audit) |
 
-### KV Cache Utilization
+### Context Cache Utilization
 
 ```
-KV cache (unchanged): [conversation history]                 ← trunk
+Context Cache (unchanged): [conversation history]                 ← trunk
 bypass branch (new computation): [tail prompt + user question] ← leaf
   → LLM completes both in a single turn: answer user + execute tail prompt task
   → After turn ends, leaf falls off (tail prompt discarded), only results remain
 ```
 
-Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack frame; tail prompts reuse the current KV cache. Both are "tail" operations that reuse existing state.
+Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack frame; tail prompts reuse the current Context Cache. Both are "tail" operations that reuse existing state.
 
 ### Core Properties
 
-- **Cache utilization**: History portion uses KV cache; only the tail prompt is newly computed
+- **Cache utilization**: History portion uses Context Cache; only the tail prompt is newly computed
 - **Bypass branch**: Does not modify the main trunk (conversation history), only appends temporary instructions at the end
 - **One-shot**: Removed from prompt after turn ends, not written to session
 - **Control**: Injector decides when and what to inject; Agent only executes
@@ -81,7 +81,7 @@ Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack fram
 Tail prompts use the vine pattern — one main trunk sprouts leaves, then continues growing. The compression scenario's special case — when the leaf falls, the preceding trunk is also replaced (checkpoint replaces old history).
 
 ```
-KV cache (unchanged):
+Context Cache (unchanged):
   [ckpt_0] + [msg_101..msg_150]
 
 Newly appended messages (only uncached portion):
@@ -112,7 +112,7 @@ Tail prompt discarded, no residue.
 | Dimension | Traditional Compression | Tail Prompt |
 |:--|:--|:--|
 | LLM Call | Independent API call | Reuses Agent's normal turn |
-| KV cache | Computes from scratch (0% hit rate) | History portion uses cache (~99% hit rate) |
+| Context Cache | Computes from scratch (0% hit rate) | History portion uses cache (~99% hit rate) |
 | Attention | Fully concentrated on compression task | Split (answer user + execute task) |
 | Control | Compression module controls | Injector controls (via prompt + tools) |
 
@@ -127,7 +127,7 @@ The traditional compression argument ("auxiliary model is cheaper than cache") d
 
 Tail prompting is itself compression, but higher quality — it leverages the Agent's normal turn attention to compress, rather than a standalone call. Without tail prompting, using the main model on full context is slow and expensive; tail prompting lets the main model compress incidentally during its normal turn, solving this problem.
 
-The auxiliary model, while fast per-token, has no KV cache (0% hit rate) and must recompute the full input. Main model + tail prompt benefits from ~99% cache hit rate on history, often resulting in lower actual latency.
+The auxiliary model, while fast per-token, has no Context Cache (0% hit rate) and must recompute the full input. Main model + tail prompt benefits from ~99% cache hit rate on history, often resulting in lower actual latency.
 
 ## References
 

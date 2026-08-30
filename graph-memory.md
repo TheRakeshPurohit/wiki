@@ -4,7 +4,7 @@
 
 ### 尾提示词
 
-详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用 KV cache 旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
+详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用上下文缓存（Context Cache）旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
 
 ## 计算时机光谱
 
@@ -61,14 +61,14 @@ LLM Wiki        KG (属性图)      KV 模式        向量模式
 
 ## 光谱的本质：索引时机
 
-三种方案的区别可以压缩为一个变量：**索引什么时候建**。
+四种方案的区别可以压缩为一个变量：**索引什么时候建**。
 
 | 方案 | 索引时机 | 索引内容 | 读取方式 |
 |:--|:--|:--|:--|
 | Wiki / 记忆宫殿 | 写入时 | 全文 + 结构 + 拓扑 | 直接载入 |
 | 属性图 | 写入时 | 实体 + 关系 + 属性 | 图遍历 |
 | 向量检索 | 读取时（隐式） | embedding 向量 | ANN 搜索 |
-| KV Cache | 写入时 | 键值对 | 精确查找 |
+| KV 模式 | 写入时 | 键值对 | 精确查找 |
 
 "写时重"意味着写入时就把索引建好，读取时直接查索引。"读时重"意味着写入时只存原始数据，读取时动态建索引（向量化 + 近似搜索）。
 
@@ -320,7 +320,7 @@ time_decay  = days_since_last_access × 0.01  # 缓慢衰减
 
 #### 并行提取机制（⚠️ 过时，被Prefix Checkpoint 方案替代）
 
-> 此方案要求对 Agent 进行改造（在 system prompt 中指示 LLM 同时输出回复和抽取三元组的函数调用），存在三个问题：(1) 需要改造 Agent 框架；(2) 函数调用可能干扰 LLM 对用户回复的注意力；(3) 没有考虑 KV cache——每轮都引入新的函数调用 token，cache 命中率低。
+> 此方案要求对 Agent 进行改造（在 system prompt 中指示 LLM 同时输出回复和抽取三元组的函数调用），存在三个问题：(1) 需要改造 Agent 框架；(2) 函数调用可能干扰 LLM 对用户回复的注意力；(3) 没有考虑上下文缓存（Context Cache）——每轮都引入新的函数调用 token，缓存命中率低。
 
 记忆更新通过 LLM 的并行函数调用在后台发生。模型在一次响应中输出一组工具调用，Hermes 解析后异步执行。用户看到流畅的文本回复，系统在后台完成多维状态更新——不需要一个庞大的函数，模型动态编排细粒度工具。
 
@@ -329,7 +329,7 @@ time_decay  = days_since_last_access × 0.01  # 缓慢衰减
 阈值到达后，在 prompt 末尾追加压缩指令，LLM 直接输出 checkpoint + memories（不通过 tool call）。
 
 ```
-Turn 1..N: 正常对话，[checkpoint] + 增量逐条追加到 prompt，KV cache 持续命中
+Turn 1..N: 正常对话，[checkpoint] + 增量逐条追加到 prompt，上下文缓存持续命中
               ↓ 达到阈值（100 条）
 Turn N+1:  prompt 末尾追加 "分析以上对话，输出 checkpoint 和 memories"
            → LLM 直接输出结果，指令本身不写入 session
@@ -344,13 +344,13 @@ Turn N+2:  新 checkpoint + 新增量，重新开始
 替代上述两种方案。核心思路：压缩不是单独的 LLM 调用，而是融入 Agent 的正常对话 turn——下一个用户提问时，注入尾提示词（不是 system prompt），Agent 一次 turn 同时完成提取和回答。
 
 **四步闭环**：
-1. **拦截与触发**：记忆系统监控 token 长度，达到阈值时修改用户消息注入压缩指令，前文 token 绝对不变，100% 命中 KV Cache
+1. **拦截与触发**：记忆系统监控 token 长度，达到阈值时修改用户消息注入压缩指令，前文 token 绝对不变，100% 命中上下文缓存
 2. **原位函数调用**：主模型在完整上下文基础上，按顺序执行 generate_summary() + create_checkpoint()
 3. **正常回复用户**：完成元任务后，继续基于压缩后上下文回答用户原始问题
 4. **历史净化**：turn 结束后还原用户消息为原始内容，保证历史可重放、无伪指令
 
 ```
-Turn 1..N: 正常对话，[checkpoint] + 增量逐条追加到 prompt，KV cache 持续命中
+Turn 1..N: 正常对话，[checkpoint] + 增量逐条追加到 prompt，上下文缓存持续命中
               ↓ 达到阈值（100 条）
 Turn N+1:  用户提问 X
            prompt 末尾追加: "先回答用户的问题，然后分析以上对话，
@@ -365,7 +365,7 @@ Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 
 **优势**：
 - 不改 Agent loop——压缩通过正常 tool call 完成，记忆系统完全控制
-- 不单独调 LLM——复用 Agent 的正常 turn，answer + compress 共享 KV cache
+- 不单独调 LLM——复用 Agent 的正常 turn，answer + compress 共享上下文缓存
 - 用户体验无感——正常回答用户，同时后台完成压缩和记忆提取
 - cache 天然命中——历史部分全部缓存，只有尾提示词 + 用户问题是新 token
 
@@ -385,7 +385,7 @@ Prefix Checkpoint 方案下，压缩融入 Agent 的正常 turn——阈值到�
 ```
 100 条消息 → 尾提示词 → Agent 一次 turn:
   1. 回答用户（LLM 直接输出）
-  2. memory_store(...)  ← LLM 主动判断，提取长期记忆（flat KV 或 triples）
+  2. memory_store(...)  ← LLM 主动判断，提取长期记忆（flat 或 graph triples）
   3. memory_checkpoint(...) ← Agent 框架执行，纯 DB 操作
 ```
 
@@ -397,7 +397,7 @@ Prefix Checkpoint 方案下，压缩融入 Agent 的正常 turn——阈值到�
 |:--|:--|:--|
 | 触发方式 | 独立 LLM 调用 | prompt 尾提示词 → Agent 正常 turn |
 | 输出方式 | LLM 直接输出 JSON（checkpoint + memories） | LLM 回答用户 + tool call（memory_store + memory_checkpoint） |
-| 缓存 | 不共享（新 API 调用） | 共享 KV cache（同一 turn） |
+| 缓存 | 不共享（新 API 调用） | 共享上下文缓存（同一 turn） |
 | 长期记忆 | LLM 在压缩调用中提取 | LLM 在 tool call 中提取 |
 
 两种方案都是一次调用产出两层，但当前方案复用 Agent 的正常 turn，cache 命中率从 0% 提升到 ~99%。
@@ -406,7 +406,7 @@ Prefix Checkpoint 方案下，压缩融入 Agent 的正常 turn——阈值到�
 
 | 阶段 | 提取格式 | 输出 |
 |:--|:--|:--|
-| 当前（Phase 2.5） | flat KV | `{content, category, importance, tags}` |
+| 当前（Phase 2.5） | flat | `{content, category, importance, tags}` |
 | 未来（图谱化） | graph triples | `{subject, predicate, object, category}` |
 
 提取机制不变（LLM 通过 `memory_store` tool call），只是输出格式从 flat 变为 structured。
@@ -439,7 +439,7 @@ KDL 可确定性转换为 Mermaid 和 Cytoscape.js 渲染（不需要 LLM 参与
 
 #### 缓存利用
 
-Prefix Checkpoint 的缓存优势：checkpoint 不可变，可永久缓存。增量部分每次变化，但历史部分（checkpoint）走 KV cache。
+Prefix Checkpoint 的缓存优势：checkpoint 不可变，可永久缓存。增量部分每次变化，但历史部分（checkpoint）走上下文缓存。
 
 当前方案不需要独立的压缩 prompt —— 压缩通过 Agent 正常 turn 完成，system prompt + few-shot 由 Agent 框架管理，记忆系统不直接控制 prompt 缓存。
 
