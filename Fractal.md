@@ -93,6 +93,11 @@
   * CNCF "Graduated" 往往代表政治共识，而非工程质量（如 Harbor 的过度膨胀）。
   * **拒绝**：伪微服务（Pseudo-Microservices），为了治理引入巨大的维护开销。
   * **拥抱**：单一二进制 + 标准协议（如 Zot + WireGuard）。
+* **集合优先，单数是特例 (Collection First, Singleton as Exception)**：
+  * 数据形状/API/配置的默认基数设为"多个"，单个实例是集合的退化投影（1 元素）。
+  * 集合对扩展闭合——增删成员是局部、非破坏操作，把集合约束到单个也是局部过滤；而单槽位扩到多槽是基数变更，破坏 schema/ABI/配置格式、须迁移全部消费方。
+  * **判据**：单数只在"本质单数"（领域上严格为单，如"只有一个根设备"）时成立，不能在"碰巧只有一个"时成立。
+  * 应用：KDL 节点天然承载多值多子节点、nix 选项用 listOf/attrsOf、认证注入先把调用面设计成能承载 N 个上下文，单个部署是特例。
 
 ## 4. 交互协议：反向约束引导 (Interactive Protocol: Counterfactual Guidance)
 * **运营反媚俗协议 (Operational Anti-Kitsch Protocol)**：
