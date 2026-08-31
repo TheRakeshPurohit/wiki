@@ -102,6 +102,7 @@ Catalog（集群/实例）
 - 早期 MySQL（MyISAM 时代）将每个"Database"映射到 `/var/lib/mysql/db_name/` 下的文件系统目录。选择术语"Database"而非"Schema"是为了简单。
 - 当 MySQL 5.0 试图与 SQL 标准对齐时，`DATABASE` 已经太根深蒂固无法更改。妥协：`CREATE SCHEMA` 是 `CREATE DATABASE` 的**同义词**——它们产生完全相同的结果。
 - 与真正的 Schema（仅逻辑）不同，MySQL Database 绑定到物理存储、文件权限和字符集。跨数据库查询有效但有陷阱（`lower_case_table_names`、权限边界）。
+- **这里其实损失了一个正交的隔离维度**：标准层次用 **Catalog（环境隔离）** 和 **Schema（逻辑隔离）** 两层来分隔不同职责——Catalog 隔离部署环境（dev/staging/prod、物理实例），Schema 在**同一环境内**按语义组织逻辑命名空间。MySQL 只有一个 Database，把这两个正交维度压成一个：它既当环境隔离又当逻辑命名空间。**少一层隔离 = 失去"在单一环境内自由组织逻辑模块"的表达能力**——要在同一个环境里按逻辑域分开（如 order/crm/inventory），得拆成多个 Database，而每个 Database 又被迫绑定物理存储与权限（环境语义），逻辑组织被环境语义污染，造成 `order 库`/`crm 库`这种"以库代模式"的实践混乱。
 
 **底线**：MySQL 的"Database"= 标准的"Schema"。MySQL 用户所说的"建库"理论上是"建模式"。
 
