@@ -937,3 +937,40 @@ impl RaftStateMachine<openraft::TypeConfig> for Arc<FjallStateMachine> {
 - **崩溃恢复**：重启后从 `meta_partition` 读取 `last_log_id`，重放未 Apply 的 Raft 日志
 - **错误保护**：Fjall 写入失败触发 panic（系统级保护），不会静默丢数据
 - **与 OKM 的关系**：`RaftCommand::UpdateActorState` 的 `serialized_context` 可以是 OKM 编码的实体——`AuraCollection.save()` 生成的 `(key, value)` 对通过 Raft 广播后，状态机将其 Apply 到 Fjall。SlateDB 模式下直接走 SlateDB async API 写入 S3，无需 Raft 状态机。
+
+## Python 侧实现：SlateDB 绑定
+
+SlateDB 官方 Python 绑定（`pip install slatedb`，UniFFI 桥接 Rust 内核）提供了 OKM 所需的全部底层原语，OKM 范式可以在 Python 侧等价实现：
+
+| OKM 需要的原语 | SlateDB Python API |
+|:--|:--|
+| 点查 | `await db.get(key)` |
+| 前缀/范围扫描 | `scan_prefix` + `KeyRange` |
+| 原子批量写（索引一致性） | `WriteBatch` + `db.write()` |
+| 事务 | `db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)` |
+
+OKM 的本质是编译在 Key 字节序上的应用层范式——数字命名空间字典、复合键编码、大端序、前缀扫描语义全部作用在 `bytes` 层，与存储引擎和宿主语言无关。Rust 版的「Struct 即 DDL」在 Python 侧对应 dataclass：
+
+```python
+@dataclass(frozen=True)
+class UserSessionKey:
+    org_id: bytes      # 16 字节，编码时校验长度
+    user_id: bytes
+    session_id: bytes
+
+    def encode(self) -> bytes:
+        assert len(self.org_id) == 16 and len(self.user_id) == 16
+        return b"sess:" + self.org_id + self.user_id + self.session_id
+```
+
+过程宏对应物是类装饰器或 `__init_subclass__` 自动生成 encode/decode，配合 mypy/pyright 静态检查约束字段类型，TypedCollection 的类型安全容器也能以泛型 `Generic[T]` 等价搭建。
+
+### 保障级别的结构性差距
+
+范式 100% 可移植，但保障从「编译期硬约束」降为「静态检查 + 运行时断言」：
+
+- **类型错误后移**：Rust 版错误 Key 编译期直接报错；Python 的类型注解是工具链约束而非语言约束，绕过注解的代码照样能跑，硬保证只剩 `assert` 运行时断言
+- **编码开销非零**：Rust 版编码退化为 memcpy 级指针偏移；Python 版是字节拼接 + 属性访问，慢 1–2 个数量级。KV 写路径由 I/O 主导时通常无感，极热路径有感知
+- **宏机制差异**：Rust 过程宏在编译期生成代码，零运行时成本；Python 装饰器/元类是运行时注册，有一次性启动开销
+
+判定：Python 侧等价物是「OKM 的动态语言版本」——范式相同，保障级别由宿主语言能力决定。

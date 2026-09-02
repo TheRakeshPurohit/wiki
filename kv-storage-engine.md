@@ -332,6 +332,61 @@ Key: data:agent:101:v:[u64::MAX - 1002]  →  记忆状态 v1002（最新）
 
 **与 SurrealKV 原生 MVCC 的区别**：SurrealKV 内置 `tx.get_at(key, timestamp)` 直接查询历史版本，不需要应用层编码。Fjall/SlateDB 需要手动将版本号编入 Key。代价不同，效果相同。
 
+### 读改写：任何 KV 引擎都不提供部分更新原语
+
+「修改 value 里的一个字段」在所有主流 KV 引擎上都不存在为 API 原语——`insert`/`put` 永远是 value 整体替换，包括 B-tree 引擎 redb。这是 KV 接口形状的普适约束，不是 LSM 特有的问题。存储结构只影响「整条重写」的物理代价：
+
+- **原地更新 B-tree**（InnoDB 页内更新）：磁盘直接改字节，写放大小
+- **redb（COW B-tree）**：改一个字段 = 复制叶到根的路径页，物理上不原地，单次写代价反而高于 LSM 追加
+- **LSM**：天然追加，旧版本被分层遮蔽，compaction 异步回收——「整条重写」的代价最便宜
+
+**put 无需先删旧值**——新版本直接遮蔽旧版本：LSM 靠分层遮蔽 + compaction 回收，B-tree 原位覆盖。显式 `del` 只在「数据不再存在」时才需要；「更新一个值」永远是纯 put。（需要显式删除旧 key 的是二级索引场景，见 §二级索引的更新——索引 key 编入了会变的维度，不删旧 key 它就永远留在错误位置。）
+
+高频字段级更新（计数器、权重累积）不应走 read-modify-write 循环，正规解法是 **delta 追加**：
+
+```
+# 不改 value，追加增量记录
+put  edge:123/read/20260902T1000  → +1
+# 读取时归并 delta 得到当前计数；低峰期批量 fold 回主记录
+```
+
+纯顺序写、无读改写竞态（并发 delta 互不覆盖）、写路径无锁。这正是 RocksDB **Merge Operator**（`merge(key, delta)`，引擎自动归并 delta 链并在 compaction 时 fold）的应用层等价物——Fjall/SlateDB 未内置 merge，需要在应用层自建，模式见上。与 §应用层 MVCC 同构：把「修改」变为「追加新版本」，只是 delta 方案只追加变化的字段而非整条记录，成本更低。
+
+**delta 不是无条件更优——判据是并发模型，不是性能。** delta 与 RMW 在 LSM 上的写路径代价相同（都是 1 次追加写、旧版本遮蔽回收），差别在并发与读路径：
+
+| | RMW 直写（`get count → put count+1`） | delta 追加 |
+|:--|:--|:--|
+| 写路径 | 1 次 put（含 1 次 get） | 1 次 put |
+| 读路径 | O(1) 单点 get | 归并 delta 链，需后台 fold 才拉回 O(1) |
+| 并发正确性 | 两写者同 get 同 put 丢更新，需 CAS/事务兜底 | 天然无锁，线性归并 |
+| 复杂度 | 无额外机制 | delta 链 + fold 后台任务 |
+
+选择判据：
+
+- **单写者 / 访问已串行**（单 Agent 进程、同一 WriteBatch 内顺序更新）→ **RMW 直写**。热计数 key 几乎必然在 block cache，get 是 μs 级，比维护 delta 链 + fold 机制简单得多
+- **多写入者并发更新同一计数**（多进程、多 Agent 实例共享 S3 真理源）→ **delta**。RMW 需要 CAS/事务兜底（多数嵌入式引擎无单 key CAS），delta 免掉整个并发问题
+- **更新频率极高**（热路径每请求多次）→ **delta**。省掉每次 get 往返，fold 攒批摊薄
+
+fold 的落点注意：归并结果应 put 到独立计数 key（value 是单个整数，整值替换，直接写新值无 RMW），不要 fold 回主记录的 msgpack 字段——那又是读改写循环，等于把要消除的模式从热路径挪到后台，本质没消。
+
+### 二级索引的更新：变维度进不进 Key
+
+索引 Key 里编入了「会变的维度」（如权重 `W:<weight>:<edge_id>`）时，维度变化需要**删除旧索引 Key + 写入新索引 Key**，两步必须在同一 WriteBatch 原子提交：
+
+```
+put  W:<new_weight>:<edge_id>  → ""
+del  W:<old_weight>:<edge_id>      # LSM 上写 tombstone——删除也是一次写
+```
+
+漏删旧 Key 则按权重扫描捞出过时条目。改一次权重 = 2 次写（新索引 + tombstone），索引更新频繁时 tombstone 积压依赖 compaction 回收。TiDB/SurrealDB 的事务内索引维护就是这对 put+delete 的引擎内置版。
+
+两条免删除的替代布局：
+
+- **变更日志式**：`WI:<edge_id>:<ts> → weight`，索引 = 权重变更记录，查询时内存归并出各 edge 当前权重。纯追加零 tombstone，代价是查询多一层归并
+- **版本懒清理**：Key 编版本号 `W:<weight>:<version>:<edge_id>`，旧条目不删、查询跳过非最新版本，低峰期批量回收
+
+选择判据是**索引维度的更新频率**：低频（如记忆边的权重，批量刷）用标准 put+delete，tombstone 开销可忽略且实现最简；高频实时更新切追加式。
+
 ### value 打包粒度：整行 vs 每字段一个 key
 
 OLTP 的访问模式以**实体为中心**——"取出这个实体的整行，改几个字段再写回"。因此默认应把一行**整行打包**（如 postcard 序列化）填入 value：读整行 1 次点查 + 1 次反序列化，完美匹配。
@@ -1111,7 +1166,7 @@ adj:alice:knows:dave    → []    ← 新增，直接 put，原子操作
 | 并发安全 | 需要事务/锁 | 天然安全 |
 | Key 数量 | N 节点 = N Key | N 边 = N Key |
 
-每边一个 Key 是标准做法。Redis Graph 模块、Neo4j 存储层全是这个模式。单 Key 邻接表的唯一优势是"一次 get 拿全部邻居"，但代价是加边/删边需要事务，得不偿失。
+每边一个 Key 是标准做法。Redis Graph 模块、Neo4j 存储层全是这个模式。单 Key 邻接表的唯一优势是"一次 get 拿全部邻居"，但代价是加边/删边需要事务，得不偿失。它也是 RMW 反模式的典型实例——当 RMW 无法通过重新编码（每边一 Key）消掉、必须更新集合类 value 时，delta 追加是比「get → append → put + 事务」更轻的路径（见 §读改写）。
 
 **查询示例**（"Alice 的朋友的朋友中住在北京的"）：
 ```
@@ -1543,6 +1598,7 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 | **点查延迟（cache miss）** | μs 级（本地 NVMe） | ms 级（S3 Range Get 网络往返） |
 | **容量上限** | 受限于本地磁盘 | 无限（S3 桶容量） |
 | **ACID 事务** | 成熟（3.0+ WriteBatch/Transactions） | 快速演进中，高级事务控制补全中 |
+| **语言绑定** | Rust only（跨语言需 KV server 层，见 §集中式 KV） | 官方 Python / Go / Java / Node / UniFFI（Swift/Kotlin） |
 | **设计目标** | 单机 bare-metal，极致延迟 | 云原生，节点无状态化 |
 
 #### 路径一：Fjall（单机本地部署）
@@ -1617,6 +1673,12 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 **3. 极致本地优化**：Fjall 3.0 对本地磁盘 Block 格式彻底重构——稀疏索引（Sparse Indexing）、前缀截断、布隆过滤器分区、可选哈希索引（Hash Index）。未命中缓存时，本地磁盘随机点查和范围扫描快 2-100 倍，内存开销极低。
 
 **4. 基因纯正**：SlateDB 的核心设计是 "Zero-Disk"（零本地盘依赖），并发锁、Fencing、Flush 策略都围绕网络对象存储延迟优化。即使支持本地写入，这些架构包袱（如因适配网络而做的激进 Batching 导致的即时持久化延迟）很难完全抹除。Fjall 100% 为本地 NVMe/SSD 吞吐量和 OS 文件系统设计。
+
+**5. 跨语言的答案在服务化，而非绑定**：SlateDB 官方提供 Python / Go / Java / Node / UniFFI 绑定，多语言团队可直接嵌入同一真理源——这是 Fjall 结构上给不了的（Rust only）。但 Fjall 的对应答案不是换引擎，而是 KV server 拼装（见 §集中式 KV）：Fjall + Tokio + WS 把嵌入式引擎变成多语言可访问的网络服务，同时进程内热路径仍保留零 RTT 直调。代价是多一层网络访问层与运维；收益是 Python/Java 侧拿到的是跨进程标准化接口，绑定层的 API 完整性反而更高。
+
+#### SlateDB 的本地磁盘模式
+
+SlateDB 构建在 `object_store` crate 之上，`LocalFileSystem` 是其合法实现——示例中的 in-memory 只是演示便利，本地磁盘路径开箱可用，部署形态因此灵活（本地盘 ≈ Fjall 的部署位置，S3 = 存算分离）。但本地模式有一结构性限制：SlateDB 的并发互斥（Fencing、put-if-absent）按对象存储语义设计，本地文件系统的互斥原语弱于 S3，官方推荐姿势是外部锁（DynamoDB / Postgres lock）保证单写者。单进程使用无碍；多进程并发写本地路径不安全。
 
 #### Fjall 的 S3 计划
 

@@ -807,9 +807,55 @@ LLM Wiki 是写时计算的极端——人工整理，结构固定，读取确�
 
 **迁移的成本**：原子事实抽取的精度损失。散文中的隐含关系可能在抽取时丢失。这是从写时计算迁移到中间区域的固有代价。
 
+## KV 实现方案：嵌入式引擎承载原子图
+
+存储层不绑定 Postgres——原子图模型可以整体落在嵌入式 KV 引擎（Fjall 本地 / SlateDB+S3，见 [KV 存储引擎](kv-storage-engine.md)）。编码范式直接复用该文档的现成模式：
+
+**边存储：每边一个 Key（属性图编码模式）**
+
+```
+edge:{src}:{label}:{dst}   → [properties msgpack + weight_meta]
+adj:{src}:{label}:{dst}    → []        ← 正向邻接，Key 编码关系，Value 留空
+radj:{dst}:{label}:{src}   → []        ← 反向邻接
+```
+
+图遍历 = 前缀扫描 + 批量点查，与 SurrealDB 的物理路径一致。复杂算法（社区发现、PageRank）从 KV 加载子图到 petgraph 跑，结果写回——这是 PG/SurrealDB 都不提供的算法能力。
+
+**权重系统：read-modify-write 消除**
+
+权重元数据（read_count/write_count/last_read）是高频字段级更新，不走 read-modify-write 循环，用 delta 追加：
+
+```
+put  edge:{src}:{dst}/read/{ts}  → +1     # 读取 = 追加 delta，纯顺序写
+# 读取时归并 delta 得当前计数；低峰期将归并结果 put 到独立计数 key（整值替换）
+put  edge:{src}:{dst}/count/read → 42     # value 是单个整数，put 即直接写新值，无 RMW
+```
+
+并发 delta 互不覆盖，写路径无锁——这是 RocksDB Merge Operator 的应用层等价物（见 [KV 存储引擎 §读改写](kv-storage-engine.md#读改写任何-kv-引擎都不提供部分更新原语)）。fold 落点是独立计数 key 而非 edge 记录内的字段——改回主记录的 msgpack 字段又是 read-modify-write，等于把要消除的循环从热路径挪到了后台。
+
+delta 与 RMW 直写的选择判据是并发模型：单 Agent 进程内串行更新（同一 WriteBatch 顺序写）时，count key 直接 RMW 更简单（省掉 delta 链与 fold）；多 Agent 实例共享 S3 真理源并发写同一计数时才需要 delta（RMW 需 CAS/事务兜底）。完整对比见 [KV 存储引擎 §读改写](kv-storage-engine.md#读改写任何-kv-引擎都不提供部分更新原语)。
+
+**权重二级索引：变维度进 Key 的更新策略**
+
+按权重 Top-K 排序需要 `W:<weight>:<edge_id>` 索引。权重变化时 put 新 Key + del 旧 Key（tombstone）在同一 WriteBatch 原子提交。记忆边的权重更新是低频批量刷，tombstone 开销可忽略，选标准 put+delete（见 [KV 存储引擎 §二级索引的更新](kv-storage-engine.md#二级索引的更新变维度进不进-key)）。
+
+**Checkpoint 事务：WriteBatch 原子提交**
+
+Prefix Checkpoint 的一次压缩 = checkpoint 更新 + 新边批量写入 + 权重 delta + 索引维护，全部编入同一 WriteBatch 原子落盘，崩溃整体回滚——等价于 PG 单事务，无需独立事务管理器。
+
+**结构性缺口：向量与全文检索**
+
+KV 引擎没有 ANN 索引和倒排索引，方案的读取侧（渐进式加载、动态召唤）依赖向量检索，需要补齐：
+
+- **向量**：arroy（HNSW，Rust）图序列化进 KV、启动时载入内存的冬眠/载入生命周期（见 [KV 存储引擎 §工业级离线冬眠](kv-storage-engine.md)）。Rust 侧可用；Python 绑定侧无现成轮子，小规模（几万边内）可用暴力扫描兜底
+- **全文**：Tantivy（Rust 生态的 Lucene，BM25 + 中文分词 Charabia/jieba-rs）外挂，或自建倒排（[KV 存储引擎 §倒排索引交集](kv-storage-engine.md)有现成编码设计）。分词与打分全链路可控——这正是 KV 路线相对 pg_search 黑盒 tokenizer 的核心换取项
+
+**选型判定**：PG 路线的优势是现成轮子集成度（pgvector/pg_search/PGQ 即装即用）；KV 路线的优势是部署形态（单二进制嵌入式 / 无限容量存算分离）+ 全链路可控（编码、分词、算法、无插件版本升级问题），代价是向量与全文两模块自建。二者是集成度 vs 可控性的取舍，不是可行 vs 不可行。
+
 ## 交叉引用
 
 - **[Property Graph Queries](property-graph-queries.md)**：图在关系库里的定义与查询落地——以 SQL/PGQ 为标准，一图多关系、多图判据、跨图走底层表、严格性按边分、关系类型的动态化。
+- **[KV 存储引擎](kv-storage-engine.md)**：本方案 KV 路线的底层承载——属性图编码模式、读改写消除（delta 追加）、二级索引更新策略、WriteBatch 事务、向量冬眠/载入生命周期。
 - **[Agent 记忆选型](agent-memory.md)**：现有方案分析（agentmemory vs cognee、四象限全景、与本文档的逐项对照）。
 - **[Agent 复利](agent-compound-interest.md)**：复利机制中"记忆积累"在属性图中的具体实现路径。
 - **[知识原子事实抽取技能](../skills/knowledge-triplets/SKILL.md)**：抽取格式定义，本文档的写入层规范。
