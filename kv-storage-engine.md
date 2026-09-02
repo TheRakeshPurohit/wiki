@@ -1809,7 +1809,7 @@ SlateDB 构建在 `object_store` crate 之上，`LocalFileSystem` 是其合法�
 
 #### SQLite vs 嵌入式 KV
 
-SQLite 是软件工程的奇迹，但大量项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。当查询模式可预测时，嵌入式 KV 在三个维度上产生系统性优势：
+SQLite 是软件工程的奇迹，但大量项目引入它，仅仅是因为想要一个"单文件、免运维、本地持久化"的存储，而不是真的需要关系代数和 SQL 优化引擎。以下三个维度上的优势来自引擎实现层的持续开销对比，与查询模式是否可预测无关（查询模式决定的是要不要固化键路径模式库，见 §SQL 翻译层 vs KV 管道链）：
 
 **C 语言依赖与交叉编译**。SQLite 是 C 写的。Rust 项目引入 rusqlite 绑定后，用户机器必须安装 C 编译器（gcc/clang）。交叉编译（Mac → Linux ARM64）时 C 工具链是主要阻塞源。纯 Rust KV 引擎（Fjall）几秒内编译出静态链接的单一二进制，零外部依赖。
 
@@ -1853,6 +1853,8 @@ Key: cfg:{app_name}:{config_key}  →  Value: [原始二进制]
 `save_config` = 一次 `put`，无 SQL 解析。`get_all_app_configs` = 一次 `prefix_scan("cfg:{app_name}:")`，无查询计划生成。代码即最高效的执行计划——LSM-Tree 的字典序迭代器直接在 SSTable 上顺序扫描。
 
 **判定**：SQLite 是业务系统的"全能妥协"；嵌入式 KV 是开源基础设施的"铁律标准"。纯 Rust CLI 工具选 Fjall，跨语言/需要 SQL 选 SQLite。
+
+**SQLite vs KV 的分界收窄**：能力上两者都能承载可预测访问的数据（Chrome 同时用 SQLite 和 LevelDB 是生态位历史，不是架构判断）；代码量在索引/schema 模式固化后打平；迁移成本双方都有——PG 每个大版本 dump/restore、SQLite 靠三十年格式兼容背历史包袱、KV 需自建版本迁移工具，只是工具化主体不同（引擎作者 vs 使用者）。真正的分界只剩工程经济学的分配：用户是自己 → 一次性投入迁移工具，换取查询层零开销（KV）；用户不可知、格式永不破坏是承诺 → SQLite 兜底。分界判据自始至终只有一条：**查询模式是否可预测**——它决定的是要不要固化键路径，不是要不要 KV。
 
 #### 选择标准（Fjall vs SlateDB）
 
