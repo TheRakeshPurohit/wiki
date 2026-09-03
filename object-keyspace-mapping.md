@@ -1058,14 +1058,12 @@ pub struct AgentMemory;
 
 业务代码从「一个 struct」变「两个 struct」，读整条记录要 K/V 拼合。但这本是事实的显式化：key 字段进字节序排序、value 字段进序列化 blob，物理命运不同。分开声明让每侧 derive 回归单 item 纯函数，属性归属无歧义，分区猜测整个消失。
 
-### Collection trait：容器契约与 KvCollection 实现
+### Collection trait + KvCollection：容器契约与实现
 
-`KvRecord` 展开出的容器契约与 `AuraStorage` 绑定（见 [Aura 架构 §3.1](aura-architecture.md#31-存储引擎抽象trait-分离)）。容器定义为 trait——上层依赖 trait 对象，与 `AuraStorage` trait + `FjallEngine/SlateEngine` 的装配画风统一；具体 struct 只有一个实现：
+`KvRecord` 展开出的容器与 `AuraStorage` 绑定（见 [Aura 架构 §3.1](aura-architecture.md#31-存储引擎抽象trait-分离)）。**`Collection` 是对不同引擎、不同容器暴露的统一接口**——上层业务依赖 trait，不依赖 `KvCollection` 具体类型；与 `AuraStorage` trait + `FjallEngine/SlateEngine` 的装配画风统一：
 
 ```rust
-use std::sync::Arc;
-
-/// 容器契约：K/V 编排 + 批次缓冲，引擎无关
+/// 容器契约：K/V 编排 + 批次缓冲，引擎无关——对上层暴露的接口面
 pub trait Collection<K: KeyEncode, V: ValueEncode> {
     /// 编码 → 积入内部批次（不落盘）
     fn save(&mut self, key: &K, value: &V);
@@ -1076,7 +1074,7 @@ pub trait Collection<K: KeyEncode, V: ValueEncode> {
     fn write(&mut self) -> Result<(), StorageError>;
 }
 
-/// 唯一实现：泛型约束到 AuraStorage；批次缓冲与引擎句柄即全部状态
+/// Collection 的标准实现：泛型约束到 AuraStorage；批次缓冲与引擎句柄即全部状态
 pub struct KvCollection<A: AuraStorage, K: KeyEncode, V: ValueEncode> {
     backend: A,
     batch: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1100,12 +1098,39 @@ impl<A: AuraStorage, K: KeyEncode, V: ValueEncode> Collection<K, V> for KvCollec
         result
     }
 }
+
+/// 跨 collection 原子写：编码进外部共享批次，不触碰内部缓冲。
+/// 主表 + 二级索引等必须同一次 WAL 提交的场景用它，提交交回引擎句柄。
+/// （save_into 不在 trait 上——它依赖具体批次机制，属实现侧能力）
+impl<A: AuraStorage, K: KeyEncode, V: ValueEncode> KvCollection<A, K, V> {
+    pub fn save_into(&self, batch: &mut WriteBatch, key: &K, value: &V) {
+        batch.push((key.encode(), value.encode_value()));
+    }
+}
 ```
 
-相比具体 struct 的两个红利：
+两个设计判据：
 
-- **`PhantomData<(K, V)>` 消失**——类型参数直接落在字段泛型上（`backend: A`、方法约束 `K`/`V`），不再有空转的 marker 字段。
-- **批次缓冲内聚**——`save` 多次积累、`write` 一次原子落盘，调用方不再自带 `WriteBatch`；单写者用 `&mut self` 表达自然的所有权模型，多路并发各持实例（`Arc` 克隆廉价）。
+- **接口与实现分离的分工**：`Collection` trait 是上层可见的接口面（save/find/write），`KvCollection` 是它的标准实现。换引擎（Fjall ↔ SlateDB）不动 trait；若未来出现不同容器实现（如带缓存的 Collection、只读快照 Collection），实现 trait 即可接入，上层代码零改动。
+- **类型参数落在字段泛型上**（`backend: A`、方法约束 `K`/`V`），不需要空转的 `PhantomData` marker——类型锁死由泛型约束本身完成。批次缓冲内聚于实现体，`save` 多次积累、`write` 一次原子落盘；多路并发各持实例或加锁，是调用方的并发选择，不焊死在容器 API 里。
+
+#### 跨 collection 原子提交
+
+内部批次是各 collection 私有的，两个 collection 各自 `write()` 是两次独立 WAL 提交——主表 + 二级索引这种要求同一原子单元的场景会被它堵死（索引行与主表行必须同生同死，见 [kv-storage-engine](kv-storage-engine.md)「二级索引的更新」）。跨 collection 原子性本质是**引擎层的属性**（WAL 一次提交），不是 collection 层能造出来的——解法是回到引擎句柄，让 collection 退回它本来擅长的：只做编码：
+
+```rust
+// 主表 + 二级索引两个 collection，共享一个引擎级批次
+let mut batch = WriteBatch::new();
+users.save_into(&mut batch, &user_key, &user_value);
+idx.save_into(&mut batch, &index_key, &EMPTY_VALUE);   // 索引行 value 留空（锚点位）
+engine.write(batch)?;                                   // 一次 WAL，原子
+
+// 两条路径的分工：
+// 单 collection 常规写 → save 积内部缓冲 + write（便利路径）
+// 跨 collection 原子写 → save_into 编进共享批次 + engine.write（一致性路径）
+```
+
+`save_into` 不触碰内部缓冲，两条路径互不干扰；不提供「共享缓冲」式的花活——那只是把 batch 挪个地方存，原子性还是得靠引擎一次提交。
 
 #### 存储的落点：三层归属
 
@@ -1114,7 +1139,7 @@ impl<A: AuraStorage, K: KeyEncode, V: ValueEncode> Collection<K, V> for KvCollec
 ```
 KeyEncode / ValueEncode 派生宏    ← 纯编译期编解码，零 I/O，不知道任何引擎
         ↓ 展开出的纯函数
-Collection trait + KvCollection  ← backend: A (AuraStorage)，唯一摸引擎的字段
+Collection trait ← KvCollection  ← backend: A (AuraStorage)，唯一摸引擎的字段
         ↓ trait 分派
 AuraStorage（FjallEngine / SlateEngine）   ← 真实 KV 存储在这层
 ```
@@ -1128,30 +1153,43 @@ let engine: Arc<dyn AuraStorage> = match deploy_mode {
     DeployMode::Local => Arc::new(FjallEngine::open("/var/lib/aura/keyspace")?),
     DeployMode::Cloud => Arc::new(SlateEngine::open_s3("s3://aura-bucket/db").await?),
 };
-let collection: Arc<Mutex<dyn Collection<AgentMemoryKey, AgentMemoryValue>>> =
-    Arc::new(Mutex::new(KvCollection::new(engine)));
+let mut collection = KvCollection::new(engine);
 
 // 使用处：save 积累 → write 一次原子落盘，全链路不感知引擎差异
-collection.lock().unwrap().save(&key, &value);
-collection.lock().unwrap().write()?;   // 一次 WAL 提交，原子性落在引擎层
+collection.save(&key, &value);
+collection.write()?;   // 一次 WAL 提交，原子性落在引擎层
 ```
 
 - **原子性落在引擎层**：`write` 把积攒的物理字节一次提交给 AuraStorage 实现体（Fjall keyspace / SlateDB 实例）；实例生命周期归装配处管理，Collection 只持句柄。
 
 ### 上层业务代码
 
-```rust
-fn process_login(collection: &Mutex<dyn Collection<AgentMemoryKey, AgentMemoryValue>>,
-                 key: AgentMemoryKey, value: AgentMemoryValue) -> Result<(), StorageError> {
-    let mut repo = collection.lock().unwrap();
+完整链路——先由 `KeyEncode` / `ValueEncode` 派生宏生成的编码函数构造 K/V，再交给依赖 `Collection` trait 的业务函数：
 
+```rust
+// 第一步：用派生宏展开的编码器构造 K/V（纯函数，零 I/O）
+fn build_kv(content: [u8; 64], score: i32, tags: Vec<String>,
+            session_id: [u8; 16], timestamp: u64) -> (AgentMemoryKey, AgentMemoryValue) {
+    let key = AgentMemoryKey { session_id, timestamp };   // KeyEncode：#[kv_ns(6)] 已随类型
+    let value = AgentMemoryValue { content, score, tags }; // ValueEncode：#[kv_version(2)] 已随类型
+    (key, value)
+}
+
+// 第二步：业务函数依赖 Collection trait——泛型分派，不感知具体容器与引擎
+fn process_login<C: Collection<AgentMemoryKey, AgentMemoryValue>>(
+                 collection: &mut C,
+                 key: AgentMemoryKey, value: AgentMemoryValue) -> Result<(), StorageError> {
     // 零原始字节操作、零手动前缀拼接、零分区猜测
-    repo.save(&key, &value);
-    repo.write()?;
+    collection.save(&key, &value);
+    collection.write()?;
 
     println!("写入 Namespace: {}", AgentMemoryKey::NAMESPACE_ID);
     Ok(())
 }
+
+// 调用处：编码构造 → trait 分派 → 引擎落盘
+let (key, value) = build_kv(content, score, tags, session_id, timestamp);
+process_login(&mut collection, key, value)?;
 ```
 
 ### 运行时冲突检测方向
