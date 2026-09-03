@@ -42,6 +42,8 @@ impl UserSessionKey {
 
 任何试图写入错误格式的代码在编译期直接报错。不需要运行时校验。
 
+> **注**：本例的 `"sess:"` 字符串前缀是**演化起点**（用于引出下文「字符串前缀的两大软肋」），不是推荐方案——正式方案是下文数字命名空间版的 `UserSessionKey`。
+
 ### 版本化 Enum 懒迁移：零停机 Schema 演进
 
 SQL 靠 `ALTER TABLE` 做迁移，需要锁表。KV 靠版本化 Enum 做懒迁移——读取时按版本自动升级，无停机：
@@ -97,34 +99,6 @@ impl SessionToMessageEdge {
 
 写入时同时 `put` 正向和反向 Key。删除时同时 `delete` 两侧。Edge Struct 的代码注释就是 E-R 图的文档化——比 SQL DDL 更显式，因为关系编码逻辑和 Key 生成逻辑在同一处。
 
-### TypedTable：泛型类型安全抽象
-
-在裸字节 KV 引擎之上封装一层声明式泛型表，交付 ORM 级别的开发体验：
-
-```rust
-use std::marker::PhantomData;
-
-/// 通用泛型表空间——PhantomData 编译期类型检查，运行时零开销
-pub struct TypedTable<K, V> {
-    _key_type: PhantomData<K>,
-    _val_type: PhantomData<V>,
-}
-
-impl<K, V> TypedTable<K, V> where
-    K: serde::Serialize,
-    V: serde::Serialize + serde::de::DeserializeOwned
-{
-    /// 类型化写入——编译器保证 Key 和 Value 类型匹配
-    pub fn put_record(&self, batch: &mut Vec<(Vec<u8>, Vec<u8>)>, key: K, value: V) {
-        let serialized_key = bincode::serialize(&key).unwrap();
-        let serialized_val = bincode::serialize(&value).unwrap();
-        batch.push((serialized_key, serialized_val));
-    }
-}
-```
-
-`TypedTable<UserSessionKey, SessionData>` 在编译期锁死了 Key 和 Value 的类型。传错类型直接编译失败，不需要运行时调试。
-
 ### SurrealDB/Mongo 的 DDL 缺陷
 
 无模式（Schema-less）是项目 0→1 阶段的「致幻剂」——开发速度极快，但到 1→10 的工业级阶段会成为数据脏乱差的万恶之源。
@@ -144,19 +118,37 @@ KV 系统最怕的风险：某次代码迭代改动了 Key 的前缀字符串（
 mod tests {
     use super::*;
 
+    /// 与「DDL 结构体」一致的数字命名空间版 UserSessionKey（ns=1，id 全部为数字）
+    pub struct UserSessionKey {
+        pub org_id: [u8; 16],     // 16 字节
+        pub user_id: u64,         // 8 字节数字 ID
+        pub session_id: [u8; 16], // 16 字节
+    }
+
+    impl UserSessionKey {
+        pub fn encode(&self) -> Vec<u8> {
+            let mut key = Vec::with_capacity(42);
+            key.extend_from_slice(&1u16.to_be_bytes()); // ns=1 → [0x00, 0x01]
+            key.extend_from_slice(&self.org_id);
+            key.extend_from_slice(&self.user_id.to_be_bytes());
+            key.extend_from_slice(&self.session_id);
+            key
+        }
+    }
+
     #[test]
     fn test_key_ddl_stability_protection() {
         // 1. 构造确定性的业务测试数据
         let test_key = UserSessionKey {
-            org_id: uuid::Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap(),
-            user_id: "user_88",
-            session_id: "sess_99",
+            org_id: uuid::Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap().into_bytes(),
+            user_id: 88,
+            session_id: [0x99; 16],
         };
 
         // 2. 硬编码历史版本生成的真实物理二进制（hex 16 进制）
-        // 任何改动前缀或字段顺序的行为都会导致编码不匹配，CI/CD 立刻报错
+        // 任何改动 ns 前缀、字段顺序或宽度的行为都会导致编码不匹配，CI/CD 立刻报错
         let expected = hex::decode(
-            "736573733a67e5504410b1426f9247bb680e5fe0c83a757365725f38383a736573735f3939"
+            "000167e5504410b1426f9247bb680e5fe0c8000000000000005899999999999999999999999999999999"
         ).unwrap();
 
         assert_eq!(
@@ -167,11 +159,11 @@ mod tests {
 }
 ```
 
-这段测试的物理含义：`hex::decode("736573733a...")` 是 `sess:67e55044...:user_88:sess_99` 的 UTF-8 字节序列。任何人改动 `UserSessionKey` 的 `encode()` 方法（改前缀、调字段顺序、换序列化格式），测试立刻失败，阻止合入主分支。这是 KV 系统替代 DDL 约束的最终防线——编译期类型安全 + 运行时 hex 校验，双保险。
+这段测试的物理含义：`hex::decode("000167e5...")` 是 42 字节的 ns 编码（`[0x00, 0x01]` + org UUID 16B + u64(88) 8B + session `0x99`×16B）。任何人改动 `UserSessionKey` 的 `encode()` 方法（改 ns、调字段顺序、换宽度），测试立刻失败，阻止合入主分支。这是 KV 系统替代 DDL 约束的最终防线——编译期类型安全 + 运行时 hex 校验，双保险。
 
 ### 判定
 
-SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + TypedTable 泛型抽象 + hex 硬编码单元测试」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）+ 编码漂移防护（hex 单元测试）。在 Schema 安全性上完成对 SurrealDB（无模式）和 PostgreSQL（运行时 DDL 锁）的双向反超。
+SQL 的核心价值是面向人类的结构化纪律。KV 只要贯彻「代码即 DDL 的强类型编码 + 多版本 Enum 懒迁移 + 双写 Key 指针契约 + hex 硬编码单元测试」，就同时获得了：编译期 Schema 安全（Rust 编译器）+ 运行时极致性能（LSM-Tree）+ 零停机演进（版本化 Enum）+ 团队可维护性（Struct 注释即文档）+ 编码漂移防护（hex 单元测试）。在 Schema 安全性上完成对 SurrealDB（无模式）和 PostgreSQL（运行时 DDL 锁）的双向反超。
 
 ## 问题：字符串前缀的两大软肋
 
@@ -296,14 +288,57 @@ pub struct MetricKey {
 
 | wrapper | 维度 | 编码 | 读路径 |
 |:--|:--|:--|:--|
-| `Enum<T>` | 基数 | 值 → 编号（`T` 位宽 = ⌈log₂基数⌉，映射为编译期常量，见命名空间字典） | O(1) 查表回译 |
+| `Enum<T>` | 基数 | 值 → 编号（**位宽锁死 `T` 的固定字节宽**，与命名空间位宽同一决策，见下文） | O(1) 查表回译 |
 | `Offset<T>` | 分布 | `值 − 基准`（有符号；基准取近今，负偏移表达更早值） | 基准 + 偏移 |
 | `Delta<T>` | 序列 | 与前值差（可变长更省） | 顺序累加（随机/乱序访问须顺序重建） |
 | `VarInt<T>` | 位宽 | 常见小值 1 字节、大值扩展（LEB128） | 逐字节 continuation bit |
 | `Rle<T>` | 重复 | 连续相同 → `(值, 次数)` | 展开 |
 | `Quant<T>` | 量纲 | 时间降精度 / 归桶（ns→ms / 小时桶） | 放缩 |
+| `Reverse<T>` | 排序方向 | **补码逐位反转**（`!bits.to_be_bytes()`），正序字节序变倒序——prefix scan 首条即最新（时间线、最新优先列表） | 同样反转回译 |
 
 **宏只生成对应 wrapper 的编解码**：字段类型即契约——`Enum<u8>` 告诉框架"这字段只存 1 字节编号"，`Offset<i32>` 告诉框架"存有符号相对值"，`Delta<i32>` 告诉框架"与前值求差"。原理与取舍见 [kv-storage-engine](kv-storage-engine.md)「编码优化」。
+
+**`Reverse<T>`：补码反转实现倒序扫描**。对定宽整型（`i64`/`u64`/`i32`/`u32`/`u16`/`u8`）逐位取反后按大端序写入——大值变小字节序列、小值变大，字节序扫描顺序与数值序完全颠倒，prefix scan 天然"最新优先"，无需应用层排序或二级索引。整数补码表示本身有序（含负数），取反不破坏可比较性，回译即再取反。**编译期门卫**：`Reverse<T>` 借助 trait 实现约束只接受可反转类型——宏展开出的 `where` 子句要求 `T: Reversible`（blanket impl 覆盖全部定宽整型，其余类型不实现），不可反转的类型（浮点、字符串、数组）误用直接编译报错，而非静默产出乱序字节：
+
+```rust
+pub trait Reversible: Copy {
+    /// 编码：bits.to_be_bytes() 逐位取反；解码：再取反还原
+    fn reverse_encode(self) -> [u8; Self::WIDTH];
+    fn reverse_decode(bytes: &[u8]) -> Self;
+}
+
+// blanket impl 只覆盖定宽整型——这是能力白名单，不在名单上的类型写进 Reverse<T> 即编译失败
+macro_rules! impl_reversible {
+    ($($t:ty),*) => { $(
+        impl Reversible for $t {
+            const WIDTH: usize = core::mem::size_of::<$t>();
+            fn reverse_encode(self) -> [u8; Self::WIDTH] {
+                let mut b = self.to_be_bytes();
+                b.iter_mut().for_each(|x| *x = !*x);   // 补码逐位反转
+                b
+            }
+            fn reverse_decode(bytes: &[u8]) -> Self {
+                let mut b: [u8; Self::WIDTH] = bytes[..Self::WIDTH].try_into().unwrap();
+                b.iter_mut().for_each(|x| *x = !*x);
+                <$t>::from_be_bytes(b)
+            }
+        }
+    )* };
+}
+impl_reversible!(u8, u16, u32, u64, i8, i16, i32, i64);
+
+// 宏为 Reverse<T> 字段展开的编解码自动带 where 约束（编译期检查）
+// 反例：Reverse<f64> → the trait bound `f64: Reversible` is not satisfied
+// 反例：Reverse<String> → the trait bound `String: Reversible` is not satisfied
+```
+
+浮点为何不在名单：IEEE 754 字节序与数值序不同构（负数位模式反而更大），逐位反转得到的是乱序字节——排序正确性会被静默破坏，这类错误必须挡在编译期而不是靠测试兜底。若确需倒序浮点，先 Quant 归桶成整型再 Reverse（组合 wrapper），转换语义显式可见。
+
+**Enum 位宽锁死类型字节宽，不按基数推导**：`Enum<T>` 的物理宽度 = `T` 的字节宽（`Enum<u8>` = 1 字节、`Enum<u16>` = 2 字节），由编码方自己选定。不采用"位宽 = ⌈log₂基数⌉"的最小位宽方案，理由与命名空间锁死 u16 同根：
+
+- **推导在编译期做不到**：宏只看得见单个 derive item，数不到全代码库的枚举变体总数；要跨 item 收集基数就得引入 `LazyLock` 式运行期登记——运行时参与编码计算，过于动态，也伤性能。
+- **更致命的是数据格式漂移**：即便推导成功，前一个位宽填满后新增枚举变体会让位宽自动扩展一格——**所有历史 key 的布局被悄然重定义**，旧数据集体失联。这与 ns 位宽"运行期 fetch_max 推导"被否决是同一类病，只是搬到字段级复发。
+- **固定宽度 + 补位余量的代价可忽略**：单字段 1 字节 vs 4 bit 的差异摊到整条 key 上不到 2%，换来"新增变体永不改布局"的结构性稳定。变体总数逼近位宽上限时，编码方**显式**把 `Enum<u8>` 升格为 `Enum<u16>` 并走版本化 Enum 懒迁移——布局变更是一个可见的、被 hex 测试拦住的动作，不是静默漂移。
 
 与**键布局（字段顺序/主键定宽 vs 索引变长）正交**：wrapper 是**压缩语义**（怎么存），不是**结构语义**（放哪个位置）；两者可叠加（`Offset<i32>` 字段本身仍参与前缀扫描、`Enum` 字段可作索引判别位）。
 
@@ -334,6 +369,7 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
     };
 
     let name = &input.ident;
+    let field_names: Vec<_> = fields.iter().map(|f| f.ident.clone().unwrap()).collect();
     let mut encode_tokens = TokenStream2::new();
     let mut decode_tokens = TokenStream2::new();
     let mut capacity_tokens = TokenStream2::new();
@@ -473,7 +509,7 @@ pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
                 if bytes.len() != offset {
                     return Err("数据长度与 Schema 不符");
                 }
-                Ok(Self { #( #fields ),* })
+                Ok(Self { #( #field_names ),* })
             }
 
             /// 编码"前 n 个字段"作为扫描前缀（n=索引字段个数）；
@@ -573,6 +609,75 @@ fn emit_wrapper_codec(
             },
             quote! { + 4 },
             4,
+        ),
+        "VarInt" => (
+            // LEB128：小值 1 字节、大值逐字节扩展；encode 由运行时循环产出（宽度不定，无 capacity 预算）
+            quote! {{
+                let mut v = #field as u64;
+                loop {
+                    let mut byte = (v & 0x7F) as u8;
+                    v >>= 7;
+                    if v != 0 { byte |= 0x80; }
+                    buf.push(byte);
+                    if v == 0 { break; }
+                }
+            }},
+            quote! {{
+                let mut v: u64 = 0;
+                let mut shift = 0;
+                loop {
+                    let byte = bytes[offset];
+                    offset += 1;
+                    v |= ((byte & 0x7F) as u64) << shift;
+                    if byte & 0x80 == 0 { break; }
+                    shift += 7;
+                }
+                let #field = v as _;
+            }},
+            quote! { /* 变长，无固定预算 */ },
+            0, // 宽度不定：含 VarInt 字段的结构体退化为运行期游标（同变长字段策略）
+        ),
+        "Rle" => (
+            // (值, 次数) 对：值定宽 4B + 次数 u16；示意单游程编解码
+            quote! {{
+                buf.extend_from_slice(&(#field as i32).to_be_bytes());
+                // 次数由上层游程检测填入，此处示意为 1
+                buf.extend_from_slice(&1u16.to_be_bytes());
+            }},
+            quote! {{
+                let #field = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                let _count = u16::from_be_bytes(bytes[offset + 4..offset + 6].try_into().unwrap());
+                offset += 6;
+            }},
+            quote! { + 6 },
+            6,
+        ),
+        "Quant" => (
+            // 量纲缩放：ns → ms（÷1_000_000），存 i64 毫秒
+            quote! {{
+                let ms = (#field as i64) / 1_000_000;
+                buf.extend_from_slice(&ms.to_be_bytes());
+            }},
+            quote! {{
+                let ms = i64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                let #field = (ms * 1_000_000) as _;
+                offset += 8;
+            }},
+            quote! { + 8 },
+            8,
+        ),
+        "Reverse" => (
+            // 补码逐位反转：大端字节序扫描天然倒序（最新优先）；T: Reversible 编译期门卫
+            quote! {{
+                let mut b = ::kv_codec::Reversible::reverse_encode(#field);
+                buf.extend_from_slice(&b);
+            }},
+            quote! {{
+                let #field = ::kv_codec::Reversible::reverse_decode(&bytes[offset..]);
+                offset += <#field_ty as ::kv_codec::Reversible>::WIDTH;
+            }},
+            quote! { + <#field_ty as ::kv_codec::Reversible>::WIDTH },
+            0, // 宽度由 T::WIDTH 决定（u64/i64 为 8），编译期常量
         ),
         _ => panic!("未知编码 wrapper: {w}"),
     }
@@ -742,11 +847,11 @@ impl EntityKeyGenerator for UserSessionRecord {
 }
 ```
 
-Key 字段（`org_id`、`user_id`）通过 `generate_compiled_key()` 编排为固定宽度二进制；Value 字段（`session_token`、`ip_address`、`is_active`）通过 `bincode::serialize()` 序列化为完整 Payload。两部分在同一个原子 Batch 内提交。
+Key 字段（`org_id`、`user_id`）通过 `generate_compiled_key()` 编排为固定宽度二进制；Value 字段（`session_token`、`ip_address`、`is_active`）通过 `postcard::to_allocvec()` 序列化为完整 Payload。两部分在同一个原子 Batch 内提交。
 
 ### TypedCollection 容器
 
-→ 生产实现中 `KvBackend` 替换为 `AuraStorage` trait（见 [Aura 架构 §5.1](aura-architecture.md#51-存储引擎抽象trait-分离)），通过 `Arc<dyn AuraStorage>` 实现 Fjall/SlateDB 运行时切换。
+→ 生产实现中直接绑定为 `AuraStorage` trait（见 [Aura 架构 §3.1](aura-architecture.md#31-存储引擎抽象trait-分离)），通过 `Arc<dyn AuraStorage>` 实现 Fjall/SlateDB 运行时切换。
 
 ```rust
 use std::marker::PhantomData;
@@ -761,7 +866,7 @@ pub struct TypedCollection<T> {
 impl<T> TypedCollection<T> where
     T: Serialize + serde::de::DeserializeOwned + Clone + EntityKeyGenerator
 {
-    pub fn new(backend: Arc<dyn KvBackend>) -> Self {
+    pub fn new(backend: Arc<dyn AuraStorage>) -> Self {
         Self { _marker: PhantomData, raw_backend: backend }
     }
 
@@ -770,7 +875,7 @@ impl<T> TypedCollection<T> where
         // 1. 宏编译期硬编码的 Key 构造器（零运行时字符串解析）
         let physical_key = entity.generate_compiled_key();
         // 2. 整个对象序列化为二进制 Value Payload
-        let physical_value = bincode::serialize(entity).unwrap();
+        let physical_value = postcard::to_allocvec(entity).unwrap(); // 选型见 serialization-protocol-comparison：postcard（写路径）/ rkyv（只读点查零拷贝）
         // 3. 推入原子写入批次
         batch.push((physical_key, physical_value));
     }
@@ -779,9 +884,9 @@ impl<T> TypedCollection<T> where
     pub fn find_by_key(&self, key_spec: &T) -> Option<T> {
         let target_key = key_spec.generate_compiled_key();
         // let raw = self.raw_backend.get(&target_key)?;
-        // let entity: T = bincode::deserialize(&raw).unwrap();
+        // let entity: T = postcard::from_bytes(&raw).unwrap(); // 高频只读点查换 rkyv 零拷贝
         // Some(entity)
-        None  // 模拟
+        None  // 占位返回：实现示意省略，非真实语义
     }
 }
 ```
@@ -814,129 +919,10 @@ impl<T> TypedCollection<T> where T: EntityKeyGenerator {
         // let current_version = u64::from_be_bytes(current[0..8]);
         // if current_version != expected_version { return false; } // 版本冲突
         // 写入新版本...
-        true
+        true // 占位返回：实现示意省略，仅示意 CAS 成功路径
     }
 }
 ```
-
-## Openraft 状态机集成
-
-OKM 与 Raft 共识层的集成点——状态机将 Raft 日志条目 Apply 到 Fjall，实现本地物理盘的分布式一致性写入。SlateDB 模式不需要 Raft——S3 自身提供 HA，计算节点无状态。
-
-### 核心结构
-
-```rust
-use std::sync::Arc;
-use openraft::{RaftStateMachine, StateMachineData, StateMachineError, LogId};
-use fjall::{Config, Keyspace, PartitionHandle};
-use serde::{Serialize, Deserialize};
-
-/// Raft 状态转换指令——所有写操作必须通过此枚举广播
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum RaftCommand {
-    UpdateActorState {
-        agent_id: String,
-        serialized_context: Vec<u8>,  // CBOR 编码的 Actor 状态快照
-    },
-    TerminateActor {
-        agent_id: String,
-    },
-}
-
-/// 分布式状态机——内嵌 Fjall 物理分区
-pub struct FjallStateMachine {
-    pub keyspace: Keyspace,
-    pub actor_partition: PartitionHandle,  // Actor 状态分区
-    pub meta_partition: PartitionHandle,   // Raft 元数据分区（last_log_id 等）
-}
-```
-
-### 初始化
-
-```rust
-impl FjallStateMachine {
-    pub fn new(path: &str) -> Self {
-        let keyspace = Keyspace::open_default(path)
-            .expect("无法初始化 Fjall 物理存储区");
-        let actor_partition = keyspace.open_partition("actors", Config::default())
-            .expect("无法开辟智能体物理状态分区");
-        let meta_partition = keyspace.open_partition("meta", Config::default())
-            .expect("无法开辟集群元数据分区");
-        Self { keyspace, actor_partition, meta_partition }
-    }
-}
-```
-
-### RaftStateMachine trait 实现
-
-```rust
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StateMachineResponse {
-    pub success: bool,
-}
-
-impl StateMachineData for FjallStateMachine {}
-
-impl RaftStateMachine<openraft::TypeConfig> for Arc<FjallStateMachine> {
-    /// 从 meta_partition 读取上一次成功执行的 Raft 日志 ID，防止状态漂移
-    async fn applied_state_id(
-        &self,
-    ) -> Result<Option<LogId<u32>>, StateMachineError<openraft::TypeConfig>> {
-        if let Ok(Some(bytes)) = self.meta_partition.get("last_log_id") {
-            let log_id = postcard::from_bytes(&bytes).unwrap();
-            Ok(Some(log_id))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// 核心 Apply 逻辑：Raft 日志 → Fjall 物理写入
-    async fn apply<I>(
-        &self,
-        entries: I,
-    ) -> Result<Vec<StateMachineResponse>, StateMachineError<openraft::TypeConfig>>
-    where
-        I: IntoIterator<Item = openraft::Entry<openraft::TypeConfig>> + Send,
-    {
-        let mut responses = Vec::new();
-
-        for entry in entries {
-            let log_id = entry.log_id;
-            if let openraft::EntryPayload::Normal(cmd) = entry.payload {
-                match cmd {
-                    RaftCommand::UpdateActorState { agent_id, serialized_context } => {
-                        // Fjall 单次写入，自带崩溃保护
-                        self.actor_partition.insert(
-                            agent_id.as_bytes(), serialized_context
-                        ).expect("Fjall 本地物理写入异常");
-                        responses.push(StateMachineResponse { success: true });
-                    }
-                    RaftCommand::TerminateActor { agent_id } => {
-                        self.actor_partition.remove(agent_id.as_bytes())
-                            .expect("Fjall 本地擦除异常");
-                        responses.push(StateMachineResponse { success: true });
-                    }
-                }
-            }
-
-            // 实时固化最新 LogId 到元数据分区
-            let log_bytes = postcard::to_stdvec(&log_id).unwrap();
-            self.meta_partition.insert("last_log_id", log_bytes).unwrap();
-        }
-
-        // 强制刷盘到 NVMe——Raft 共识的持久化保证
-        self.keyspace.persist().unwrap();
-        Ok(responses)
-    }
-}
-```
-
-### 物理保证
-
-- **原子性**：Fjall 的 `keyspace.persist()` 保证一次 apply 内所有写入原子落盘
-- **崩溃恢复**：重启后从 `meta_partition` 读取 `last_log_id`，重放未 Apply 的 Raft 日志
-- **错误保护**：Fjall 写入失败触发 panic（系统级保护），不会静默丢数据
-- **与 OKM 的关系**：`RaftCommand::UpdateActorState` 的 `serialized_context` 可以是 OKM 编码的实体——`AuraCollection.save()` 生成的 `(key, value)` 对通过 Raft 广播后，状态机将其 Apply 到 Fjall。SlateDB 模式下直接走 SlateDB async API 写入 S3，无需 Raft 状态机。
 
 ## Python 侧实现：SlateDB 绑定
 
@@ -955,12 +941,17 @@ OKM 的本质是编译在 Key 字节序上的应用层范式——数字命名�
 @dataclass(frozen=True)
 class UserSessionKey:
     org_id: bytes      # 16 字节，编码时校验长度
-    user_id: bytes
-    session_id: bytes
+    user_id: int       # u64 数字 ID
+    session_id: bytes  # 16 字节
 
     def encode(self) -> bytes:
-        assert len(self.org_id) == 16 and len(self.user_id) == 16
-        return b"sess:" + self.org_id + self.user_id + self.session_id
+        assert len(self.org_id) == 16 and len(self.session_id) == 16
+        return (
+            (1).to_bytes(2, "big")             # ns=1 → b"\x00\x01"
+            + self.org_id                      # 16B
+            + self.user_id.to_bytes(8, "big")  # 8B u64
+            + self.session_id                  # 16B
+        )
 ```
 
 过程宏对应物是类装饰器或 `__init_subclass__` 自动生成 encode/decode，配合 mypy/pyright 静态检查约束字段类型，TypedCollection 的类型安全容器也能以泛型 `Generic[T]` 等价搭建。
