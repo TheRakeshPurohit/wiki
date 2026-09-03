@@ -6,7 +6,7 @@
 
 ---
 
-OKM 是对标 ORM 的范式——ORM 将对象映射到关系表，OKM 将对象映射到 KV 键空间。通过自定义过程宏 `#[derive(KvEncode)]` + 数字命名空间 ID，构建零成本抽象语义数据层：开发侧如同 ORM 般声明式，编译后退化为纯指针偏移计算。
+OKM 是对标 ORM 的范式——ORM 将对象映射到关系表，OKM 将对象映射到 KV 键空间。通过自定义过程宏 `#[derive(KeyEncode)]` / `#[derive(ValueEncode)]` + 数字命名空间 ID，构建零成本抽象语义数据层：开发侧如同 ORM 般声明式，编译后退化为纯指针偏移计算。
 
 ## 代码即 DDL：KV 的开发者体验保障
 
@@ -220,7 +220,7 @@ Namespace 3 → logs
 ## DDL 结构体：全定长、零浪费
 
 ```rust
-#[derive(KvEncode)]
+#[derive(KeyEncode)]
 #[kv_ns(1)]  // 编译期翻译为 [0x00, 0x01] 2 字节大端序前缀
 pub struct UserSessionKey {
     pub org_id: [u8; 16],     // 16 字节
@@ -235,7 +235,7 @@ pub struct UserSessionKey {
 ```rust
 /// User 表按 (name, city) 组合字段的二级索引：
 /// [索引字段…]@[主表主键 user_id]，Value 留空（锚点位，仅作前缀扫描回查）
-#[derive(KvEncode)]
+#[derive(KeyEncode)]
 #[kv_ns(2)]  // 编译期翻译为 [0x00, 0x02]
 pub struct UserIndexNameCityKey {
     pub name: String,    // 变长索引字段 1：[len: u16] + UTF-8 字节
@@ -268,17 +268,17 @@ pub struct UserIndexNameCityKey {
 
 ## 编码 Wrapper 类型：字段级压缩（声明即自动编解码）
 
-`KvEncode` 把 kv-storage-engine 的编码原理封装成**字段级 wrapper 类型**——字段类型本身即契约，声明即自动编解码：
+`KeyEncode` 把 kv-storage-engine 的编码原理封装成**字段级 wrapper 类型**——字段类型本身即契约，声明即自动编解码：
 
 ```rust
-#[derive(KvEncode)]
+#[derive(KeyEncode)]
 #[kv_ns(4)]  // logs
 pub struct LogEntryKey {
     pub ts_offset: Offset<i32>,   // 分布集中 → 基准 + 有符号偏移（事件时间）
     pub err_type:   Enum<u8>,     // 低基数 → 枚举编号（日志错误类型）
 }
 
-#[derive(KvEncode)]
+#[derive(KeyEncode)]
 #[kv_ns(5)]  // metrics（append-only 序列）
 pub struct MetricKey {
     pub seq_delta: Delta<i32>,    // 序列相邻差 → 常为正小值，配 VarInt 更省
@@ -342,6 +342,87 @@ impl_reversible!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 与**键布局（字段顺序/主键定宽 vs 索引变长）正交**：wrapper 是**压缩语义**（怎么存），不是**结构语义**（放哪个位置）；两者可叠加（`Offset<i32>` 字段本身仍参与前缀扫描、`Enum` 字段可作索引判别位）。
 
+## Value 侧：版本化 payload 与 TLV 扩展区
+
+Key 层已零浪费（ns 字典 + 定宽偏移），但 value 用 postcard——**非自描述格式**，字段按位置而非按 tag 解码。这使「加字段」成为整行打包布局的结构性代价：旧数据没有字段位置信息，新 reader 无法跳过不认识的尾部。解法不在换布局（见 kv-storage-engine「value 打包粒度」的论证），而在让序列化格式本身可演进。OKM 提供两级机制，按需取用。
+
+### L1：版本化 payload（最简）
+
+value 头带 1 字节 `schema_version`（`u8`——位宽锁死所选类型的固定字节宽，与 Enum/ns 同一决策：版本数不可能逼近 256，u16 是无谓浪费；0 保留为未版本化初始布局）：
+
+```rust
+#[derive(ValueEncode)]
+#[kv_version(2)]                       // 显式声明当前版本，宏写入 value 头
+pub struct AgentMemoryValue {
+    pub content: [u8; 64],             // 定长热区字段
+    pub score:   i32,
+}
+```
+
+宏展开的 `encode_value` / `decode_value`：
+
+```rust
+impl AgentMemoryValue {
+    pub const SCHEMA_VERSION: u8 = 2;
+
+    pub fn encode_value(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 64 + 4);
+        buf.push(Self::SCHEMA_VERSION);            // 1 字节版本头
+        buf.extend_from_slice(&self.content);
+        buf.extend_from_slice(&self.score.to_be_bytes());
+        buf
+    }
+
+    pub fn decode_value(bytes: &[u8]) -> Result<Self, &'static str> {
+        match bytes[0] {
+            2 => Self::decode_v2(&bytes[1..]),     // 当前版本直解
+            1 => Self::decode_v1(&bytes[1..]),     // 旧版本按旧布局解，读时升级
+            _ => Err("未知 schema 版本"),
+        }
+    }
+}
+```
+
+**懒迁移**：`decode_v1` 解出后按 v2 语义补默认值、`encode_value` 写回——Key 不变、零 DDL、新老行共存。纪律：字段只允许**尾部追加**（v1 的字段在 v2 中位置不变），中间插字段 = 破坏旧 reader，被版本号 bump 拦住。
+
+### L2：Tagged/TLV 扩展区（主轴）
+
+L1 的痛点是每加一个字段都要 bump 版本 + 写旧版 decoder。TLV 把「演进」从版本分派降为**字段自描述**：payload 分两段，定长热区（现有 `KeyEncode` 直出，位置契约不变）+ tagged 扩展区（`field_id: u8 + len: u16 + bytes`）：
+
+```rust
+#[derive(ValueEncode)]
+#[kv_version(2)]
+pub struct AgentMemoryValue {
+    pub content: [u8; 64],             // 热区：定长偏移直读
+    pub score:   i32,
+
+    #[kv_ext(id = 1)]                  // 扩展区：新字段声明即归段
+    pub tags:    Vec<String>,
+    #[kv_ext(id = 2)]
+    pub flags:   u8,
+}
+```
+
+物理布局：
+
+```
+[ ver:1B | content:64B | score:4B | ext_count:u8 | (id:1B len:2B bytes)... ]
+  └── 热区，偏移编译期已知 ──┘  └──── tagged 扩展区，逐项跳读 ────┘
+```
+
+- **旧 reader 兼容**：v1 的 decoder 只读到热区末尾，扩展区整段跳过（`ext_count` 之后按 len 跳项）——加字段零迁移、无需写旧版 decoder，这是对 L1 最大痛点的消除。
+- **新 reader 读扩展字段**：扫 tagged 段按 `id` 匹配，未知 id 跳过（向前兼容后继版本）。
+- **`id` 编码方手动分配**，宏不自动编号——自动编号又是一个跨 item 收集状态的需求，与「宏只看得见单个 derive item」的约束同构；手动 id 让字段删除后的 id 不被复用，旧数据不误读。
+- **代价**：每项 3 字节头 + `ext_count` 1 字节，扩展区变长破坏定长容量预算（与 String 字段同策略：含扩展字段的结构体 `encode_value` 退回运行期游标，key 层不受影响——扩展区只存在于 value）。
+
+### L3：热/冷分仓（按需升级）
+
+L2 的扩展区字段读路径是逐项跳读（O(字段数)）。当某个扩展字段升级为高频单字段热路径时，把它**提升进热区**：挪到热区字段列表尾部（旧 reader 凭版本号分派，热区扩展对 v1 是布局变更 → bump 版本，走一次显式迁移），这是唯一的显式动作，被 hex 测试拦住，不静默。
+
+### 与 wrapper 体系的关系
+
+wrapper 是 key 层的**压缩语义**（怎么存一个字段），TLV 是 value 层的**结构语义**（字段之间怎么排布），正交可叠加：扩展区的 `bytes` 内部同样可以用 postcard 编 Struct，热区字段照常享受定宽偏移。原理与取舍的完整论证见 [kv-storage-engine](kv-storage-engine.md)「value 打包粒度：整行 vs 每字段一个 key」。
+
 ## 过程宏实现源码
 
 ### 宏编译器驱动（`kv_codec_derive/src/lib.rs`）
@@ -352,7 +433,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{parse_macro_input, AttrStyle, Data, DeriveInput, Fields, Lit, Meta, Type, Expr};
 
-#[proc_macro_derive(KvEncode, attributes(kv_ns))]
+#[proc_macro_derive(KeyEncode, attributes(kv_ns, kv))]
 pub fn derive_kv_encode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -687,13 +768,13 @@ fn emit_wrapper_codec(
 ### 运行时模块 + 测试（`kv_codec/src/lib.rs`）
 
 ```rust
-pub use kv_codec_derive::KvEncode;
+pub use kv_codec_derive::KeyEncode;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(KvEncode)]
+    #[derive(KeyEncode)]
     #[kv_ns(1)]
     pub struct UserSessionKey {
         pub org_id: [u8; 16],
@@ -738,7 +819,7 @@ mod tests {
     }
 
     // 二级索引：ID 统一放 Key 末尾，Value 留空；前缀扫描返回 Vec<Self>
-    #[derive(KvEncode, Clone)]
+    #[derive(KeyEncode, Clone)]
     #[kv_ns(2)]
     pub struct UserIndexNameCityKey {
         pub name: String,     // 变长索引字段（长度前缀 [len: u16] + UTF-8）
@@ -776,6 +857,138 @@ mod tests {
 }
 ```
 
+### ValueEncode 派生宏（`kv_codec_derive/src/lib.rs`）
+
+KeyEncode 之外的第二个派生宏——只认 value 侧属性（`#[kv_version]` 结构体级、`#[kv_ext]` 字段级），展开 `encode_value` / `decode_value`：
+
+```rust
+#[proc_macro_derive(ValueEncode, attributes(kv_version, kv_ext))]
+pub fn derive_value_encode(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    // 编译期提取版本号（u8），0 保留为未版本化初始布局
+    let version = extract_version(&input);
+
+    let fields = match &input.data {
+        Data::Struct(data_struct) => match &data_struct.fields {
+            Fields::Named(fields_named) => &fields_named.named,
+            _ => panic!("只支持带命名字段的结构体"),
+        },
+        _ => panic!("只支持结构体"),
+    };
+
+    let name = &input.ident;
+    let field_names: Vec<_> = fields.iter().map(|f| f.ident.clone().unwrap()).collect();
+    let mut hot_encode = TokenStream2::new();     // 热区：定宽偏移直写
+    let mut hot_decode = TokenStream2::new();
+    let mut ext_encode = TokenStream2::new();     // 扩展区：TLV 逐项
+    let mut ext_decode = TokenStream2::new();
+    let mut ext_fields: Vec<(String, proc_macro2::TokenStream)> = Vec::new();
+
+    for field in fields {
+        let field_name = &field.ident;
+        let field_type = &field.ty;
+
+        // 字段级属性分派：#[kv_ext(id = N)] → 扩展区；未标注 → 热区
+        let ext_id = extract_ext_id(field);
+
+        match (ext_id, field_type) {
+            (None, Type::Array(ta)) => {
+                let len = &ta.len;
+                hot_encode.extend(quote! { buf.extend_from_slice(&self.#field_name); });
+                hot_decode.extend(quote! {
+                    let mut #field_name = [0u8; #len];
+                    #field_name.copy_from_slice(&bytes[offset..offset + #len]);
+                    offset += #len;
+                });
+            }
+            (None, Type::Path(tp)) if is_numeric(tp) => {
+                let width = numeric_width(tp);   // u64/i64→8, u32/i32→4 …
+                hot_encode.extend(quote! {
+                    buf.extend_from_slice(&self.#field_name.to_be_bytes());
+                });
+                hot_decode.extend(quote! {
+                    let #field_name = #field_type::from_be_bytes(
+                        bytes[offset..offset + #width].try_into().unwrap());
+                    offset += #width;
+                });
+            }
+            (None, Type::Path(tp)) if tp.path.is_ident("String") => {
+                // 热区变长：长度前缀 [len: u16] + UTF-8
+                hot_encode.extend(quote! {
+                    let _s = self.#field_name.as_bytes();
+                    buf.extend_from_slice(&(_s.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(_s);
+                });
+                hot_decode.extend(quote! {
+                    let _len = u16::from_be_bytes(bytes[offset..offset+2].try_into().unwrap()) as usize;
+                    let #field_name = String::from_utf8(bytes[offset+2..offset+2+_len].to_vec())
+                        .map_err(|_| "UTF-8 解码失败")?;
+                    offset += 2 + _len;
+                });
+            }
+            (Some(id), _) => {
+                // 扩展区字段：postcard 打包进 TLV 项（id:1B + len:2B + bytes）
+                ext_fields.push((id.to_string(), quote! { #field_type }));
+                ext_encode.extend(quote! {{
+                    let payload = postcard::to_allocvec(&self.#field_name).unwrap();
+                    buf.push(#id);
+                    buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(&payload);
+                }});
+                ext_decode.extend(quote! {{
+                    // 逐项扫描：匹配 id 解码，未知 id 按 len 跳过（向前兼容）
+                    let (item_id, payload) = next_tlv(bytes, &mut offset);
+                    if item_id == #id {
+                        #field_name = postcard::from_bytes(&payload).unwrap();
+                    }
+                }});
+            }
+            _ => panic!("ValueEncode 热区只接受 [u8; N]、数值类型与 String；结构化字段请标注 #[kv_ext]"),
+        }
+    }
+
+    let expanded = quote! {
+        impl #name {
+            pub const SCHEMA_VERSION: u8 = #version;
+
+            pub fn encode_value(&self) -> Vec<u8> {
+                let mut buf = Vec::new();
+                buf.push(Self::SCHEMA_VERSION);          // 1 字节版本头
+                #hot_encode
+                // 扩展区：ext_count + TLV 项（热区字段越多越早写，位置契约不变）
+                buf.push(#ext_count);
+                #ext_encode
+                buf
+            }
+
+            pub fn decode_value(bytes: &[u8]) -> Result<Self, &'static str> {
+                match bytes[0] {
+                    Self::SCHEMA_VERSION => Self::decode_current(&bytes[1..]),
+                    // 旧版本按旧布局解，读时升级（懒迁移）；未知版本拒绝
+                    _ => Err("未知或过期 schema 版本"),
+                }
+            }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+/// TLV 读取原语：offset 处取 (id, payload)，offset 前移
+fn next_tlv(bytes: &[u8], offset: &mut usize) -> (u8, &[u8]) {
+    let id = bytes[*offset];
+    let len = u16::from_be_bytes(bytes[*offset+1..*offset+3].try_into().unwrap()) as usize;
+    let payload = &bytes[*offset+3..*offset+3+len];
+    *offset += 3 + len;
+    (id, payload)
+}
+
+fn extract_version(input: &DeriveInput) -> u8 { /* 解析 #[kv_version(N)]，同 extract_ns_id */ }
+fn extract_ext_id(field: &syn::Field) -> Option<u8> { /* 解析 #[kv_ext(id = N)] */ }
+```
+
+与 KeyEncode 的分工：宏编译器同一 crate 内两个入口，共享 `is_numeric` 等类型工具；ValueEncode 不接受 `#[kv(reverse)]`（排序方向是 key 的物理问题）与 `#[kv_ns]`（命名空间是 key 的编排问题）——挂错侧的属性直接编译报错。
+
 ## syn→quote 类型映射规则
 
 | 字段类型 | syn 分析 | quote 生成 | 字节宽度 |
@@ -795,130 +1008,165 @@ mod tests {
 - **Cache Locality 极致**：LSM-Tree 布隆过滤器拦截、内存 Seek 查找时 CPU 缓存局部性极好
 - **零运行时开销**：无正则/split/AST，查询路径随 `cargo build --release` 固化为机器码
 
-## TypedCollection：编译期对象空间容器
+## 双派生宏：KeyEncode / ValueEncode / KvRecord
 
-OKM 的上层封装——通过 PhantomData 泛型对底层裸字节 KV 进行类型死锁，对外暴露 100% 类型安全的 ORM 级接口，运行时零开销。
+一个 struct 混装 key 字段与 value 字段、靠属性或注释分区，会让单 derive 宏承担「挑字段」逻辑且语义模糊——key 字段与 value 字段的物理命运本来就不同（前者进字节序排序，后者进 postcard blob），强塞进一个 struct 是声明层的假象。OKM 的最终形态是**三个宏各司其职**：
 
-### 实体声明：Key 字段 + Value 字段
+- `KeyEncode`——物理键序（Key 侧）
+- `ValueEncode`——载荷演进（Value 侧）
+- `KvRecord`——把 K/V 关联进存取接口（组装层，不碰编码）
 
-结构体中一部分字段由宏提取用于编排 Key，剩下的自动作为 Value Payload：
+### KeyEncode：Key 侧派生宏
 
 ```rust
-use kv_codec::KvEncode;
-use serde::{Serialize, Deserialize};
-
-/// 声明式 DDL 契约——看起来像 ORM 实体表
-#[derive(KvEncode, Serialize, Deserialize, Debug, Clone)]
-#[kv_ns(1)]  // 永久死锁在 Namespace ID 1
-pub struct UserSessionRecord {
-    // 【KEY 区】：宏提取 → 大端序定长物理 Key
-    pub org_id: [u8; 16],
-    pub user_id: u64,
-
-    // 【VALUE 区】：业务资产 → 序列化为磁盘行数据
-    pub session_token: String,
-    pub ip_address: u32,
-    pub is_active: bool,
+#[derive(KeyEncode)]
+#[kv_ns(6)]                            // ns 只属于 key 侧
+pub struct AgentMemoryKey {
+    pub session_id: [u8; 16],
+    #[kv(reverse)]                     // 排序方向是 key 的物理问题
+    pub timestamp: u64,
 }
 ```
 
-### EntityKeyGenerator：Key/Value 自动分离 trait
+全字段即 key 字段，宏无「挑字段」逻辑；`#[kv(reverse)]` 排序方向、`#[kv_ns]` 命名空间都挂在自己的宏上，边界天然清晰。展开即「过程宏实现源码」的 key 编码路径（定宽偏移、wrapper 编解码、`encode_prefix`/`scan`）。
 
-宏在编译期自动为结构体实现 `EntityKeyGenerator`，在不解构的前提下分离 Key 字段与 Value 字段：
+### ValueEncode：Value 侧派生宏
 
 ```rust
-/// 过程宏全自动生成的辅助 trait
-pub trait EntityKeyGenerator {
-    const NAMESPACE_ID: u16;
-    fn generate_compiled_key(&self) -> Vec<u8>;
-}
-
-// 宏自动生成的实现
-impl EntityKeyGenerator for UserSessionRecord {
-    const NAMESPACE_ID: u16 = 1;
-
-    fn generate_compiled_key(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + 16 + 8); // 26 字节
-        buf.extend_from_slice(&Self::NAMESPACE_ID.to_be_bytes()); // 2 字节命名空间
-        buf.extend_from_slice(&self.org_id);                        // 16 字节
-        buf.extend_from_slice(&self.user_id.to_be_bytes());        // 8 字节
-        buf
-    }
+#[derive(ValueEncode)]
+#[kv_version(2)]                       // 版本头只属于 value 侧
+pub struct AgentMemoryValue {
+    pub content: [u8; 64],
+    #[kv_ext(id = 1)]                  // TLV 扩展区也是 value 侧的事
+    pub tags: Vec<String>,
 }
 ```
 
-Key 字段（`org_id`、`user_id`）通过 `generate_compiled_key()` 编排为固定宽度二进制；Value 字段（`session_token`、`ip_address`、`is_active`）通过 `postcard::to_allocvec()` 序列化为完整 Payload。两部分在同一个原子 Batch 内提交。
+全字段即 value 字段，postcard 整行打包 + 版本头 + TLV 扩展区（见「Value 侧」章节）。value 侧永远不需要排序方向属性——`#[kv(reverse)]` 在 ValueEncode 上直接编译报错，错误归属明确。
 
-### TypedCollection 容器
-
-→ 生产实现中直接绑定为 `AuraStorage` trait（见 [Aura 架构 §3.1](aura-architecture.md#31-存储引擎抽象trait-分离)），通过 `Arc<dyn AuraStorage>` 实现 Fjall/SlateDB 运行时切换。
+### KvRecord：K/V 关联宏（组装层）
 
 ```rust
-use std::marker::PhantomData;
+#[derive(KvRecord)]
+#[kv_record(key = AgentMemoryKey, value = AgentMemoryValue)]
+pub struct AgentMemory;
+```
+
+职责只有一件事：把两侧绑定进同一个原子 Batch 的存取接口——生成 `Collection` trait 绑定（`save` 积批次 / `find` 点查 / `write` 原子提交，见「Collection trait」节）。不碰编码，不做字段处理。
+
+### 双 struct 的代价与诚实性
+
+业务代码从「一个 struct」变「两个 struct」，读整条记录要 K/V 拼合。但这本是事实的显式化：key 字段进字节序排序、value 字段进序列化 blob，物理命运不同。分开声明让每侧 derive 回归单 item 纯函数，属性归属无歧义，分区猜测整个消失。
+
+### Collection trait：容器契约与 KvCollection 实现
+
+`KvRecord` 展开出的容器契约与 `AuraStorage` 绑定（见 [Aura 架构 §3.1](aura-architecture.md#31-存储引擎抽象trait-分离)）。容器定义为 trait——上层依赖 trait 对象，与 `AuraStorage` trait + `FjallEngine/SlateEngine` 的装配画风统一；具体 struct 只有一个实现：
+
+```rust
 use std::sync::Arc;
 
-/// 零状态、零运行时开销的编译期对象管理器
-pub struct TypedCollection<T> {
-    _marker: PhantomData<T>,  // 编译期类型锁死，运行时 0 字节
-    pub raw_backend: Arc<dyn AuraStorage>,  // FjallEngine 或 SlateEngine
+/// 容器契约：K/V 编排 + 批次缓冲，引擎无关
+pub trait Collection<K: KeyEncode, V: ValueEncode> {
+    /// 编码 → 积入内部批次（不落盘）
+    fn save(&mut self, key: &K, value: &V);
+    /// 点查：key.encode() → 引擎 get → decode（版本分派）
+    fn find(&self, key: &K) -> Option<V>;
+    /// 内部批次一次 WAL 提交，随后清空。
+    /// 纪律：save 积累后必须 write——漏调即丢写，无隐式自动 flush（原子性优先于便利）。
+    fn write(&mut self) -> Result<(), StorageError>;
 }
 
-impl<T> TypedCollection<T> where
-    T: Serialize + serde::de::DeserializeOwned + Clone + EntityKeyGenerator
-{
-    pub fn new(backend: Arc<dyn AuraStorage>) -> Self {
-        Self { _marker: PhantomData, raw_backend: backend }
+/// 唯一实现：泛型约束到 AuraStorage；批次缓冲与引擎句柄即全部状态
+pub struct KvCollection<A: AuraStorage, K: KeyEncode, V: ValueEncode> {
+    backend: A,
+    batch: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl<A: AuraStorage, K: KeyEncode, V: ValueEncode> Collection<K, V> for KvCollection<A, K, V> {
+    fn save(&mut self, key: &K, value: &V) {
+        let physical_key = key.encode();
+        let physical_value = value.encode_value();
+        self.batch.push((physical_key, physical_value));
     }
 
-    /// 类 ORM 体验：将结构体原生存入系统
-    pub fn save(&self, batch: &mut WriteBatch, entity: &T) {
-        // 1. 宏编译期硬编码的 Key 构造器（零运行时字符串解析）
-        let physical_key = entity.generate_compiled_key();
-        // 2. 整个对象序列化为二进制 Value Payload
-        let physical_value = postcard::to_allocvec(entity).unwrap(); // 选型见 serialization-protocol-comparison：postcard（写路径）/ rkyv（只读点查零拷贝）
-        // 3. 推入原子写入批次
-        batch.push((physical_key, physical_value));
+    fn find(&self, key: &K) -> Option<V> {
+        let raw = self.backend.get(&key.encode())?;
+        V::decode_value(&raw).ok()
     }
 
-    /// 类 ORM 体验：通过 Key 字段精准点查
-    pub fn find_by_key(&self, key_spec: &T) -> Option<T> {
-        let target_key = key_spec.generate_compiled_key();
-        // let raw = self.raw_backend.get(&target_key)?;
-        // let entity: T = postcard::from_bytes(&raw).unwrap(); // 高频只读点查换 rkyv 零拷贝
-        // Some(entity)
-        None  // 占位返回：实现示意省略，非真实语义
+    fn write(&mut self) -> Result<(), StorageError> {
+        let result = self.backend.write(&self.batch);
+        self.batch.clear();
+        result
     }
 }
 ```
 
-### 上层业务代码的极致清爽
+相比具体 struct 的两个红利：
+
+- **`PhantomData<(K, V)>` 消失**——类型参数直接落在字段泛型上（`backend: A`、方法约束 `K`/`V`），不再有空转的 marker 字段。
+- **批次缓冲内聚**——`save` 多次积累、`write` 一次原子落盘，调用方不再自带 `WriteBatch`；单写者用 `&mut self` 表达自然的所有权模型，多路并发各持实例（`Arc` 克隆廉价）。
+
+#### 存储的落点：三层归属
+
+实际 KV 存储不在宏层，归属自上而下三层，各管一段：
+
+```
+KeyEncode / ValueEncode 派生宏    ← 纯编译期编解码，零 I/O，不知道任何引擎
+        ↓ 展开出的纯函数
+Collection trait + KvCollection  ← backend: A (AuraStorage)，唯一摸引擎的字段
+        ↓ trait 分派
+AuraStorage（FjallEngine / SlateEngine）   ← 真实 KV 存储在这层
+```
+
+- **宏层刻意无存储**：编码契约（字节怎么排）与引擎可替换性（字节放哪）解耦，宏才能保持单 item 纯函数。`encode()` / `encode_value()` 只做 `Vec<u8>` 进出。
+- **`A: AuraStorage` 是引擎的唯一入口**，构造时注入——由上层装配处决定 Fjall 还是 SlateDB：
 
 ```rust
-fn process_login(collection: &TypedCollection<UserSessionRecord>, data: UserSessionRecord) {
-    let mut batch = Vec::new();
+// 装配处：引擎选择 + 生命周期归这里管，不归宏、不归 Collection 本身
+let engine: Arc<dyn AuraStorage> = match deploy_mode {
+    DeployMode::Local => Arc::new(FjallEngine::open("/var/lib/aura/keyspace")?),
+    DeployMode::Cloud => Arc::new(SlateEngine::open_s3("s3://aura-bucket/db").await?),
+};
+let collection: Arc<Mutex<dyn Collection<AgentMemoryKey, AgentMemoryValue>>> =
+    Arc::new(Mutex::new(KvCollection::new(engine)));
 
-    // 零原始字节操作、零手动前缀拼接、零恶心分隔符字符串
-    collection.save(&mut batch, &data);
-
-    println!("写入 Namespace: {}", UserSessionRecord::NAMESPACE_ID);
-}
+// 使用处：save 积累 → write 一次原子落盘，全链路不感知引擎差异
+collection.lock().unwrap().save(&key, &value);
+collection.lock().unwrap().write()?;   // 一次 WAL 提交，原子性落在引擎层
 ```
 
-开发人员面对的是纯粹的 Rust 领域模型。宏在编译期把所有类型信息蒸发，直接打穿底层 KV 引擎的硬件极限性能。上层是 ORM 般的声明式体验，底层是裸字节级的指针偏移计算。
+- **原子性落在引擎层**：`write` 把积攒的物理字节一次提交给 AuraStorage 实现体（Fjall keyspace / SlateDB 实例）；实例生命周期归装配处管理，Collection 只持句柄。
+
+### 上层业务代码
+
+```rust
+fn process_login(collection: &Mutex<dyn Collection<AgentMemoryKey, AgentMemoryValue>>,
+                 key: AgentMemoryKey, value: AgentMemoryValue) -> Result<(), StorageError> {
+    let mut repo = collection.lock().unwrap();
+
+    // 零原始字节操作、零手动前缀拼接、零分区猜测
+    repo.save(&key, &value);
+    repo.write()?;
+
+    println!("写入 Namespace: {}", AgentMemoryKey::NAMESPACE_ID);
+    Ok(())
+}
+```
 
 ### 运行时冲突检测方向
 
-TypedCollection 可以扩展乐观冲突检测——基于 MVCC 版本号的 CAS 乐观锁重试循环，抵御多线程并发对同一 Session 的更新擦除：
+Collection 可扩展乐观冲突检测——基于 MVCC 版本号的 CAS 乐观锁重试循环，抵御多线程并发对同一记录的更新擦除：
 
 ```rust
-impl<T> TypedCollection<T> where T: EntityKeyGenerator {
-    /// 乐观锁写入：版本号不匹配时自动重试
-    pub fn save_with_cas(&self, batch: &mut WriteBatch, entity: &T, expected_version: u64) -> bool {
-        let key = entity.generate_compiled_key();
-        // let current = self.raw_backend.get(&key)?;
-        // let current_version = u64::from_be_bytes(current[0..8]);
+impl<A: AuraStorage, K: KeyEncode, V: ValueEncode> KvCollection<A, K, V> {
+    /// 乐观锁写入：版本号不匹配时返回 false，调用方重试
+    pub fn save_with_cas(&mut self, key: &K, value: &V, expected_version: u64) -> bool {
+        let physical_key = key.encode();
+        // let current = self.backend.get(&physical_key)?;
+        // let current_version = u64::from_be_bytes(current[0..8].try_into().unwrap());
         // if current_version != expected_version { return false; } // 版本冲突
-        // 写入新版本...
+        // 编码积入批次，write 时一并原子提交...
         true // 占位返回：实现示意省略，仅示意 CAS 成功路径
     }
 }
@@ -954,7 +1202,7 @@ class UserSessionKey:
         )
 ```
 
-过程宏对应物是类装饰器或 `__init_subclass__` 自动生成 encode/decode，配合 mypy/pyright 静态检查约束字段类型，TypedCollection 的类型安全容器也能以泛型 `Generic[T]` 等价搭建。
+过程宏对应物是类装饰器或 `__init_subclass__` 自动生成 encode/decode，配合 mypy/pyright 静态检查约束字段类型，Collection trait 的类型安全容器也能以泛型 `Generic[T]` 等价搭建。
 
 ### 保障级别的结构性差距
 
