@@ -496,7 +496,7 @@ fn score_key(prefix: &[u8], score: i64, member: &[u8]) -> Vec<u8> {
 
 所有 Score 共享同一字节长度（8 bytes），高位补零由硬件指令自动完成，字典序 = 数值序。
 
-#### 重要应用：补码反转（Complement Encoding）—— 无符号时间戳的倒序
+#### 重要应用：补码反转（Complement Encoding）—— 时间戳的倒序
 
 KV 引擎按 Key 字节序从小到大（字典序）严格排序。时间戳递增时，新数据天然排在最底下。为了实现「最新数据排在最上面」（方便取 Top-N 最新记忆），框架设计中有一个教科书级的物理黑客手段——最大值减去当前值：
 
@@ -517,7 +517,7 @@ key_descending.extend_from_slice(&inverted_time.to_be_bytes()); // 大端序保�
 
 **应用场景**：Agent 对话历史倒序加载、排行榜取最新记录、日志时间线倒序读取。任何需要「最新优先」的前缀扫描场景都适用。与 `SeekForPrev` 反向迭代器互补——后者依赖引擎支持，补码反转在所有 KV 引擎上通用。
 
-> **对齐**：此处的 `timestamp` / `inverted_time` 均为 u64 无符号，属总纲「无符号正整数大端保序」保证的范畴——补码反转正是在这一支上叠加倒序变换，不涉及有符号 / 浮点的额外变换。
+> **对齐**：此处的 `timestamp` / `inverted_time` 为 u64，属总纲「无符号正整数大端保序」保证的范畴——补码反转正是在这一支上叠加倒序变换。该变换适用于全部定宽整型：有符号补码整数经偏移（加 `i64::MIN` 绝对值）即得无符号保序域，逐位取反同样保持倒序性质；浮点因 IEEE 754 字节序与数值序不同构被排除，须先 Quant 归桶成整型再反转（实现口径见 object-keyspace-mapping「编码 Wrapper 类型」的 `Reversible` trait）。
 
 ### 索引主键 ID：统一放 Key 末尾，Value 留空
 
@@ -623,7 +623,7 @@ Namespace 3 → logs
 
 KV 不止要对齐 key 结构，还要把字段的**内容**压小。原则：先问数据的**维度**，再选技巧——目标是用体积换更快的比较 / 索引 / 排序，代价是读路径解码复杂度。**类型驱动实现见 [object-keyspace-mapping](object-keyspace-mapping.md)「编码 Wrapper 类型」**（`Enum<u8>` / `Offset<i32>` / `Delta<i32>` … 声明即自动编解码）。
 
-按「压什么」分四个维度：
+按「压什么」分五个维度：
 
 - **基数维度**（值种类少）
   - **低基数编号**：枚举等基数封闭的值 → 编号，**位宽锁死所选类型的固定字节宽**（≤256 个变体用 `u8`），不按当前基数动态推导——推导需运行期登记（`LazyLock` 参与编码计算），且位宽随变体数增长自动扩展会让历史 key 布局漂移。日志错误类型 / 状态 / 类别。
@@ -637,6 +637,8 @@ KV 不止要对齐 key 结构，还要把字段的**内容**压小。原则：�
   - **VarInt**：常见小值 1 字节、大值扩展（LEB128）——与定宽互补，压「常见值」而非「上限」。
   - **量纲缩放 / 精度归一**：时间降精度（ns→ms）或归桶（小时桶），直接降基数 / 缩位宽。
   - **位字段打包**：多个枚举 / 布尔分段打包进同一字节。
+- **排序方向维度**（字节序扫描顺序颠倒）
+  - **补码反转**：定宽整型逐位取反，正序字节序变倒序——prefix scan 首条即最新（时间线、最新优先列表）。原理见「物理层编码范式」补码反转一节；实现为 `Reverse<T>` wrapper，`Reversible` trait 编译期白名单（仅定宽整型，浮点排除），见 object-keyspace-mapping「编码 Wrapper 类型」。
 
 **取舍**：四维度不互斥、可叠加（`Offset<i32>` 字段仍参与前缀扫描）。核心代价 = 读路径**解码复杂度**（VarInt / Delta 尤甚）与**随机访问损失**（Delta / RLE 顺序依赖）。「零解析」只在定宽 / 全局基准这类读 O(1) 时成立；变长压缩读需解码，只在压缩收益超过解码成本时才值得。
 
@@ -654,18 +656,16 @@ pub struct AgentMemoryKey {
 }
 
 impl AgentMemoryKey {
-    /// 序列化：领域模型 → 固定 30 字节二进制流（无堆分配）
+    /// 序列化：领域模型 → 固定 28 字节二进制流（无堆分配）
     pub fn serialize_to_bytes(&self) -> Vec<u8> {
-        // 4(tenant) + 1(/) + 16(session) + 1(/) + 8(time) = 30 字节
-        let mut buf = Vec::with_capacity(30);
+        // 4(tenant) + 16(session) + 8(time) = 28 字节，全定宽靠偏移切分，无分隔符
+        let mut buf = Vec::with_capacity(28);
 
         // 租户 ID（大端序）
         buf.extend_from_slice(&self.tenant_id.to_be_bytes());
-        buf.extend_from_slice(b"/");
 
         // 会话 UUID（固定 16 字节，无需编码）
         buf.extend_from_slice(&self.session_id);
-        buf.extend_from_slice(b"/");
 
         // 倒序时间戳（补码反转，最新优先）
         let inverted_time = u64::MAX - self.timestamp;
@@ -676,14 +676,14 @@ impl AgentMemoryKey {
 
     /// 反序列化：二进制切片 → 领域模型（零拷贝，纳秒级）
     pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() != 30 {
+        if bytes.len() != 28 {
             return Err("非法的物理 Key 长度约束违规");
         }
 
         let tenant_id = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
         let mut session_id = [0u8; 16];
-        session_id.copy_from_slice(&bytes[5..21]);
-        let inverted_time = u64::from_be_bytes(bytes[22..30].try_into().unwrap());
+        session_id.copy_from_slice(&bytes[4..20]);
+        let inverted_time = u64::from_be_bytes(bytes[20..28].try_into().unwrap());
         let timestamp = u64::MAX - inverted_time;  // 反转还原
 
         Ok(Self { tenant_id, session_id, timestamp })
@@ -691,7 +691,7 @@ impl AgentMemoryKey {
 }
 ```
 
-**设计要点**：所有字段固定宽度（4+16+8=28 字节 + 2 分隔符 = 30 字节），反序列化无需解析、无需堆分配，纯指针切片操作。倒序时间戳内嵌在 Key 中，正向迭代器扫描即得「最新优先」结果。
+**设计要点**：所有字段固定宽度（4+16+8=28 字节），定宽字段靠偏移即可切分，无分隔符；反序列化无需解析、无需堆分配，纯指针切片操作。倒序时间戳内嵌在 Key 中，正向迭代器扫描即得「最新优先」结果。
 
 ## SQL 操作的 KV 实现
 
@@ -1026,8 +1026,8 @@ meta:entry_point      → [u32]                   ← 图入口节点
 ```rust
 // 伪代码：在宿主 Actor 的 KV 存储中融合向量持久化
 pub fn save_vector_node(&self, partition: &PartitionHandle, vector_id: &str, embedding: &[f32]) {
-    // 采用 Bincode 极速紧凑序列化
-    let serialized_vec = bincode::serialize(embedding).unwrap();
+    // postcard 紧凑序列化（定论见序列化协议分析对比）
+    let serialized_vec = postcard::to_allocvec(embedding).unwrap();
 
     // 写入本地磁盘（Fjall 示例；任意嵌入式 KV 等价）
     partition.insert(format!("V:{}", vector_id).as_bytes(), serialized_vec).unwrap();
@@ -1108,7 +1108,7 @@ impl SearchEngine {
         // 2. 将词频原子化写入倒排索引分区
         for (term, count) in term_counts {
             let index_key = format!("T:{}:{}", term, doc_id);
-            let val = bincode::serialize(&count).unwrap();
+            let val = postcard::to_allocvec(&count).unwrap();
             self.index.insert(index_key.as_bytes(), val).unwrap();
         }
     }
@@ -1212,7 +1212,7 @@ impl GraphIndexer {
     pub fn insert_edge(&self, src: &str, edge_type: &str, dst: &str, weight: f32) {
         let out_key = format!("E:out:{}:{}:{}", src, edge_type, dst);
         let in_key = format!("E:in:{}:{}:{}", dst, edge_type, src);
-        let val = bincode::serialize(&weight).unwrap();
+        let val = postcard::to_allocvec(&weight).unwrap();
 
         // 顺序落盘，布隆过滤器会自动加速单键判定
         self.out_edges.insert(out_key.as_bytes(), val).unwrap();
