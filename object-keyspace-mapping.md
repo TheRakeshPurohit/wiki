@@ -421,7 +421,7 @@ L2 的扩展区字段读路径是逐项跳读（O(字段数)）。当某个扩�
 
 ### 与 wrapper 体系的关系
 
-wrapper 是 key 层的**压缩语义**（怎么存一个字段），TLV 是 value 层的**结构语义**（字段之间怎么排布），正交可叠加：扩展区的 `bytes` 内部同样可以用 postcard 编 Struct，热区字段照常享受定宽偏移。原理与取舍的完整论证见 [kv-storage-engine](kv-storage-engine.md)「value 打包粒度：整行 vs 每字段一个 key」。
+wrapper 是 key 层的**压缩语义**（怎么存一个字段），TLV 是 value 层的**结构语义**（字段之间怎么排布），正交可叠加：扩展区的 `bytes` 内部同样可以用 postcard 编 Struct，热区字段照常享受定宽偏移。原理与取舍的完整论证见 [kv-storage-engine](kv-storage-engine.md)「value 打包粒度：整行 vs 每字段一个 key」；与引擎级 block 压缩（LZ4）的分工边界（磁盘压缩归引擎、变长 wrapper 只解内存驻留矛盾）见同文档「编码层与引擎层的分工」。
 
 ## 过程宏实现源码
 
@@ -1161,6 +1161,8 @@ collection.write()?;   // 一次 WAL 提交，原子性落在引擎层
 ```
 
 - **原子性落在引擎层**：`write` 把积攒的物理字节一次提交给 AuraStorage 实现体（Fjall keyspace / SlateDB 实例）；实例生命周期归装配处管理，Collection 只持句柄。
+
+- **对接强类型引擎（如 redb）**：redb 的 `Key`/`Value` trait 已原生承担「类型 ↔ 字节」转换，此时宏的 emit 目标从自由函数改为 trait impl——`KeyEncode` 展开 `impl redb::Key`（含自定义 `compare`），`ValueEncode` 展开 `impl redb::Value`，编码规则一字不改，宏层「零 I/O、纯编解码」的设计正为此预留。布局语义与跨类型纪律仍归 OKM，论证见 [kv-storage-engine](kv-storage-engine.md)「编码层与引擎层的分工」。
 
 ### 上层业务代码
 
