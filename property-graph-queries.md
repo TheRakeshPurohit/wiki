@@ -26,7 +26,8 @@ CREATE PROPERTY GRAPH org_graph
   EDGE TABLES (
     org_membership KEY id
       SOURCE KEY(org_id) REFERENCES organizations(id)
-      DESTINATION KEY(user_id) REFERENCES users(id),
+      DESTINATION KEY(user_id) REFERENCES users(id)
+      LABEL org_membership,
     org_hierarchy KEY id
       SOURCE KEY(parent_org_id) REFERENCES organizations(id)
       DESTINATION KEY(org_id) REFERENCES organizations(id),
@@ -35,6 +36,15 @@ CREATE PROPERTY GRAPH org_graph
       DESTINATION KEY(user_b) REFERENCES users(id)
   );
 ```
+
+边表的 `LABEL` 子句给边声明标签——图匹配模式里 `-[e IS org_membership]->` 引用的就是这个 label；省略 `LABEL` 时默认以表名作 label（所以上面的例子里写不写结果相同）。
+
+label 不是表名的冗余别名，两者是不同层的名字：表名是物理层的，label 是查询层的，图模式语法里只有 label 可见。解耦的意义在两条：
+
+- **多表共用一个 label**：两张物理表（如人工写入的 `user_org_membership` 和系统写入的 `app_org_membership`，写入控制不同、字段不同）可声明同一个 label，一条图模式同时遍历两表（引擎内部 union）；反过来一张边表也可声明多个 label，同一批边按不同语义口径被引用。按表名过滤做不到这两点。
+- **表结构重构不动查询**：拆表、合表、改表名，只需改图声明这一处，查询层的 label 词汇表保持稳定。
+
+§七的 `LABEL (rel)` 把列值提升成 label（一张物理边表在图层面呈现为多个 label），是这条解耦的进阶用法——那里的 label 是动态的，本节的 label 是常量。
 
 图像层只负责"怎么查"；**"谁能写"回到底层表权限**。这带来一个直接推论：需要严格保护的边（如用户-组织成员关系），在**边表上**用 FK + 表权限锁死写入，不开放给 LLM/Agent，图的声明对此无副作用。
 
@@ -48,9 +58,10 @@ CREATE PROPERTY GRAPH org_graph
 -- 找 user 所在子组织能触达的所有 skill（沿 membership + hierarchy 混合遍历）
 SELECT DISTINCT s.name
 FROM GRAPH_TABLE (org_graph
-  MATCH (u:users)-[:org_membership]->(o:organizations)
-       -[:org_hierarchy]->(o2:organizations)
-       -[:skill_scope]->(s:skills)
+  MATCH (u IS users)
+       -[e1 IS org_membership]->(o IS organizations)
+       -[e2 IS org_hierarchy]->(o2 IS organizations)
+       -[e3 IS skill_scope]->(s IS skills)
   WHERE u.id = ?)
 AS gt;
 ```
@@ -87,9 +98,10 @@ SQL/PGQ 标准**不提供友好的跨图查询**——图匹配一次作用于�
 -- 从 user 出发，沿 org_membership + org_hierarchy 遍历到可达 skill
 SELECT DISTINCT s.name
 FROM GRAPH_TABLE (org_graph
-  MATCH (u:users)-[:org_membership]->(o:organizations)
-       -[:org_hierarchy]->(o2:organizations)
-       -[:skill_scope]->(s:skills)
+  MATCH (u IS users)
+       -[e1 IS org_membership]->(o IS organizations)
+       -[e2 IS org_hierarchy]->(o2 IS organizations)
+       -[e3 IS skill_scope]->(s IS skills)
   WHERE u.id = ?)
 AS gt;
 ```
@@ -154,14 +166,105 @@ CREATE TABLE edges (
 );
 
 CREATE PROPERTY GRAPH g
-  VERTEX TABLES (users KEY id, orgs KEY id, skills KEY id, ...)
+  VERTEX TABLES (
+    users  KEY id,
+    orgs   KEY id,
+    skills KEY id
+  )
   EDGE TABLE edges
-    KEY (src_type, src_id) REFERENCES ...
-    DESTINATION KEY (dst_type, dst_id) REFERENCES ...
-    LABEL (rel);              -- 关系类型变成动态 label
+    KEY (src_type, src_id)
+      SOURCE KEY (src_id)
+      DESTINATION KEY (dst_id)
+      LABEL (rel);              -- 关系类型变成动态 label
 ```
 
+`SOURCE KEY`/`DESTINATION KEY` 不带 `REFERENCES`：端点是多态的（`src_type` 指向 users/orgs/skills 中任意一张表），FK 只能指向单一表，按类型约束端点写不出来——端点合法性只能由应用层保证，这是通用边表相对显式边表（§二）牺牲的第二个东西（第一个是 label 集合的封闭性）。
+
 加新关系 = INSERT 一行（rel 列填新值），不用建表、不用改图。但注意边界：PGQ 的 label 集合仍需在某种程度上可预期（图匹配 `[:rel]` 要写全）；若 rel 是完全开放的涌现值，图匹配语法写不全，就回到"按 rel 列谓词过滤"——那是纯三元组表的地盘。
+
+通用边表并不排斥图查询：SQL/PGQ 允许同一张边表在 `EDGE TABLES` 中声明多次，每次绑定不同的端点顶点表、给不同 label：
+
+```sql
+CREATE PROPERTY GRAPH g
+  VERTEX TABLES (
+    users  KEY id,
+    orgs   KEY id,
+    skills KEY id
+  )
+  EDGE TABLES (
+    edges KEY (src_type, src_id)
+      SOURCE KEY (src_id) REFERENCES users(id)
+      DESTINATION KEY (dst_id) REFERENCES orgs(id)
+      LABEL user_org_edges,
+    edges KEY (src_type, src_id)
+      SOURCE KEY (src_id) REFERENCES users(id)
+      DESTINATION KEY (dst_id) REFERENCES skills(id)
+      LABEL user_skill_edges
+  );
+```
+
+声明之后 `MATCH (u IS users)-[e IS user_org_edges]->(o IS orgs)` 是正经图查询，可遍历。代价是**每个（源类型, 目标类型）组合都要声明一条**，且必须预先知道有哪些组合——类型组合一多声明就爆炸。所以图查询的适用面随声明收窄：关系组合少且稳定，声明后照常图查；关系完全涌现，图模式表达不了（顶点元素只能绑定一张顶点表，没有「任意顶点」，边端点也只能 REFERENCES 到具体一张表），才退到 `src_type`/`dst_type` 列 JOIN。
+
+查询侧的两种形态对应这个分界：
+
+```sql
+-- 图匹配：label 写在模式里，仍然写全（label 集合可预期时）
+SELECT GRAPH_TABLE (g
+  MATCH (u IS users)-[e IS membership]->(o IS orgs)
+  COLUMNS (u.name, o.name)
+)
+WHERE u.name = 'alice';
+
+-- rel 完全开放、图匹配写不全时，退回按 rel 列谓词过滤（纯三元组表用法）
+SELECT * FROM edges
+WHERE src_id = 42 AND rel = 'mentored';
+```
+
+### 通用节点表与混合形态
+
+通用边表通常和**通用节点表**配对出现。边要动态，节点同样有这个需求：按 [graph-memory.md](graph-memory.md) 的术语，**域内实体**（用户、组织、商品——属性结构稳定、有数据库稳定 id）用显式表；**域外实体**（自由知识对象、外部概念——属性开放、无稳定身份）用通用节点表：
+
+```sql
+CREATE TABLE nodes (
+  id   BIGINT KEY,
+  kind TEXT,          -- 节点类型：对应表名或逻辑类型名
+  data JSON           -- 该类型的属性，schema 外置
+);
+```
+
+`nodes` 加进 `VERTEX TABLES`（`nodes KEY id`）即可入图。**混合形态下通用边表从可选变成必须**：一条边从域内表（`users`）连到 `nodes` 是常态，「同表多次声明」虽能覆盖跨表边，但组合数量 = 域内类型数 × 域外类型数，而域外类型不预先可知，声明仍会爆炸。所以域内实体之间的边也统一走通用边表，显式边表只留给需要 FK 锁死的信任边界（org_membership，见 §五）——「严格性按边分」在混合形态下的自然推论。
+
+混合形态的代价：
+
+- 域内实体进了通用边表，丢失 FK 端点约束（前述牺牲扩大到全部实体间关系）
+- `nodes.data` 的 JSON 列把该类型属性的 schema 约束全部让渡给应用层，`data->>'x'` 谓词走不了普通列索引（可用 JSON 索引或物化视图部分补救）
+- 「域内 vs 域外」的分界是流动的：某类域外节点获得稳定身份后要「毕业」进域内显式表，涉及数据迁移和所有 `src_type='nodes'`/`dst_type='nodes'` 历史边的改写，成本应在设计时预知
+
+**按节点定表形态**，与按图定动态度同构：域内实体进显式表（结构稳定、有 id、要约束要索引）；域外实体进 `nodes`（属性开放、无稳定身份、寿命短）。两者共存于一张图是常态，不是妥协。
+
+混合形态的三种典型查询：
+
+```sql
+-- 1) 域内 → 域外跨表边：图查询照常可用（前提：edges 声明了 users→nodes 组合）
+SELECT GRAPH_TABLE (g
+  MATCH (u IS users)-[e IS edges]->(n IS nodes)
+  COLUMNS (u.name, e.rel, n.kind)
+)
+WHERE u.id = 42;
+
+-- 2) 域外节点属性过滤：JSON 列谓词（schema 让渡给应用层的具体形态）
+SELECT * FROM nodes
+WHERE kind = 'paper' AND data->>'year' = '2026';
+
+-- 3) 域外之间的开放遍历：图模式没有「任意顶点」，退到底层表 JOIN
+SELECT n2.*
+FROM edges e1
+JOIN nodes n1 ON e1.src_type = 'nodes' AND e1.src_id = n1.id
+JOIN nodes n2 ON e1.dst_type = 'nodes' AND e1.dst_id = n2.id
+WHERE n1.kind = 'concept' AND e1.rel = 'contradicts';
+```
+
+三个例子各对应一个论点：跨表边图查可用（但受声明组合约束）、JSON 谓词是索引让渡的代价现场、真开放遍历只有 JOIN 能表达。
 
 **结论：按图定动态度。** 权限图关系类型封闭，方案 A（通用边表 + 多 label）恰到好处，预定义一次几十行 DDL 可接受；记忆图关系开放，用纯三元组 `(s,p,o)`，零定义。若要在单图内做到完全显式动态（无任何声明），SQL/PGQ 本性不支持——类型是列约束，那正是 DuckDB/纯三元组的兜底位置。
 
