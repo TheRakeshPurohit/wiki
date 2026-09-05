@@ -83,34 +83,28 @@ Chromium 是 **process-per-page**（每页面一个 renderer，无论一窗多�
 
 ## 七、窗口管理与热键
 
-窗口管理目标：浏览器窗口自成一组，既方便单独唤起，又不淹没通用窗口切换器。
+窗口管理目标：**统一切换**——mudra 的每个 page 窗口就是普通 niri 窗口，直接出现在 Alt+Tab（`recent-windows`）里，不需要在浏览器内部再维护一套自己的切换方式（像多标签浏览器那样的双层切换）。窗口过多只是副作用，需要时在 launcher 中过滤窗口即可；**最常用的依然是 Alt+Tab**。
 
-- **独立 walker 菜单（类 cwdhist / windowsmru）**：专列浏览器窗口，查 `niri msg -j windows` 按过滤标准列出，独立热键触发。通用 windowsmru 菜单按同一标准排除浏览器窗口 → 不被淹没。**注意**：niri **无原生**「从切换器排除某类窗口」的开关——默认配置里根本没有 Alt+Tab 绑定（其导航是 workspace 式 Mod+HJKL + Mod+O overview）。浏览器窗口不被淹没 靠的是**一隔离维度一 workspace 的结构性隔离** + 专用 walker 菜单，而非过滤原生 Alt+Tab。
-- **Alt+Tab 过滤（实现）**：把 Alt+Tab 重绑为一个 walker 窗口菜单，列表**排除浏览器前缀** → 即「不含浏览器的 Alt+Tab」；niri 原生切换无法过滤，只能由 launcher 层顶替。
-- **过滤标准**：原生 Wayland 窗口元数据只有 `app_id` 与 `title`（无任意 tag）→ "元数据过滤"的现实选项 = title 前缀 / app_id / workspace / **url**。
-  - **title 前缀**：wrapper 打开 `--app` 窗口时加统一前缀（如 `◆` 或实例名），wrapper 自身可控，最稳。
-  - **workspace**：隔离实例的窗口路由到专用 workspace（如 `web:<name>`），菜单按 workspace 过滤，兼具分组意义。
-  - **url**：页面 url 实时记录，可按地址过滤。
-- **walker 模式与切换**：把"当前上下文"（situation）作为切换主键——在 `inbox / work / personal / privacy` 间切换（默认 inbox），列表按 situation 过滤对应实例的 open pages；`#` 进入**操作模式**（对当前聚焦 page 提供关闭、收藏、复制链接等）。**page** 搜索 = 当前上下文实例的打开窗口，`Enter` 切过去（`activateTarget` + niri focus window）。全局 page（IM 常驻）在任意上下文都可访问（pin 实例），不随 situation 改变。
+- **不加 title 前缀、不做排除**：早期方案曾打算给 `--app` 窗口加 title 前缀以便从通用切换中过滤/排除——已废弃。单独 page 窗口能直接 Alt+Tab 切换、能在 launcher 中过滤，本身就是优势；专门的 mudra 窗口菜单不再必要。
+- **mudra 专属视图交给 web 控制台**：控制台（`mudra ui`，chromium `--app` 载入本地面板）里显示的只有 mudra 的 page；实例启动时即记录地址、pid、窗口 id 等映射，不依赖窗口 title。**Mod+Space（Win+Space）绑定打开该控制台**（NixOS niri 配置，替代原 cwdhist 直达）。
+- **无需 launcher 改造**：早期方案保留 launcher `p` 模式作为 page 热路径——已废弃。mudra 的全部管理面收敛到 web 控制台：**搜索过滤、操作（聚焦/关闭/移动等）、tag 森林树形展示**都在控制台完成。launcher 侧零改动（仅 Mod+Space 绑定）。
 - **关闭语义**：mudra 主动关闭 → 从归档**删除**该页（不留痕）；通过 niri 关窗 / 意外（崩溃）关闭 → **保留**（仅标 closed，不删）——主动关不留痕，外部/意外关不丢。
 
 **分拣：页面树 → workspace**：把某个页面连同它的**整棵子树**移到独立 workspace，用于归类（WM 层操作）。
 
-**launcher 交互（walker）**——launcher 层承载**热路径单动作**，富交互交给面板：
-- `p` = **Page 模式**（保留）：页面列表 → 聚焦 / 关闭 / 移动到当前窗口 / 交换。
-- **tag 富操作（评分轴、tag 多选批量、排序）移交给管理面板**（`mudra ui`，solidjs）。
-  早期草案的 `t`（tag）/`a`（Action）/`s`（sort）三模式被面板吸收，launcher 不再承担。
-  面板规格见 mudra 仓 `docs/PANEL.md`。
-动作回调 `mudra CLI`；`p` 列表按 tag / situation 过滤。
+**交互收敛（2026-09 定稿）**：launcher（walker elephant menus 的 `p`/`t`/`a`/`s` 模式及后续 `p` 保留方案）整体废弃；交互两层——
+1. **Alt+Tab / windowsmru**：统一切换，窗口过多时系统级过滤；
+2. **web 控制台**：搜索过滤、全部管理操作、tag 森林树形展示（tag 多选批量、评分轴、排序也在此）。
+CLI 保留为脚本化事实源，不承担交互。
 
 ## 八、实现设计（`mudra` CLI，方向 tag 森林）
 
 选型：**B（每 isolated 实例一实例/工作区）并发版 + Python + 命令名 `mudra`**。
 
 ### 交互分层（设计主线）
-交互分三层，职责分离、各自可脚本化/接入：
-1. **接口 / CLI（核心操作）**：`mudra` 命令——数据与页面操作的事实源（open / ls / focus / tag / star / col），无 UI 假设。
-2. **Launcher（实际的页面管理操作）**：walker 菜单——`p`/`t`/`a`/`s` 列选动作，选中回调 `mudra CLI`。
+交互分两层 + 一个脚本化事实源（2026-09 收敛，launcher 层已废弃）：
+1. **接口 / CLI（核心操作）**：`mudra` 命令——数据与页面操作的事实源（open / ls / focus / tag / star / col），无 UI 假设，供脚本与其他层回调。
+2. **Web 控制台（实际的管理面）**：搜索过滤、全部页面操作、tag 森林树形展示；统一切换则留在 Alt+Tab / windowsmru。
 3. **WM（展示相关）**：niri——workspace 布局、列宽、窗口映射；**页面树 → workspace** 移动（分拣）。
 
 ### 组件
@@ -138,11 +132,11 @@ state(key TEXT PRIMARY KEY, value TEXT)                       -- current_context
 ### 隔离实例 = workspace（并发）
 - 每个 isolated tag 绑定一个 niri **workspace**（如 `web:<tag>`），**可同时开多个实例，一个实例一个 workspace**。
 - `mudra open` = 切到该 workspace + 拉起该实例、重建其 pages。
-- 实例窗口进对应 workspace：title 前缀（app_id）经 niri 窗口规则路由 + `mudra open` 时 `niri msg action focus-workspace <name>` 双保险。
+- 实例窗口进对应 workspace：`mudra open` 时 `niri msg action focus-workspace <name>` + 窗口↔实例映射（启动即记录 pid/窗口 id，按映射而非 title 定位）。
 - 切/混上下文 = 关掉或移动某实例窗口，另起目标；**不同实例窗口可混合摆在同一 workspace，也可移动 workspace 分开**。
 
 ### 窗口↔进程映射 与 批量移动
-- 记录每个窗口属于哪个实例：CDP target 归属（经该实例调试端口）+ title/app_id 对齐到 niri 窗口。
+- 记录每个窗口属于哪个实例：实例拉起时即记录**地址、pid、窗口 id**（CDP target 归属 + pid 对齐到 niri 窗口），不依赖窗口 title 前缀。
 - **一条命令把某实例的全部窗口移到别的 workspace**：`mudra move <instance|tag> <workspace>` → 遍历该实例的窗口 → `niri msg action move-window-to-workspace <ws>`。
 - **可混合**：不同实例窗口可摆同一 workspace，再移动来分开/分组——**workspace 移动即"分开"手段**。
 
