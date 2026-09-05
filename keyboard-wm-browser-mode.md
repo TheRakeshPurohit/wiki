@@ -39,13 +39,13 @@
 - qutebrowser modal：输入法无解（上游 #3444），排除。
 - 纯扩展层：错误页/内置页注入不了，不能完全控制，排除。
 - Nyxt / EVE / uzbl：全可编程但系于 WebKit / Emacs / Lisp，门槛与兼容不划算。
-- **chromium `--app` + CDP + SurfingKeys + sqlite/mudra**：折中，各层各司其职。容器不复刻 qutebrowser"嵌入引擎画标签条"，而是**完整 Chromium + 外部控制器**（保留 SurfingKeys 扩展与错误页可控）。组织与精炼由 mudra 的 **tag 森林**承担。
+- **chromium `--app` + CDP + 自研 mudra-keys 扩展 + sqlite/mudra**：折中，各层各司其职。容器不复刻 qutebrowser"嵌入引擎画标签条"，而是**完整 Chromium + 外部控制器**（自研扩展 + 错误页可控）。组织与精炼由 mudra 的 **tag 森林**承担。
 
 ## 三、架构（各层职责）
 
 - **`--app` 每页一窗口**：无 omnibox、无标签条 → 最大化 webview。Niri 默认无标题栏 → 打开就是一张干净网页。"标签"（tab）不在浏览器里，由外部控制器（mudra）按 **tag 森林**管理。**CDP 操纵不了 Chromium 的 UI chrome**（标签条/omnibox 是浏览器自身 UI，非 CDP 能力范围）——最小 UI 只能靠 `--app`，不能用 CDP 去缩/藏 chrome。
 - **CDP 脊梁**：控制浏览器里所有 target（含错误页、内置页）+ `Target.targetCreated/Destroyed` 事件实时同步到 sqlite（满足"关闭时更新列表"）+ 恢复。
-- **SurfingKeys**：普通页面的键盘 / 插入 / 输入法切换（JS 驱动，能自理 IME）；创建实例时**提前种进 profile**。
+- **mudra-keys 扩展（自研，2026-09-05 落地）**：普通页面的键盘驾驶——四模式状态机（normal/hint/insert/command）、qutebrowser 式底部状态栏（ctx·mode·tag 胶囊｜title·url·滚动%）、link hint、滚动命令 + `<N>%` 百分比跳转、`:set` 运行时改配置。MV3 **零构建**（源码即产物，`--load-extension=<repo>/frontend`，扩展根 = `frontend/`：`extension/` 放 content/SW，`shared/` 放与控制台面板共用的库——solid 运行时（全局 IIFE bundle）、bar、tag 胶囊组件）。决策记录在 mudra 仓库 `docs/ADR-self-maintained-extension.md`。取代 SurfingKeys 的动机：SurfingKeys MV2 构建在 chromium 139+ 被静默拒载，且交互面（tag 胶囊、状态栏数据源）需要与 mudrad 深度耦合，自研才能闭环。
 - **sqlite + launcher**：**tag 森林**组织与精炼（多 tag 维度 × 页面）、isolated 实例隔离、窗口↔进程映射、url 记录与过滤、网站列宽记忆；walker 列 tag 过滤唤起 + 地址输入。
 
   **引擎控制面（核实 2026-08）**：chromium 是唯一具备成熟 **CDP** 的引擎（`/json` 端点 + WebSocket，`Target.*`/`Page.*`/`Runtime.*` 完备控制面——目标/窗口/导航/注入，mudra 全依赖它）。替代引擎 Ladybird、Servo **都有**远程控制，但都走 **Firefox 远程调试协议（RDP）**——actor + TCP JSON 包，且都标着不完整（Servo `protocol.rs` 自注 "currently only supports JSON packets"；Ladybird `LibDevTools` 含 `FirefoxClient.*`/`Actor.*`，即 RDP actor 架构）——**不是 CDP**，也非成熟的窗口/会话管理表面，能力面远不够当 daily-driver 受控引擎。→ 引擎抽象方向：mudra 控制层抽象成 `BrowserEngine` 接口（chromium=CDP backend），等哪个引擎协议长成熟再补，而非现在改包。
@@ -146,7 +146,7 @@ state(key TEXT PRIMARY KEY, value TEXT)                       -- current_context
 
 ### 代理 与 扩展插件列表
 - **代理**：每独立实例可设 `proxy`，拉起时 `chromium --proxy-server=<url>`（可加 `--proxy-bypass-list`）。
-- **插件列表（可配置）**：实例允许设置预装的扩展清单（如 SurfingKeys、Bitwarden）。拉起时 `chromium --load-extension=<dir1>,<dir2>,...` 加载 unpacked 扩展，清单随实例配置插入。**已实测（2026-08-28）**：`--app` + `--load-extension` 能把 SurfingKeys（构建产物 `dist/production/chrome/`）载入 `--app` 窗口（扩展 id `fbnpkpganphpmhekgfkanhdpombfanpj`，其 service_worker 与注入 iframe 在 CDP 可见）。unpacked 扩展需先构建（SurfingKeys 源 `npm install` 走官方 registry 直连、webpack `build:prod` 出 dist）。
+- **插件列表（可配置）**：实例允许设置预装的扩展清单（如 mudra-keys、Bitwarden）。拉起时 `chromium --load-extension=<dir1>,<dir2>,...` 加载 unpacked 扩展，清单随实例配置插入。默认加载 mudra 仓库内 `frontend/`（自研扩展 + 面板共享库）。**已实测（2026-08-28）**：`--app` + `--load-extension` 能把 unpacked 扩展载入 `--app` 窗口（当时用 SurfingKeys 构建产物验证；2026-09-05 起日常即 mudra-keys 自身）。
 - 两个均为标准 Chromium 命令行开关（NixOS 包装脚本透传）。
 
 ### 网站列宽记忆（Win+R）
@@ -176,7 +176,7 @@ mudra quit / mudra daemon start|stop|status
 ```
 
 ### CDP 映射
-- 拉起：`chromium --app=<url> --remote-debugging-port=<动态端口> --user-data-dir=<该实例 profile> --no-first-run`（profile 内预置 SurfingKeys）
+- 拉起：`chromium --app=<url> --remote-debugging-port=<动态端口> --user-data-dir=<该实例 profile> --no-first-run`（`--load-extension` 载入 mudra-keys）
 - 开页 `Target.createTarget` / 关页 `Page.close` → 事件同步
 - 导航 `Page.navigate` / `reload` / `getNavigationHistory` / `navigateToHistoryEntry` / 聚焦 `Target.activateTarget`
 - **新窗口拦截（级联）**：`--app` 里 `_blank`/`window.open` 默认开成 chrome 窗口；mudrad 维护注入脚本（拦 `window.open` 与 `a[target=_blank]` → Image beacon → 本地 `/open` → 新 `--app`）。**必须在每个新 page target 出现时注入**（`Target.targetCreated` → `Page.addScriptToEvaluateOnNewDocument`），否则 mudrad 自己开出的新 `--app` 窗口没带脚本，里面再点新窗口又退回 chrome 默认（非 `--app`）。
@@ -196,14 +196,14 @@ mudra quit / mudra daemon start|stop|status
 - ✅ CDP 能列出并 attach `--app` 窗口（它就是普通 page target）。
 - ✅ niri `move-window-to-workspace` / `move-column-to-workspace` / `set-column-width` 存在；列宽读取（`layout.tile_size[0]`/`logical.width`）与设置（百分比）已核实。
 - ✅ walker **支持多字符前缀**（`src/data.rs` `starts_with`）+ `argument_delimiter`；mudra 走 elephant `menus` provider（widget 见 mudra `docs/EXTENSIONS.md`）。
-- ⏳ SurfingKeys 在 `--app` 窗口的注入未实测（本环境未安装扩展）。
+- ✅ 自研 mudra-keys 扩展（`--load-extension=frontend/`）在 `--app` 窗口全功能运行（2026-09-05：四模式、hint、滚动、`:set`、状态栏均 CDP 实测）。
 - ⏳ CDP 对错误页（`chrome-error`）reload / navigate 未实测（按机制应当可控）。
 - ⏳ 同实例多窗口 ≈ 多标签的资源等价逻辑成立，未实测；走 B 并发版，多实例资源为预期代价。
 - ⏳ tag 森林落地：situation 切换 / isolated 实例 / importance·urgency 树 / ML 打标，未实现（重构进行中）。
 
 ## 十、开放问题
 
-- **双控制路由**：SurfingKeys（普通页）与 CDP（错误页/内置页）之间，按键谁管、如何按 target 类型判定切换。
+- **CDP error-page 路由**：错误页/内置页 extension 注入不了（`chrome-error`），按键控制只能走 CDP；普通页由 mudra-keys 自治。如何按 target 类型判定切换（以及错误页上还有哪些操作必要）待实测定义。
 - **引擎 UI 缺口**：下载 / 打印等原本由浏览器 chrome 提供的功能，需另行接（CDP / 省略）。
 - **tag 森林落地**：树内单选的 app 约束、isolated 多命中（现为未定义行为）、重要性/紧急性的规则迭代与 ML 辅助；inbox 分流的 UX 细节。
 - **ML 打标**：朴素贝叶斯 / 逻辑回归从手动评分学"该选哪个值"，生成规则供审（非 LLM 黑箱）。
