@@ -1,5 +1,7 @@
 # KV 存储引擎：架构设计、复合键编码与用例
 
+> **语言：** [English](kv-storage-engine-en.md)（主文档）· [中文](kv-storage-engine.md)
+
 **Status:** 持续演进
 **覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、redb（本地 B-tree）、SQLite 对比
 **架构：** [Aura 架构 §5](aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
