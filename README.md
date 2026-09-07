@@ -17,7 +17,7 @@
 | [Agent 原则](agent-principles.md) | | AI Agent 通用设计原则：确定性/非确定性边界、反主流护城河、概率系统思维 |
 | [Agent 使用模式](agent-usage-patterns.md) | | 人类侧交互技巧和审查习惯——决定 Agent 质量上限的不是模型，是使用方式 |
 | [Hermes Agent 设计](hermes-agent-design.md) | | Hermes 特定的使用约定、配置细节和运维协议 |
-| [AI Agent 选型](ai-agent-selection.md) | | 轻量 CLI Agent 选型调研（jcode → Hermes 之间） |
+| [AI Agent 选型](ai-agent-selection.md) | | 轻量 CLI Agent 选型调研——已定案：Hermes 主力 + jcode 救援，Open Interpreter 移除 |
 | [多智能体批判](multi-agent-critique.md) | | 多 Agent 模式的技术批判 |
 | [辩论验证](debate-validation.md) | | Prefix Checkpoint 方案的辩论验证过程：帕累托最优论证、层次隔离、揭穿 AI 幻觉 |
 | [用户画像：Orbit](orbit-profile.md) | | Orbit（O）的偏好、习惯、技术立场 |

@@ -138,6 +138,18 @@ agentmemory（持久记忆，跨工具共享）
 - 如果**看板是硬需求** → 任何 Agent + kanban-md（文件式 Kanban，Markdown + YAML frontmatter）
 - 如果**现在就要用** → jcode（Rust，成熟）+ agentmemory 外挂，接受无 skill 系统
 
+---
+
+## 三·一、实际部署定案（2026-09）
+
+选型落地为「Hermes 为主 + jcode 救援」的双层结构，而非单选：
+
+- **主力：Hermes**。全功能（记忆/技能/多平台），mattermost 网关单会话是其主要运行形态；CLI 里直接跑 hermes 进程不受网关会话数限制，作为本地第二入口。
+- **救援：jcode**（Rust，14ms 冷启动，~150MB 磁盘 / 27.8MB 内存）。定位是「Hermes 出问题时能修好 Hermes」的轻量救援 Agent，不是日常主力——无 skill 系统、无记忆系统，靠 CLAUDE.md/SYSTEM.md 文件级上下文工作。
+- **已移除：Open Interpreter**。三个死因：① 上游强制启用 Responses API，升级即不可用，锁死版本；② 安全确认过于频繁，批准粒度不匹配无人值守场景（离人即停摆）；③ 体积大，与轻量定位相反。
+
+NixOS 部署见 `modules/dev/units/jcode.nix`（fullstack + rescue 两套 profile 均引入），复用 openinterpreter 的预编译 release + narHash 校验模式。
+
 > 编译语言生态的 Agent 普遍把精力放在"对齐 Claude Code 的行为"，忽略了 Hermes 走通的核心路径：skill → 自主进化 → 复利。但记忆可以外挂解决了最关键的复利问题——剩下的是 skill 系统。epic-harness 是目前唯一在 skill + self-evolving 方向上探索的编译语言 Agent，值得观察。
 
 ---
