@@ -508,7 +508,7 @@ impl<T> AuraCollection<T> where T: Serialize + DeserializeOwned + EntityKeyGener
 }
 ```
 
-→ OKM 的完整 proc macro 实现和 TypedCollection 设计见 [OKM 文档](object-keyspace-mapping.md)。
+→ OKM 的完整 proc macro 实现见 [OKM 项目](https://github.com/orbsh/okm)。
 
 #### 分发层 trait
 
@@ -655,7 +655,7 @@ ctx.metadata.get("global_counter")     // 获取全局唯一 ID
 
 **Durability**：SlateDB 的 WAL 在本地磁盘，节点磁盘丢失时需等 S3 flush 完成才能恢复——flush 前的窗口期存在数据丢失风险。对于 Agent 场景（对话数据可重建），这个风险通常可接受。
 
-**Openraft 状态机集成**：当需要 Actor 状态强一致复制时（TiDB 模式），Openraft 状态机挂载 Fjall 的实现见 [OKM 文档 §Openraft 状态机集成](object-keyspace-mapping.md#openraft-状态机集成)。详见 [共识协议文档](consensus-protocol.md)。
+**Openraft 状态机集成**：当需要 Actor 状态强一致复制时（TiDB 模式），Openraft 状态机挂载 Fjall 的实现见 [共识协议文档](consensus-protocol.md)。
 
 ### 3.7 配置与工作量评估
 
