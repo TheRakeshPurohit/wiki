@@ -1,6 +1,7 @@
 # KV 存储引擎：架构设计、复合键编码与用例
 
 > **语言：** [English](kv-storage-engine-en.md)（主文档）· [中文](kv-storage-engine.md)
+> **实现项目：** [OKM](https://github.com/orbsh/okm) — Rust KV crate，声明式 derive（`KeyEncode` / `RowEncode` / `EdgeEncode`）
 
 **Status:** 持续演进
 **覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、redb（本地 B-tree）、SQLite 对比

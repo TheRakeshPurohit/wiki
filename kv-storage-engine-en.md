@@ -1,6 +1,7 @@
 # KV Storage Engine: Architecture, Composite Key Encoding, and Use Cases
 
 > **Languages:** [English](kv-storage-engine-en.md) (primary) · [中文](kv-storage-engine.md)
+> **Implementation:** [OKM](https://github.com/orbsh/okm) — Rust KV crate with declarative derives (`KeyEncode` / `RowEncode` / `EdgeEncode`)
 
 **Status:** Continuously evolving
 **Engines covered:** Fjall (local NVMe), SlateDB (S3 cloud-native), redb (local B-tree), SQLite comparison
