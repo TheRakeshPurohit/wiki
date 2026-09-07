@@ -488,7 +488,7 @@ Numeric order:  9 < 10
 
 The correct approach is a fixed-width big-endian byte array. Rust implementation:
 
-> The examples below use colons for readability. Production should use fixed-width offset encoding; see the [OKM project](https://github.com/orbsh/okm) ([Chinese README](https://github.com/orbsh/okm/blob/main/README.md)).
+> The examples below use colons for readability. Production should use fixed-width offset encoding; see the [OKM project](https://github.com/orbsh/okm) ([English README](https://github.com/orbsh/okm/blob/main/README.md)).
 
 ```rust
 fn score_key(prefix: &[u8], score: i64, member: &[u8]) -> Vec<u8> {
