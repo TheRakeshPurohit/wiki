@@ -6,7 +6,8 @@
 
 | 文档 | English | 内容 |
 |:--|:--|:--|
-| [图谱化记忆](graph-memory.md) | | **设计文档**：计算时机光谱、属性图定位、原子三元组、双层模型、聚簇策略、权重系统、原位检查点压缩（上下文缓存复用）、编码场景 |
+| [图谱化记忆](graph-memory.md) | | **设计文档**：计算时机光谱、属性图定位、原子三元组、双层模型、聚簇策略、权重系统、编码场景 |
+| [Krystallizer](krystallizer.md) | | **实现设计**：会话控制原语（branch/tail/summarize）、full/assist 双模式、会话即数据（无状态 agent）、提取机制三方案、KDL 序列化、存储实现 |
 | [记忆架构](agent-memory.md) | [Memory Architecture](agent-memory-en.md) | **架构设计**：Surface/Engine 两层分离、Prefix Checkpoint、记忆控制、主动触发、三方案对比 |
 | [Agent 复利](agent-compound-interest.md) | | 持久化如何改变 AI 工具本质：memory/skill/cron 的累积效应、跨项目联动 |
 
