@@ -275,6 +275,18 @@ memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pend
 
 压缩检测、尾提示词注入、pending 管理全部在 WorkingMemory 内部。换框架时只重写适配层（~20 行），Engine 完全复用。
 
+### 演进方向：会话即数据（无状态 agent）
+
+三步调用之上还有更彻底的收缩。当记忆系统同时持有完整会话（append-only + prefix checkpoint，按 `session_id` 寻址），agent 循环可以退化为纯函数：
+
+```
+f(session, user_input) -> session'
+```
+
+取会话 → 跑 turn → 存会话。循环不再持有会话状态、不改写历史，agent 在调用之间无状态，持久化与恢复全部沉到记忆系统——与会话的 sleep/wake 模型天然同构，scale-to-zero 免费。所有函数调用（记忆调用也不例外）对循环都是普通记录，调用只有一种模式；工具调用格式的裁剪发生在记忆系统的序列化路径（视图层），存储层始终持有完整会话——视图被裁剪，存储不被裁剪，裁剪严格只在读侧。
+
+这个模式下三步调用收缩为「取会话 → 执行 → 存会话」，上面 push/get_context/write 的三步接口是它的中间形态。
+
 ---
 
 ## 三、Engine设计
