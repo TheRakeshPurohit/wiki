@@ -268,6 +268,8 @@ In the pure KV world, algorithms are no longer glue code floating outside the da
 
 Above the technique set you need a ground floor: **enumerate all access patterns first, then derive the key layout backwards**. Every access pattern (point lookup of an entity, fetch the most recent N by prefix, scan a field interval, paginate, join via a relation back to the primary table) should land as a point lookup or a prefix scan — a missing pattern is a missing key segment. Predictable query patterns are not just an argument for KV's applicability vs. SQL (see [SQL Translation Layer vs KV Pipeline Chain](#sql-translation-layer-vs-kv-pipeline-chain-a-decisive-advantage-under-predictable-query-patterns)); they are the **input to hand design**: SQL lets you declare "I will query this way"; KV's discipline is to enumerate the access patterns fully first, then ensure every query has a corresponding path in the prefix space.
 
+This discipline, as an executable modeling method — four layers per entity (ns → primary key → sort fields → access methods), mandatory access methods, covering-index restraint, the composite-key boundary — see the [OKM Modeling Guide](https://github.com/orbsh/okm/blob/main/docs/MODELING.md).
+
 ### Key-Space Pattern: Logical Encoding Layer vs Physical Partitioning
 
 The key-space pattern is often mistaken as requiring engine-level multi-partition capability, but it is defined at the **logical encoding layer**: encode the namespace into the key (`ns:entity:field` prefix, composite key encoding, a u16 namespace dictionary), independent of the engine's physical layout. Any KV — including flat-key-space engines — supports it at zero cost, because keys are already flat byte strings and the namespace is just a convention you encode into them.
