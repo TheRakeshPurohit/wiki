@@ -88,6 +88,8 @@ TUI is a pragmatic compromise — when pure CLI lacks sufficient state visibilit
 
 **yazi** (file manager) is a typical case of the TUI middle ground: intuitive interface, smooth operations, but its cutesy visual style (rounded borders, multi-level panels, flashy icons, drop shadows) makes advanced users feel like they're using a toy for serious work. This is the same root problem as GUI: visual decoration substituted for operational flexibility.
 
+TUI carries an even deeper cost than "cutesy": **state invisibility**. In a fully-rendered tool, internal state (current context, token usage, which tools were called) is wrapped inside the visual layer — parsing its output with `jq`? Impossible. Feeding intermediate state to another script? Impossible. TUI turns what should be a transparent pipeline into a black box. This shares the same root as the visual-cutesy problem: both substitute a visual layer for operational flexibility — the former sacrifices composability, the latter sacrifices pipeability.
+
 ### Root Cause: LLMs Are Text-Native
 
 The fundamental reason for the CLI revival is not nostalgia — it's that **structural advantages are amplified in the AI era**.
@@ -151,6 +153,7 @@ The structural defects of visual forms (inefficiency, inflexibility, poor compos
 
 ## Cross References
 
+- **[Terminal Agent Critique](terminal-agent-critique.md)**: performance/size pseudo-problems and engineering-barrier critique — the TUI argument of this document applied to the terminal Agent domain.
 - **[Dify Critique](dify-critique.md)**: Dify is a textbook case of the myth of visualization — replacing text-based programming with drag-and-drop orchestration, using visualization to mask paradigmatic contradictions.
 - **[Harbor Critique](harbor-critique.md)**: Harbor's web UI is another product of the myth of visualization — wrapping simple API operations in a graphical interface.
 - **[Nushell Introduction](nushell-introduction.md)**: Nushell demonstrates the structural advantages of text-based forms in the AI era.
