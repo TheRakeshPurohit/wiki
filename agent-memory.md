@@ -1,14 +1,6 @@
-# 记忆架构设计
+# 记忆架构选型
 
-跟 AI 聊天时，每说一句话，AI 都要从头读一遍之前的所有对话。对话越长，AI 读得越慢、越贵。
-
-我们的做法：把旧对话压缩成一段摘要固定住，后面新对话直接追加。因为摘要不动（前缀不变），AI 不用重新理解旧内容——就像看书翻到夹了书签的那页，不用从第一页重新读。这叫 **Prefix Checkpoint**。
-
-这个机制还让记忆系统能完全控制 AI 的行为：通过在对话末尾追加指令，驱动 AI 调用记忆工具完成存储和整理，而 AI 本身不需要任何改造。详见 [Surface 设计](#二surface设计)。
-
-### 尾提示词
-
-详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用上下文缓存（Context Cache）旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
+*Agent 记忆系统的通用架构分析与方案对比：Surface/Engine 两层、计算时机光谱、注入方式、外部开源方案。本项目实现设计见 [Krystallizer](krystallizer.md)，图谱概念设计见 [图谱化记忆](graph-memory.md)，Agent 组件架构（turn 模型、压缩、注入的架构语义）见 [无状态 Agent 架构](stateless-agent-architecture.md)。*
 
 ## 一、两层架构
 
@@ -47,249 +39,21 @@
 | **存储** | SQLite / SurrealDB / Postgres / 三存储分离 | agentmemory 用 SQLite，skillforge 用 SurrealDB |
 | **检索** | 向量 / BM25 / 图遍历 / RRF 融合 / 多策略路由 | agentmemory 向量+关键词，skillforge HNSW+BM25+RRF，cognee 9 种策略 |
 
-### 计算时机光谱
+计算时机光谱的完整展开（写时/读时代表方案、光谱本质、属性图定位）见 [图谱化记忆](graph-memory.md)。
 
-Engine的核心区别在**计算发生在哪个阶段**：
+## 二、Surface 设计要点
 
-```
-写时重 ─────────────────────────────────── 读时重
+Surface 的完整架构语义——Prefix Checkpoint 机制、记忆控制框架、六种触发方式、checkpoint+增量注入、历史纯净性——属于 Agent 架构层，独立成篇见 [无状态 Agent 架构](stateless-agent-architecture.md)。分层视角的要点：
 
-LLM Wiki        KG (属性图)       KV 模式         向量模式
-                graph-memory      skillforge      agentmemory
-                SurrealDB graph   SurrealDB KV    SQLite + vector
-
-写: LLM 整理/嵌入/拓扑推断    写: 简单切分/存储
-读: 直接载入/遍历              读: 匹配/排序/向量搜索
-```
-
-光谱位置取决于使用方式，不取决于存储产品。SurrealDB 的多模型架构覆盖全部区间。
-
----
-
-## 二、Surface设计
-
-### Prefix Checkpoint
-
-跟 AI 聊天时，每说一句话，AI 都要从头读一遍之前的所有对话。对话越长，AI 读得越慢、越贵。
-
-传统做法是"记住最近 N 条"——但每次新消息来了，原来的 N 条就变了（最旧的被挤出去，最新的被加进来），AI 相当于每次都要重新读一遍。
-
-Prefix Checkpoint 的做法不同：
-
-1. 对话积累到一定长度（比如 100 条），AI 自己总结一段摘要："用户在讨论项目架构，决定用 SurrealDB……"
-2. 这段摘要**固定下来，永远不变**。后续所有对话都在它后面追加。
-3. 因为开头不动，AI 可以"跳过"已经理解的部分，只处理新消息——就像看书翻到夹了书签的那页，不用从第一页重新读。
-
-摘要就是"前缀"（Prefix），固定不变；"Checkpoint"是存档点。每次新存档后，旧存档清空，重新累积。
-
-**为什么传统压缩无法利用缓存**：传统做法是把 100 条消息发给一个单独的模型（或单独发起一次 API 调用）来生成摘要。这个调用和之前的对话没有缓存关系——即使你用同一个模型，它看到的是一段全新的文本，上下文缓存从零开始计算，缓存命中率 0%。
-
-Prefix Checkpoint 不同：100 条消息已经在缓存中（之前每轮对话都在用）。尾提示词只是在末尾追加了一小段新文本。模型处理时，前面 99% 的 token 直接走缓存，只有最后的提示词 + 用户问题是新计算。
-
-```
-传统压缩：
-  [100 条消息] → 新 API 调用 → 全部重新计算 → 输出摘要
-  缓存命中率：0%
-
-Prefix Checkpoint：
-  [100 条消息（缓存中）] + [尾提示词 + 用户问题]
-  缓存命中率：~99%
-```
-
-结果：又快又好，消耗少。快是因为缓存，好是因为用的是同一个强模型（不是小模型），消耗少是因为大部分 token 不需要重新计算。而且不需要改造 Agent loop——压缩通过正常 tool call 完成。
-
-**"辅助模型"≈传统模式**：能配置独立辅助模型的 Agent 系统，本质上就是传统压缩——需要单独发起一次 LLM 调用，无法利用缓存。所谓"快速模型"只是相对的：100 条消息发过去，小模型也要从头算一遍，延迟可能只少 30-50%，但质量差很多。Prefix Checkpoint 连辅助模型都不需要——压缩就是 Agent 正常回答的一部分。
-
-### 记忆控制
-
-Prefix Checkpoint 不仅是一个缓存优化机制，更是一个**记忆控制框架**。
-
-AI 每次回复前都会读一遍完整的对话。如果我们想让 AI 做某件事（比如"把刚才聊的偏好记下来"），只需要在对话末尾加一句话就行了。
-
-具体来说，当对话累积到 100 条时，记忆系统会在用户下一次提问时，在提问前面插入一段指令：
-
-```
-[之前的所有对话]           ← AI 已经理解了（缓存中）
-[记忆系统插入的指令]        ← "先回答用户的问题，然后调用
-                              memory_checkpoint(session_id, summary)
-                              将对话压缩为摘要"
-[用户的问题]               ← 用户真正想问的
-```
-
-AI 看到这段指令后，先回答用户问题，然后调用 `memory_checkpoint` 工具生成对话摘要并存入 checkpoint 表。用户完全无感——他只是问了一个问题，AI 回答了，但后台顺便完成了压缩。
-
-**控制机制**：Agent 是被动的——它只看到 prompt 和可用工具，按照 prompt 中的指令调用工具。记忆系统通过控制两件事实现完全控制：
-1. **注入什么** — 尾提示词（决定 Agent 做什么）
-2. **提供什么工具** — Agent 可调用的工具列表（决定 Agent 能做什么）
-
-**这使得记忆系统可以做到**：
-- 控制压缩时机（阈值到达时注入压缩指令）
-- 控制提取内容（提示词指定提取偏好/事实/决策）
-- 控制存储方式（工具决定写入哪个表、什么格式）
-- 不改 Agent loop — 所有控制通过 prompt + 工具实现
-
-**类比**：Agent 是一个"没有主见的执行者"——它有能力（LLM 推理 + 工具调用），但没有意图。记忆系统通过 prompt 注入意图，Agent 负责执行。这和操作系统的"系统调用"类似：内核提供能力（syscall），用户态程序决定何时调用。
-
-### 触发时机
-
-三种记忆，三种触发机制：
-
-| 记忆类型 | 工具 | 谁触发 | 机制 | 优点 | 缺点 |
-|:--|:--|:--|:--|:--|:--|
-| **长期记忆** | `memory_store` | **LLM**（主动判断） | LLM 在对话过程中判断"这条值得记住"时调用 | 精准，只存有价值的 | 依赖 LLM 判断力，可能遗漏 |
-| **短期记忆** | `memory_checkpoint` | **记忆系统**（阈值触发） | 消息累积到 N 条时，prompt 注入尾提示词，Agent 框架执行 DB 操作 | 低频调用，开销可控 | N 条内未压缩（但原始消息仍在 session 中） |
-| **记忆检索** | `memory_search` | **LLM**（主动判断） | LLM 在对话过程中判断"需要查一下"时调用，同时搜索 memories + session_checkpoints | 跨会话知识检索，支持历史对话摘要 | 依赖 LLM 判断力，可能遗漏 |
-| 短期记忆变体 | `memory_checkpoint` | **定时任务** | 用户不活跃时（如凌晨）后台触发 | 不影响用户体验，利用闲置算力 | 需要定时任务基础设施 |
-| 短期记忆变体 | `memory_checkpoint` | **流式计算** | session 闲置 + cache 快过期时触发，续期 checkpoint | 防止 cache 过期失效 | 需要监听 session 活跃状态 |
-| 短期记忆变体 | `memory_checkpoint` | **图谱聚簇** | 检测到对话主题切换时触发，按语义边界压缩 | 摘要更清晰 | 需要主题检测能力（图谱化记忆） |
-
-### 主动触发（长期记忆）
-
-Prefix Checkpoint 的记忆控制不仅用于压缩，还用于**主动记忆**—— LLM 在对话过程中判断"这条值得记住"时，主动调用 `memory_store` 工具，存入 `memories` 表。
-
-触发方式是**用户要求或暗示**：
-- 用户明确说"记住这个"、"以后都这样做"
-- 用户表达了偏好、习惯、决策（LLM 判断值得长期保存）
-- LLM 发现了重要的事实或上下文
-
-LLM 不主动捕捉执行过程中产生的知识——它用判断力筛选，只存储有价值的信息，精准但依赖判断力。
-
-### 其他触发机制
-
-**夜间定时触发**：用户不活跃时（如凌晨），后台定时任务触发压缩。利用闲置算力完成压缩，不影响白天的用户体验。适合压缩成本较高（长对话、大模型）的场景。
-
-**长期闲置触发（流式计算）**：session 长时间无活动时触发压缩，可结合 cache 到期时间——在 cache 快过期时主动续期。本质是**流式计算**：持续维护热缓存，防止 cache 失效导致下次对话时全量重算。和 Prefix Checkpoint 配合：压缩后新 checkpoint 作为前缀，cache 重新命中。
-
-**主题转换触发**：检测到对话主题切换时触发压缩。按语义边界压缩，摘要更清晰（"前半段讨论架构，后半段讨论部署"比"100 条消息的混合摘要"更有用）。需要主题检测能力，与图谱化记忆配合——图谱中的聚簇边界就是天然的主题边界。
-
-这是记忆系统的六种触发方式，按记忆类型分组：
-
-| 记忆类型 | 方式 | 时机 | 谁触发 | 存什么 |
-|:--|:--|:--|:--|:--|
-| **长期记忆** | 主动触发 | 对话过程中 | **LLM**（主动判断） | LLM 判断值得记住的 → `memories` 表 |
-| **短期记忆** | Prefix Checkpoint | 阈值到达时 | **记忆系统** | 对话摘要 → `session_checkpoints` 表 |
-| **记忆检索** | 主动触发 | 对话过程中 | **LLM**（主动判断） | 搜索 `memories` + `session_checkpoints` |
-| 短期记忆变体 | 夜间定时 | 用户不活跃时 | **定时任务** | 同 Prefix Checkpoint |
-| 短期记忆变体 | 长期闲置 | session 闲置 + cache 快过期 | **流式计算** | 续期 checkpoint |
-| 短期记忆变体 | 主题转换 | 语义边界 | **图谱聚簇** | 按主题分段的摘要 |
-
-### 注入方式
-
-| 方式 | 机制 | cache 友好度 |
+| 决策点 | 选项 | 代表方案 |
 |:--|:--|:--|
-| **全量注入** | 每轮把所有历史注入 prompt | 差（内容每轮变化，上下文缓存失效） |
-| **top-K 检索** | 每轮检索相关记忆注入 | 中（检索结果可能变化） |
-| **checkpoint + 增量** | 不可变 checkpoint + 最近 N 条消息 | 高（checkpoint 固定，可永久缓存） |
+| **触发时机** | auto hooks（每轮系统自动） / 手动调用（Agent 判断） / 阈值触发 | agentmemory 用 hooks，skillforge 用阈值 |
+| **注入方式** | 全量注入 / top-K 检索注入 / checkpoint + 增量 | Hermes 全量，agentmemory top-K，skillforge checkpoint |
+| **框架适配** | 适配层接口（push_user_message / get_context / write_assistant_message） | _AgnoAgentWrapper 适配 Agno |
 
-#### checkpoint + 增量机制
+注入方式中 **checkpoint + 增量** 的 cache 友好度最高（checkpoint 不可变、可永久缓存），是本架构的默认选择。尾提示词（临时注入、用后即弃、不写 session）的缓存旁路机制见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。
 
-类似 event-sourcing 的快照模式。消息逐条写入 session_messages 表，达到阈值时压缩为 checkpoint（写入 session_checkpoints 表），后续所有未压缩消息即为增量：
-
-```
-msg_001 ... msg_100    ← 消息追加到 session_messages 表
-              ↓ 达到阈值（100 条）
-ckpt_0: summary="用户讨论了项目架构，决定用 SurrealDB..."
-              ↓ 写入 session_checkpoints 表，不可变
-msg_101 ... msg_150    ← 全部是增量（当前所有未压缩消息）
-              ↓ 再次达到阈值
-ckpt_1: summary="..."
-msg_151 ...            ← 新的增量
-```
-
-**读取流程**：
-
-消息一条条追加到 prompt 中（不是每次重新拼接）。LLM API 的多轮对话机制天然缓存前面所有 tokens：
-
-```
-Turn 1: [ckpt] + [msg_101]
-Turn 2: [ckpt] + [msg_101] + [msg_102]       ← 前面的 tokens 走上下文缓存
-Turn 3: [ckpt] + [msg_101] + [msg_102] + [msg_103]
-...
-Turn N: 达到阈值 → 融入下一个 Agent turn 完成压缩
-Turn N+1: [ckpt_1] + [用户问题 X] + [Agent 回答 Y]
-```
-
-**写入流程**：
-1. 每条消息追加到 session_messages 表
-2. 检查距上次 checkpoint 的消息数是否 >= 阈值
-3. 达到阈值 → 标记需要压缩 → 下一个用户提问时，将尾提示词作为普通消息追加到 prompt 末尾
-
-**Prefix Checkpoint**：阈值到达后，下一个用户提问时，记忆系统注入尾提示词（不是 system prompt）：
-
-```
-上下文缓存中（不变）：
-  [ckpt] + [msg_101..msg_150]
-
-新追加的消息（唯一未缓存的部分）：
-  "先回答用户的问题，然后调用 memory_checkpoint(session_id, summary)
-   将对话压缩为摘要"
-
-Agent 一次 turn 完成两件事（注意顺序）：
-  1. "Y"                              ← 先回答用户问题（用户体验优先）
-  2. tool_call: memory_checkpoint(    ← 再压缩对话为摘要
-       session_id, "这段对话讨论了...")
-```
-
-**历史纯净性**：尾提示词是临时的——只存在于当次 turn 的 prompt 中，从不写入 session。session 里永远是纯净的历史：
-
-```
-session 中存储的：
-  [checkpoint_1] + [用户原始消息 X] + [Agent 回答 Y]
-
-而不是：
-  [checkpoint_1] + [尾提示词 + 用户原始消息 X] + [Agent 回答 Y]
-```
-
-即使 prompt 中为了触发压缩而注入了尾提示词，session 中也不会残留——用户消息通过 `push_user_message` 缓冲在内存中，`get_context()` 构建上下文时才加入，`write_assistant_message()` 写入 DB 后清空。session 里永远是纯净的历史：
-- 历史可重放——任何时候重新加载 session，内容都是真实的对话
-- 无伪指令——session 中不会残留系统指令
-- 逻辑连贯——checkpoint + 原始消息 + 回答，构成完整的因果链
-
-**顺序很重要**：必须先回答用户问题，再做记忆操作。用户问了一个问题，如果先看到一堆工具调用在跑，体验很差。提示词中明确要求"先回答，再处理记忆"——用户看到的第一个输出就是答案，记忆操作是"顺便"完成的。
-
-**为什么这样设计**：
-- **不改 Agent loop** — 压缩通过正常 tool call 完成，记忆系统完全控制
-- **不单独调 LLM** — 复用 Agent 的正常 turn，answer + compress 共享上下文缓存
-- **cache 天然命中** — 历史部分全部缓存，只有尾提示词 + 用户问题是新 token
-- **用户体验无感** — 正常回答用户，同时后台完成压缩和记忆提取
-- **历史自动清理** — turn 结束后旧消息不再需要，历史变为 `checkpoint_1 + X + Y`
-
-**为什么 cache 友好**：checkpoint 一旦写入不可变，后续所有 turn 共享同一个 checkpoint 文本。LLM API 的 prompt caching 将 checkpoint 部分缓存在 GPU 显存中，只有增量部分每次变化。随着增量消息增多、下一次 checkpoint 触发，增量被压缩为新的固定摘要，缓存再次命中。
-
-**与 Agno 滑动窗口的对比**：Agno 的 `add_history_to_context` 每次从 DB 读最近 N 条完整消息。随着新消息到来，N 条的组成不断变化（旧的被挤出、新的被加入），上下文缓存每轮失效。checkpoint 模式下，历史被压缩为固定摘要，只有未压缩的增量部分变化，cache 持续命中。
-
-### 框架适配
-
-**铁律：mem 模块厚，agent 适配层薄。**
-
-适配层只做三步调用，不实现记忆逻辑：
-
-```python
-# 适配层（~20 行）
-memory.push_user_message(session_id, user_message)   # 缓冲用户消息
-context = memory.get_context(session_id)              # checkpoint + DB + pending + 尾提示词
-agent.additional_input = context                       # 注入到 agent
-agent.run()
-memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pending
-```
-
-压缩检测、尾提示词注入、pending 管理全部在 WorkingMemory 内部。换框架时只重写适配层（~20 行），Engine 完全复用。
-
-### 演进方向：会话即数据（无状态 agent）
-
-三步调用之上还有更彻底的收缩。当记忆系统同时持有完整会话（append-only + prefix checkpoint，按 `session_id` 寻址），agent 循环可以退化为纯函数：
-
-```
-f(session, user_input) -> session'
-```
-
-取会话 → 跑 turn → 存会话。循环不再持有会话状态、不改写历史，agent 在调用之间无状态，持久化与恢复全部沉到记忆系统——与会话的 sleep/wake 模型天然同构，scale-to-zero 免费。所有函数调用（记忆调用也不例外）对循环都是普通记录，调用只有一种模式；工具调用格式的裁剪发生在记忆系统的序列化路径（视图层），存储层始终持有完整会话——视图被裁剪，存储不被裁剪，裁剪严格只在读侧。
-
-这个模式已有具体设计——full 模式（会话即记忆）、会话控制原语（branch / tail / summarize）、视图层裁剪——见 [Krystallizer](krystallizer.md)。三步调用是无状态模式的中间形态：记忆系统持有完整会话后，push/get_context/write 收缩为「取会话 → 执行 → 存会话」。
-
----
-
-## 三、Engine设计
+## 三、Engine 设计
 
 ### 提取
 
@@ -308,52 +72,7 @@ f(session, user_input) -> session'
                 └→ flat memories / graph triples（写入存储）
 ```
 
-#### 提取时机：三种方案
-
-**方案 A：每轮并行提取（⚠️ 过时）**
-
-在 system prompt 中指示 LLM 同时输出用户回复和抽取三元组的函数调用，一次响应完成两件事。
-
-问题：(1) 需要改造 Agent 框架；(2) 函数调用干扰 LLM 对用户回复的注意力；(3) 每轮引入新的函数调用 token，上下文缓存命中率低。→ 详见 [图谱化记忆](graph-memory.md) §并行提取机制
-
-**方案 B'：纯追加指令（⚠️ 过时，被 B 替代）**
-
-阈值到达后，在 prompt 末尾追加压缩指令，LLM 直接输出 checkpoint + memories（不通过 tool call）。
-
-```
-Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，上下文缓存持续命中
-              ↓ 达到阈值
-Turn N+1:  prompt 末尾追加 "分析以上对话，输出 checkpoint 和 memories"
-           → LLM 直接输出结果，指令本身不写入 session
-Turn N+2:  新 checkpoint + 新增量，重新开始
-```
-
-优势：LLM 注意力完全集中在压缩任务上（不需要同时回答用户），提取质量可能更高。
-问题：(1) 需要改 Agent loop（识别特殊输出并处理）；(2) 压缩和回答分开，两次 LLM 调用；(3) 压缩时机不在记忆系统控制下。
-
-**方案 B：Prefix Checkpoint（当前方案）**
-
-替代方案 B'。压缩不是单独的操作，而是融入 Agent 的正常对话 turn——下一个用户提问时，注入尾提示词（不是 system prompt）。Agent 一次 turn 同时完成提取和回答：
-
-```
-Turn 1..N: 正常对话，[ckpt] + 增量逐条追加，上下文缓存持续命中
-              ↓ 达到阈值
-Turn N+1:  用户提问 X
-           prompt 末尾追加: "先回答用户的问题，然后调用
-                           memory_checkpoint(session_id, summary)
-                           将对话压缩为摘要，然后回答：{X}"
-           → Agent 一次 turn: 回答 Y + tool_call(memory_checkpoint)
-Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
-```
-
-优势：(1) 不改 Agent loop；(2) answer + compress 共享上下文缓存；(3) 用户体验无感；(4) 压缩完全由记忆系统控制（通过 tool call）。
-
-| 维度 | A（并行提取） | B'（纯追加指令） | B（融入 Agent turn） |
-|:--|:--|:--|:--|
-| Agent 改造 | 需要 | 需要 | 不需要 |
-| LLM 调用 | 每轮 | 压缩单独一次 | 复用正常 turn |
-| 注意力 | 分散 | 集中在压缩 | 分散（但 tool call 机制保障） |
-| 控制权 | Agent | 不确定 | 记忆系统 |
+提取时机三方案（并行提取 → 纯追加指令 → Prefix Checkpoint）的演进记录完整保留在 [Krystallizer](krystallizer.md)。当前方案即 Prefix Checkpoint：压缩融入 Agent 正常 turn，不单独调 LLM。
 
 ### 提取规格：三轴分离
 
@@ -370,9 +89,9 @@ Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 **写入语义（Engine·存储）**：状态更迭必须"数据上生效"，而非"文本上的更强"。跨多个 checkpoint 后"当前最新状态"要为真，须按 session/实体**物化 latest-wins 的当前状态**（由 DB 派生，类比任务完成判定），而非每次新 checkpoint 在文本里重述。规格须先声明：append-only 不可变 checkpoint，还是逐键覆盖。
 
 **越界即返工**：三处常见混界——
-- TODO 不进记忆摘要——属独立任务表（`tasks`/`task_items`，见 [skillforge 任务记忆](#四skillforge-实现)），完成判定归 DB；
+- TODO 不进记忆摘要——属独立任务表（`tasks`/`task_items`，属独立任务表（`tasks`/`task_items`），完成判定归 DB），完成判定归 DB；
 - 实体与偏好不同桶——实体是图状三元组，偏好是 flat 事实，两套提取模式；
-- 无验证层——压缩错误累积是复亏（见 §七 合成闭环的缺口），须留"提取对不对"的校验台阶。
+- 无验证层——压缩错误累积是复亏（见「合成闭环的缺口」节），须留"提取对不对"的校验台阶。
 
 ### 存储
 
@@ -393,114 +112,7 @@ Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
 
 RRF（Reciprocal Rank Fusion）是融合多路检索结果的标准做法——各路独立排序，按排名倒数加权合并。不依赖分数归一化，鲁棒性强。
 
----
-
-## 四、skillforge 实现
-
-### 当前方案（Phase 2.5）
-
-在光谱中间偏右——比 agentmemory 检索质量高、cache 友好，比 cognee 部署轻、LLM 成本低。
-
-```
-写时重 ─────────────────────────────────── 读时重
-
-cognee          skillforge        agentmemory
-(知识图谱)       (当前实现)         (轨迹压缩)
-SurrealDB graph  SurrealDB KV      SQLite + vector
-```
-
-#### Surface
-
-| 决策点 | 选择 |
-|:--|:--|
-| 触发时机 | 阈值触发（100 条）+ Agent 手动调用 |
-| 注入方式 | checkpoint + 增量（additional_input 注入） |
-| 框架适配 | _AgnoAgentWrapper（三步调用：push → get_context → write） |
-
-#### Engine
-
-| 决策点 | 选择 |
-|:--|:--|
-| 提取 | flat KV（LLM 双层输出：checkpoint + memories） |
-| 存储 | SurrealDB（session_messages + session_checkpoints + memories） |
-| 检索 | HNSW + BM25 + RRF 三路融合 |
-| 用户隔离 | 工作记忆：`user_id` + `session_id` 双键查询；长期记忆：`user_id` 查询 |
-
-**用户隔离设计**：
-- 工作记忆表（`session_messages`、`session_checkpoints`）包含 `user_id` 字段，支持同一用户多客户端会话隔离
-- 长期记忆表（`memories`）包含 `user_id` 字段，支持跨会话知识积累
-- `memory_search` 同时搜索 `memories` 和 `session_checkpoints`，结果带 `source` 字段区分来源
-
-#### 核心接口
-
-三个：`store` / `search` / `forget`。辅助接口 `list_all`（导出/备份）和 `get_stats`（仪表盘/运维）不参与 Agent 对话流程。
-
-| 方法 | 用途 |
-|:--|:--|
-| `store(content, category, importance, tags)` | 存储记忆（embedding 由 SurrealDB 内部生成） |
-| `search(query, top_k)` | 混合检索（memories + session_checkpoints） |
-| `forget(memory_id)` | 删除记忆 |
-
-#### 关键设计决策
-
-| 决策 | 原因 |
-|:--|:--|
-| 100 条以内 LLM 无感知 | 不膨胀 prompt，不破坏上下文缓存 |
-| Checkpoint 不可变 | 写入后固定，可永久缓存 |
-| 不依赖框架 MemoryManager | 黑盒提取不可控、框架绑定、每 turn 额外 LLM 调用 |
-| Embedding 在 SurrealDB 内部生成 | Python 侧零传输零存储 |
-| 不做过期清理 | 存储不是瓶颈，向量检索天然让不相关旧记忆排在后面 |
-
-#### 框架迁移
-
-`_AgnoAgentWrapper` 是唯一与框架耦合的部分（~20 行三步调用）。WorkingMemory、MemoryManager、MemoryTools 完全复用。迁移成本：重写适配层（~20 行）。
-
----
-
-## 五、图谱化演进
-
-Engine的演进方向：提取从 flat KV 升级为 graph triples，检索增加图遍历。Surface不变。
-
-```
-当前：  flat KV + 向量/BM25/RRF
-        ↓
-演进：  graph triples + 向量/图遍历/RRF
-```
-
-### 提取变化
-
-LLM 双层输出的第二层从 flat memories 变为 graph triples：
-
-```
-当前输出：
-  memories: [{"content": "...", "category": "fact", "importance": 3, "tags": [...]}]
-
-图谱化输出：
-  triples: [{"subject": "...", "predicate": "...", "object": "...", "category": "fact|rule|logic|preference"}]
-```
-
-一次 LLM 调用双层输出的模式不变，只是第二层的输出格式从 flat 变成 structured。
-
-### 检索变化
-
-在现有 HNSW + BM25 + RRF 基础上增加图遍历：
-
-```
-当前：query → 向量检索 + BM25 → RRF 融合
-演进：query → 向量检索 + BM25 + 图遍历（多跳） → RRF 融合
-```
-
-### SurrealDB 的支撑
-
-SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共存，检索时根据 query 类型路由。不需要换存储引擎。
-
-### 详细设计
-
-图谱化的完整设计（聚簇策略、权重系统、双层模型）见 [图谱化记忆](graph-memory.md)。
-
----
-
-## 六、外部方案对比
+## 四、外部方案对比
 
 ### agentmemory（24k★，TypeScript + Rust）
 
@@ -534,7 +146,7 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 
 ### 对比矩阵
 
-| 维度 | agentmemory | cognee | skillforge |
+| 维度 | agentmemory | cognee | Krystallizer（前身 skillforge mem） |
 |:--|:--|:--|:--|
 | **触发** | auto hooks（每轮） | 手动 remember() | 阈值触发 + 手动调用 |
 | **提取** | iii-engine 压缩（黑盒） | LLM entity extraction | LLM 双层输出 |
@@ -545,9 +157,8 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 | **框架绑定** | MCP | Python SDK + MCP | 无（适配层隔离） |
 | **LLM 开销** | 低（压缩可配置） | 高（ingest 每 chunk） | 低（100 条才调一次） |
 
----
 
-## 七、参考
+## 五、参考
 
 ### CodeGraph：代码结构层
 
@@ -573,7 +184,7 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 
 ### MCP 与记忆层
 
-agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记忆层走 MCP 可接受（低频操作），工具执行层走 MCP 不可接受（高频操作）。skillforge 用框架适配层（_AgnoAgentWrapper）替代 MCP，进程内调用无网络开销。
+agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记忆层走 MCP 可接受（低频操作），工具执行层走 MCP 不可接受（高频操作）。Krystallizer 前身（skillforge mem）用框架适配层（_AgnoAgentWrapper）替代 MCP，进程内调用无网络开销。
 
 ### 合成闭环的缺口
 
@@ -583,13 +194,11 @@ agentmemory 和 cognee 通过 MCP 适配商业 IDE，是"政治性妥协"。记�
 
 **落地方案（2026-08）：人审门控的做梦沉淀。** 把三难拆成"自动生成 + 人审操作 + 驳回回流"三段，避开三端各自代价：每晚离线做全局社区检测，对 SKILL 主体的边界提 merge/relink 操作集（自动、便宜、写时重摊销）；管理者以 diff 审核**操作**而非最终文本（准确度兜底，且只审低频操作、不陪跑每条记忆）；被拒操作写回做梦输入避免重复提出（闭环反馈）。完整设计见 [图谱化记忆](graph-memory.md) §「做梦沉淀」。
 
----
-
-## 八、总结
+## 六、总结
 
 ### 当前状态
 
-skillforge 已实现两层架构的Surface（阈值触发 + checkpoint 注入 + _AgnoAgentWrapper 适配）和Engine的基础形态（flat KV 提取 + HNSW/BM25/RRF 检索 + SurrealDB 存储）。核心接口三个：store / search / forget。
+skillforge 已实现两层架构的 Surface（阈值触发 + checkpoint 注入 + _AgnoAgentWrapper 适配）和 Engine 的基础形态（flat KV 提取 + HNSW/BM25/RRF 检索 + SurrealDB 存储），实现现状已迁移至 Krystallizer（记忆核心独立为 krystallizer 项目）。
 
 ### 演进方向
 
@@ -607,3 +216,13 @@ skillforge 已实现两层架构的Surface（阈值触发 + checkpoint 注入 + 
 3. **LLM 调用最小化**：100 条以内无感知，压缩融入 Agent 正常 turn，不单独调 LLM
 4. **框架无关**：记忆逻辑不依赖任何特定 Agent 框架
 5. **渐进式演进**：当前 flat KV 够用就用 flat KV，需要图结构时再升级
+
+---
+
+## 交叉引用
+
+- **[无状态 Agent 架构](stateless-agent-architecture.md)**：Surface 机制的架构篇——Prefix Checkpoint 详解、记忆控制、触发时机、注入方式、压缩双模式。
+- **[Krystallizer](krystallizer.md)**：本项目记忆系统的实现设计——会话控制原语、full/assist 模式、提取三方案演进、KDL 序列化、skillforge 实现现状。
+- **[图谱化记忆](graph-memory.md)**：图谱的记忆概念设计——计算时机光谱详述、双层模型、聚簇策略、权重系统、涌现式 Skill、做梦沉淀。
+- **[缓存树和尾提示词优化](tail-prompt-optimization.md)**：尾提示词的缓存旁路机制。
+- **[Agent 复利](agent-compound-interest.md)**：跨会话累积的价值——记忆是复利资产的载体。

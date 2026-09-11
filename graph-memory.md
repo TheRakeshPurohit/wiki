@@ -2,10 +2,6 @@
 
 *记忆架构的计算时机光谱，以及属性图在 Agent 记忆系统中的定位。*
 
-### 尾提示词
-
-详见 [缓存树和尾提示词优化](tail-prompt-optimization.md)。核心：注入 prompt 末尾的临时指令，利用上下文缓存（Context Cache）旁路分支，turn 结束后丢弃。压缩场景中触发工具调用后旧历史直接丢弃。
-
 ## 计算时机光谱
 
 记忆方案的本质区别不在数据结构，在**计算发生在哪个阶段**。
@@ -634,5 +630,6 @@ KV 路线的完整实现设计（属性图编码模式、delta 追加消除 read
 - **[Property Graph Queries](property-graph-queries.md)**：图在关系库里的定义与查询落地——以 SQL/PGQ 为标准，一图多关系、多图判据、跨图走底层表、严格性按边分、关系类型的动态化。
 - **[KV 存储引擎](kv-storage-engine.md)**：本方案 KV 路线的底层承载——属性图编码模式、读改写消除（delta 追加）、二级索引更新策略、WriteBatch 事务、向量冬眠/载入生命周期。
 - **[Agent 记忆选型](agent-memory.md)**：现有方案分析（agentmemory vs cognee、四象限全景、与本文档的逐项对照）。
+- **[无状态 Agent 架构](stateless-agent-architecture.md)**：组件架构总纲——turn 模型、压缩双模式、Surface 架构语义、skill 涌现在架构中的位置。
 - **[Agent 复利](agent-compound-interest.md)**：复利机制中"记忆积累"在属性图中的具体实现路径。
 - **[知识原子事实抽取技能](../skills/knowledge-triplets/SKILL.md)**：抽取格式定义，本文档的写入层规范。

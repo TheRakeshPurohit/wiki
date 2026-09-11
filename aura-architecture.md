@@ -167,7 +167,9 @@ Agent 的逻辑分为两层——编排层和工具层，分别用不同语言�
 
 Agent 主循环在单个 Actor 实例中运行（partition key = session_id）。同一会话内的工具调用串行（Actor 单线程语义），不同会话并行。Agent 处理完请求后进入 `on_sleep`，状态落盘 Fjall，内存归零（Scale-to-Zero）。下次消息到达时 `on_wake` 激活恢复。流式输出通过高频 emit `agent.stream` 事件实现，Fluxora 转为 SSE/WebSocket 推送。
 
-主循环本身可以进一步收缩为纯函数——会话即数据：Actor 按 `session_id` 从记忆系统取完整会话 → 跑 turn → 存会话，会话持久化与恢复全部沉到记忆系统，Actor 在两次调用之间无状态，`on_sleep`/`on_wake` 退化为存取两个动作。循环不再持有会话状态、不改写历史，所有函数调用对它都是普通记录；工具调用格式的裁剪发生在记忆系统的序列化视图层，存储层始终完整。详见 Krystallizer ADR-0006（无状态 Agent 集成）。
+主循环本身可以进一步收缩为纯函数——会话即数据：Actor 按 `session_id` 从记忆系统取完整会话 → 跑 turn → 存会话，会话持久化与恢复全部沉到记忆系统，Actor 在两次调用之间无状态，`on_sleep`/`on_wake` 退化为存取两个动作。循环不再持有会话状态、不改写历史，所有函数调用对它都是普通记录；工具调用格式的裁剪发生在记忆系统的序列化视图层，存储层始终完整。
+
+无状态 Agent 的完整组件架构独立成篇：循环组件（Gravity）、入口（Prism）、执行触手（Probe，Aura 内嵌/远程触手两形态）、skill 涌现闭环与传输裁决，见 [无状态 Agent 架构](stateless-agent-architecture.md)；记忆侧设计见 Krystallizer ADR-0006（无状态 Agent 集成）。
 
 工具和 Skill 不是静态文件，而是 graph-memory 中高工具指数的子图——使用数据自动聚类涌现 Skill 边界，Agent 运行时通过向量搜索发现相关 Skill 边，按权重排序注入上下文。
 

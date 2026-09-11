@@ -1,6 +1,6 @@
 # Krystallizer — Agent 记忆核心
 
-*会话控制 + 原子事实图 + 混合检索的嵌入式记忆系统：机制与实现设计。属性图的概念定位见 [图谱化记忆](graph-memory.md)，通用记忆架构分析见 [Agent 记忆选型](agent-memory.md)。*
+*会话控制 + 原子事实图 + 混合检索的嵌入式记忆系统：机制与实现设计。属性图的概念定位见 [图谱化记忆](graph-memory.md)，通用记忆选型分析见 [Agent 记忆选型](agent-memory.md)，Surface 架构语义见 [无状态 Agent 架构](stateless-agent-architecture.md)。*
 
 Krystallizer 是从 skillforge `src/mem` 独立出来的记忆系统，落在 [KV 存储引擎](kv-storage-engine.md)架构上：会话控制原语（branch / tail / summarize）、原子事实图（append-only KDL 事实 + 权重）、自建混合检索（arroy 向量 + 手写 BM25 + RRF）。嵌入式 Rust 核心（mem-core）+ Python 绑定（PyO3），零 LLM 依赖、零传输依赖。
 
@@ -25,7 +25,9 @@ summarize(...)        组合操作：注入压缩指令（经 tail）→ 收集�
 
 尾提示词注入和摘要化都只是分支操作：tail 是单轮分支，summarize 是注入+截断。一个机制，没有特例。
 
-**触发策略上移到调用方。** 核心提供原语；*何时* 压缩（阈值、会话结束、显式命令）是 agent 侧策略。旧的自动触发退化为调用方的一种可选策略，不是核心行为。把策略埋进存储层意味着调用方无法关闭它、无法按 session 改阈值、无法在其他时机触发压缩——这是旧 `ConversationMemory` 把 `checkpoint_threshold` 硬接线进 `get_context()` 的教训。
+**触发策略上移到调用方——修正为「被动决策在 Krystallizer」。** 核心提供原语；压缩决策默认在 Krystallizer 内部（fetch 时视图组装决定是否注入尾提示词——它持有全部上下文，信息最全）， Gravity 只能感知外部信号时主动调 `summarize`（主动压缩直接结束本轮，纯压缩 turn）。旧的自动触发退化为一种默认策略，不是硬接线——调用方仍可关闭、可按 session 调整、可在其他时机触发；这是旧 `ConversationMemory` 把 `checkpoint_threshold` 硬接线进 `get_context()` 导致调用方完全无控制权的教训。两版教训的公共内核：**策略必须是调用方可控的配置，不是隐藏在存储层的私有行为**——Krystallizer 的被动压缩也要能配置阈值与关闭，配置面在 store 构造期。
+
+**LLM 调用归调用方（Gravity），Krystallizer 零 LLM 依赖。** 压缩等尾提示词触发的 LLM 调用由 Gravity 实现：上下文缓存与模型（及账户）绑定，只有发起推理的那一侧才知道用哪个模型、走哪个账户——Krystallizer 不需要也不应该知道这些。被动模式下压缩决策在 Krystallizer（fetch 时注入尾提示词，Gravity 无感执行），主动模式暴露 `summarize` 原语；LLM 调用一律发生在 Gravity 的 turn 内，缓存天然命中。唯一例外是内部向量嵌入：Krystallizer 自己调用 embedding 模型，因为不同模型的嵌入空间互不兼容——写入与检索必须用同一个模型算向量，这个绑定是数据正确性约束，不是策略选择。两条边界的判据一致：**绑定到模型身份的调用归谁持有会话真相谁做**——推理缓存绑定 Gravity 的模型账户，嵌入空间绑定 Krystallizer 的存储内部。
 
 ### 接口面 2：记忆
 
@@ -52,7 +54,7 @@ Agent 按 `session_id` 取完整会话 → 执行 → 把新会话写回。循�
 
 **消解的缓存代价有界（供参考）**。前缀缓存是逐请求对最长公共前缀匹配的，不是逐会话整体匹配。把最后两条记录（tool_call + tool_result）消解成一条合并记录只改尾部；往前一百条字节不变、缓存照常命中。每轮损失限于被替换的尾部（几 KB 的重算），与分支剪枝同机制：追加 + 局部尾改，前缀保持稳定。「改写历史使缓存全量失效」是误解——改写点就是尾部。
 
-**Agent 四分**：UI、智能会话上下文（会话+记忆接口面）、执行（工具）、循环。循环收缩为：取会话 → 跑 turn → 存会话。
+**Agent 四分**：入口（Prism）、循环（Gravity）、记忆面（Krystallizer）、执行触手（Probe）。循环收缩为：取会话 → 跑 turn → 存会话。完整架构见 [无状态 Agent 架构](stateless-agent-architecture.md)。
 
 **代价与转移**：
 
@@ -251,9 +253,113 @@ M 问"有没有更好的方法让 AI 更了解我们的代码，不用每次都�
 
 存储选型、key 编码、检索实现见 [KV 存储引擎](kv-storage-engine.md)（属性图编码模式、delta 追加消除 read-modify-write、二级索引更新策略、WriteBatch 事务、向量冬眠/载入生命周期）。检索侧自建：arroy（HNSW）向量 + 手写 BM25 倒排 + RRF 融合，分词与打分全链路可控——向量与全文检索是 KV 路线需自建补齐的两模块，pg_search 黑盒 tokenizer 不可控正是 KV 路线的核心换取项。
 
+## skillforge 实现现状
+
+### 当前方案（Phase 2.5）
+
+在光谱中间偏右——比 agentmemory 检索质量高、cache 友好，比 cognee 部署轻、LLM 成本低。
+
+```
+写时重 ─────────────────────────────────── 读时重
+
+cognee          skillforge        agentmemory
+(知识图谱)       (当前实现)         (轨迹压缩)
+SurrealDB graph  SurrealDB KV      SQLite + vector
+```
+
+#### Surface
+
+| 决策点 | 选择 |
+|:--|:--|
+| 触发时机 | 阈值触发（100 条）+ Agent 手动调用 |
+| 注入方式 | checkpoint + 增量（additional_input 注入） |
+| 框架适配 | _AgnoAgentWrapper（三步调用：push → get_context → write） |
+
+#### Engine
+
+| 决策点 | 选择 |
+|:--|:--|
+| 提取 | flat KV（LLM 双层输出：checkpoint + memories） |
+| 存储 | SurrealDB（session_messages + session_checkpoints + memories） |
+| 检索 | HNSW + BM25 + RRF 三路融合 |
+| 用户隔离 | 工作记忆：`user_id` + `session_id` 双键查询；长期记忆：`user_id` 查询 |
+
+**用户隔离设计**：
+- 工作记忆表（`session_messages`、`session_checkpoints`）包含 `user_id` 字段，支持同一用户多客户端会话隔离
+- 长期记忆表（`memories`）包含 `user_id` 字段，支持跨会话知识积累
+- `memory_search` 同时搜索 `memories` 和 `session_checkpoints`，结果带 `source` 字段区分来源
+
+#### 核心接口
+
+三个：`store` / `search` / `forget`。辅助接口 `list_all`（导出/备份）和 `get_stats`（仪表盘/运维）不参与 Agent 对话流程。
+
+| 方法 | 用途 |
+|:--|:--|
+| `store(content, category, importance, tags)` | 存储记忆（embedding 由 SurrealDB 内部生成） |
+| `search(query, top_k)` | 混合检索（memories + session_checkpoints） |
+| `forget(memory_id)` | 删除记忆 |
+
+#### 关键设计决策
+
+| 决策 | 原因 |
+|:--|:--|
+| 100 条以内 LLM 无感知 | 不膨胀 prompt，不破坏上下文缓存 |
+| Checkpoint 不可变 | 写入后固定，可永久缓存 |
+| 不依赖框架 MemoryManager | 黑盒提取不可控、框架绑定、每 turn 额外 LLM 调用 |
+| Embedding 在 SurrealDB 内部生成 | Python 侧零传输零存储 |
+| 不做过期清理 | 存储不是瓶颈，向量检索天然让不相关旧记忆排在后面 |
+
+#### 框架迁移
+
+`_AgnoAgentWrapper` 是唯一与框架耦合的部分（~20 行三步调用）。WorkingMemory、MemoryManager、MemoryTools 完全复用。迁移成本：重写适配层（~20 行）。
+
+---
+
+## 图谱化演进
+
+```
+当前：  flat KV + 向量/BM25/RRF
+        ↓
+演进：  graph triples + 向量/图遍历/RRF
+```
+
+### 提取变化
+
+LLM 双层输出的第二层从 flat memories 变为 graph triples：
+
+```
+当前输出：
+  memories: [{"content": "...", "category": "fact", "importance": 3, "tags": [...]}]
+
+图谱化输出：
+  triples: [{"subject": "...", "predicate": "...", "object": "...", "category": "fact|rule|logic|preference"}]
+```
+
+一次 LLM 调用双层输出的模式不变，只是第二层的输出格式从 flat 变成 structured。
+
+### 检索变化
+
+在现有 HNSW + BM25 + RRF 基础上增加图遍历：
+
+```
+当前：query → 向量检索 + BM25 → RRF 融合
+演进：query → 向量检索 + BM25 + 图遍历（多跳） → RRF 融合
+```
+
+### SurrealDB 的支撑
+
+SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共存，检索时根据 query 类型路由。不需要换存储引擎。
+
+### 详细设计
+
+图谱化的完整设计（聚簇策略、权重系统、双层模型）见 [图谱化记忆](graph-memory.md)。
+
+---
+
 ## 交叉引用
 
 - **[图谱化记忆](graph-memory.md)**：原子事实图的概念设计——计算时机光谱、聚簇策略、权重系统、图谱化 Skill。
-- **[Agent 记忆选型](agent-memory.md)**：通用记忆架构分析——Surface/Engine 两层、注入方式、外部方案对比。
+- **[Agent 记忆选型](agent-memory.md)**：通用记忆选型分析——Surface/Engine 两层、注入方式、外部开源方案对比。
+- **[无状态 Agent 架构](stateless-agent-architecture.md)**：组件架构总纲——turn 模型、压缩双模式、Surface 架构语义、Prism/Gravity/Probe。
 - **[KV 存储引擎](kv-storage-engine.md)**：存储层承载——属性图编码模式、读改写消除、二级索引更新策略、WriteBatch 事务。
 - **[缓存树和尾提示词优化](tail-prompt-optimization.md)**：尾提示词的缓存旁路机制。
