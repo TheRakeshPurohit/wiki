@@ -58,11 +58,11 @@ Gravity 的全部职责：Krystallizer full 模式取会话 → LLM 调用与工
 
 - **被动（默认）**：压缩决策在 Krystallizer——它持有全部上下文，信息最全。决策输入是多维的，不止单一阈值：
   - **体量**：消息数/token 量达到阈值（原实现是固定条数如 100 条，剪裁边界应按**结构单元**对齐——一个闭合的工具调用对或一条独立消息，而不是固定条数切一刀；切点落在工具对中间就扩展到对齐为止）
-  - **时间间隔**：最后一条消息距今较长（如缓存 TTL 的量级），前段大概率冷却——赶在缓存失效前把不变前缀固化成 checkpoint。注意这一维**不能走被动模式**：被动压缩挂在 fetch 上，有 turn 才有 fetch，而间隔触发的场景恰恰是没有 turn。时间数据（消息时间戳）在 Krystallizer，但 Krystallizer 不能主动唤起 Gravity——执行只能由 Gravity 侧的空闲定时器发起（CLI 循环的空闲 tick 或 Aura 定时 Actor），属主动模式的一种，所需时间戳从 fetch 的会话视图即可获得
+  - **时间间隔**：最后一条消息距今较长（如缓存 TTL 的量级），前段大概率冷却——赶在缓存失效前把不变前缀固化成 checkpoint。注意这一维**不能走被动模式**：被动压缩挂在 fetch 上，有 turn 才有 fetch，而间隔触发的场景恰恰是没有 turn。时间数据（消息时间戳）在 Krystallizer，但 Krystallizer 不能主动唤起 Gravity——发起只能来自客户端侧：CLI 循环的空闲 tick（本地部署），或 Prism 保持的连接上定时触发压缩 turn 投递（服务端部署，客户端只是个手机 App 也可以由它发）；Aura 部署时也可由 `@cron`/`on_debounce` 注解的 Actor 代发。属主动模式的一种，所需时间戳从 fetch 的会话视图即可获得。Aura 无需新增定时机制——`@cron` 与 debounce timer 已覆盖，定时执行压缩 turn 是它们的用例而非新原语
   - **权重**：旧消息被引用的密度低（图谱写入的 tool_invoke_count 侧写）
 
   达到条件时，`fetch_session` 返回的视图尾部**自带压缩尾提示词**：Gravity 收到什么执行什么，不感知这是压缩 turn；LLM 输出中的 `memory_store`/`checkpoint` tool call 自然回流，Krystallizer 在 append 时识别并处理（摘要入 checkpoint、facts 入图谱、截断旧消息）。对 Gravity 而言压缩 turn 与普通 turn 无差别——调用只有一种模式。剪裁产物**不限定条数**：压缩区间多大、留多少尾部，由决策维度算出，不是固定一两条。
-- **主动（外部信号 / 空闲定时）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层）；空闲定时器（CLI 空闲 tick / Aura 定时 Actor）则在无 turn 到来时代替用户发起。两者都由 Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。Krystallizer 被动等 fetch，永远不能唤起 Gravity——发起权只在有 LLM 的一侧。
+- **主动（外部信号 / 空闲定时）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层）；空闲触发（CLI 空闲 tick、Prism 连接上的定时投递、Aura `@cron` Actor）则在无 turn 到来时代替用户发起。两者都由 Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。Krystallizer 被动等 fetch，永远不能唤起 Gravity——发起权只在有 LLM 的一侧。
 
 **pending 输入缓冲**：用户输入可能多条（连发几条才合并为一个 turn）。fetch 会话时 pending 输入落进 Krystallizer 的缓冲；压缩发生时缓冲一并进入 prompt 视图（压缩看到完整信息），commit 时缓冲随截断一并清理。缓冲在任何路径下都不丢输入：不压缩则正常 turn 消费缓冲，压缩则被摘要吸收。
 
