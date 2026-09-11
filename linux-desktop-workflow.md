@@ -144,13 +144,11 @@ herdr 的能力面：
 
 这与 mudra 的去 session 化（tag 森林取代 session）是同一个道理。
 
-Zellij 有 CLI 接口（`zellij list-sessions` / `zellij attach`），「walker 列出 → 选中 → 切换」技术上可行：walker provider 枚举 session，选中后 attach。实现得了，但体验差一档，差别在数据模型，不在接口：
+Zellij 有 CLI 接口（`zellij list-sessions` / `zellij attach`），「walker 列出 → 选中 → 切换」技术上可行。实现得了，但体验差一档，差别在数据模型，不在接口：herdr 的 CLI 暴露的是 workspace（项目级，含 git/agent 状态），walker 里看到的就是「任务」本身；Zellij 的 CLI 只能枚举 session 名字字符串，「这个 session 在干什么」是黑盒。切换语义也不同——`zellij attach` 是新开终端实例挂上去，herdr 由复用器自身感知焦点、复用现有面板，上下文连续；herdr 的 workspace 打开自带项目目录语义，Zellij 的 session 与目录只是弱关联。
 
-1. **可枚举单元不同**。herdr 的 CLI 暴露的是 workspace（项目级，内部状态含 git/agent 信息），walker 里看到的就是「任务」本身。Zellij 的 CLI 只能枚举 session（名字字符串），「这个 session 在干什么」是黑盒——切换器再方便，列表项本身没有信息量，最终还是依赖命名纪律。
-2. **切换语义**。`zellij attach` 是 attach 进程进 session，从别的窗口触发时体验是「新开一个终端实例挂上去」；herdr 的切换由复用器自身感知焦点、复用现有面板，跳过去之后上下文连续。
-3. **cwd 跟随**。herdr 的 workspace 打开自带项目目录语义；Zellij 的 session 与目录只是弱关联（启动时定了，之后靠纪律维护）。
+结论不是「做不到」，而是 Zellij 的 CLI 和它的 session 模型绑在一起——接口能接上 walker，接上来的内容贫乏。herdr 的优势在于模型先对了（workspace 扁平透明），CLI 才顺手。
 
-结论不是「做不到」，而是 Zellij 的 CLI 和它的 session 模型绑在一起——接口能接上 walker，接上来的内容贫乏。herdr 的优势在于模型先对了（workspace 扁平透明），CLI 才顺手。这也符合 launcher 层的定位：它消费的应是「有意义的项目条目」，不是「进程名单」。
+架构、多机协作、agent 状态感知与键盘交互的完整对比（含 herdr 0.9 的客户端渲染架构与 prefix-free chord），见 [终端复用器的代际交替](terminal-multiplexer-herdr-zellij.md)。
 
 
 ## 五、结论
