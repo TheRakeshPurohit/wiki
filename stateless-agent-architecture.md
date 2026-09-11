@@ -56,12 +56,26 @@ Gravity 的全部职责：Krystallizer full 模式取会话 → LLM 调用与工
 
 **压缩的双模式**：
 
-- **被动（默认）**：压缩决策在 Krystallizer——它持有全部上下文，信息最全（消息数、token 量、权重状态），阈值判断不该由调用方做。Gravity `fetch_session` 时，若达到压缩条件，返回的视图尾部**自带压缩尾提示词**：Gravity 收到什么执行什么，不感知这是压缩 turn；LLM 输出中的 `memory_store`/`checkpoint` tool call 自然回流，Krystallizer 在 append 时识别并处理（摘要入 checkpoint、facts 入图谱、截断旧消息）。对 Gravity 而言压缩 turn 与普通 turn 无差别——调用只有一种模式。
-- **主动（外部信号）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层与时间）。Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。
+- **被动（默认）**：压缩决策在 Krystallizer——它持有全部上下文，信息最全。决策输入是多维的，不止单一阈值：
+  - **体量**：消息数/token 量达到阈值（原实现是固定条数如 100 条，剪裁边界应按**结构单元**对齐——一个闭合的工具调用对或一条独立消息，而不是固定条数切一刀；切点落在工具对中间就扩展到对齐为止）
+  - **时间间隔**：最后一条消息距今较长（如缓存 TTL 的量级），前段大概率冷却——赶在缓存失效前把不变前缀固化成 checkpoint。注意这一维**不能走被动模式**：被动压缩挂在 fetch 上，有 turn 才有 fetch，而间隔触发的场景恰恰是没有 turn。时间数据（消息时间戳）在 Krystallizer，但 Krystallizer 不能主动唤起 Gravity——执行只能由 Gravity 侧的空闲定时器发起（CLI 循环的空闲 tick 或 Aura 定时 Actor），属主动模式的一种，所需时间戳从 fetch 的会话视图即可获得
+  - **权重**：旧消息被引用的密度低（图谱写入的 tool_invoke_count 侧写）
+
+  达到条件时，`fetch_session` 返回的视图尾部**自带压缩尾提示词**：Gravity 收到什么执行什么，不感知这是压缩 turn；LLM 输出中的 `memory_store`/`checkpoint` tool call 自然回流，Krystallizer 在 append 时识别并处理（摘要入 checkpoint、facts 入图谱、截断旧消息）。对 Gravity 而言压缩 turn 与普通 turn 无差别——调用只有一种模式。剪裁产物**不限定条数**：压缩区间多大、留多少尾部，由决策维度算出，不是固定一两条。
+- **主动（外部信号 / 空闲定时）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层）；空闲定时器（CLI 空闲 tick / Aura 定时 Actor）则在无 turn 到来时代替用户发起。两者都由 Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。Krystallizer 被动等 fetch，永远不能唤起 Gravity——发起权只在有 LLM 的一侧。
 
 **pending 输入缓冲**：用户输入可能多条（连发几条才合并为一个 turn）。fetch 会话时 pending 输入落进 Krystallizer 的缓冲；压缩发生时缓冲一并进入 prompt 视图（压缩看到完整信息），commit 时缓冲随截断一并清理。缓冲在任何路径下都不丢输入：不压缩则正常 turn 消费缓冲，压缩则被摘要吸收。
 
 **Krystallizer 侧的实现形态**：被动模式无独立接口——压缩逻辑藏在 fetch（视图组装时决定是否注入尾提示词）与 append（识别 memory tool call、写 checkpoint）内部，Gravity 完全无感；主动模式暴露显式原语 `summarize(session_id)`。两模式共享同一条压缩路径，入口不同而已。
+
+### 并发与共享：会话的两种归属
+
+同一会话的并发输入（手机和电脑同时在打字）不是要调度的竞态，是产品语义的选择：
+
+- **不共享**：两个 session，各自独立演化。默认形态，无任何新机制。
+- **共享**：后到消息**取消前一轮的执行**，重新执行完整 turn——连续两条用户消息都要在上下文里（API 不支持多 user message 时，Krystallizer 合并；UI 支持分叉时，这里自然长出分支：先到的消息走原分支跑完，后到的开新分支）。取消靠 Gravity 单趟模型天然成立：turn 跑完才 append，取消只是丢弃未 append 的执行。
+
+共享会话由此只有「最新意图生效」一种语义，没有部分完成的中间态。执行体无状态时，「取消重来」就是并发会话的全部答案——不需要版本号或冲突仲裁这类协调机制。
 
 ## Surface 设计：注入与触发
 

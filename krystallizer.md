@@ -356,7 +356,14 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 
 ---
 
-## 交叉引用
+## 外部印证与对照：DeepSeek Harness（dsh）
+
+dsh 的会话模型与本系统的设计独立收敛到同一形态：append-only 事件日志为唯一真相源，LLM 消息历史由 `deriveMessages()` 从日志**派生**而非存储，压缩是日志之上的视图替换（surface replace），原始事件一个不删。两点设计可直接印证或吸收：
+
+- **压缩调用的缓存复用**：dsh 生成摘要时重放被压缩请求的前缀、在尾部追加压缩指令，使 provider 侧 KV cache 命中——与本系统尾提示词机制的缓存收益相同（它是独立压缩调用的尾提示词，我们是混入正常 turn 的尾提示词）。
+- **剪裁的结构对齐**：dsh 的保留单元是完整闭合的 step（工具调用 + 结果成对），切割点落在 step 中间就扩展到对齐，`compactRegion` 拒绝拆散工具对。compress_task 的截断边界应采用同一规则，取代固定条数。
+
+## 交叉引用## 交叉引用
 
 - **[图谱化记忆](graph-memory.md)**：原子事实图的概念设计——计算时机光谱、聚簇策略、权重系统、图谱化 Skill。
 - **[Agent 记忆选型](agent-memory.md)**：通用记忆选型分析——Surface/Engine 两层、注入方式、外部开源方案对比。
