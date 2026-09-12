@@ -291,20 +291,43 @@ memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pend
 
 **自带 CLI 驱动循环**：Gravity 提供本地 CLI 形态——进程内循环执行 turn（取会话 → 跑 → 存，下一 turn），这是本地/单机模式；同一 Gravity 函数在 Aura 中注册为 Actor 类型时，每条 turn 事件触发一趟执行，是分布式模式。同一执行函数，三种驱动：CLI for 循环（本地）、Aura Actor（分布式）、函数计算（serverless）——CLI 就是函数的 for 循环，Actor 就是函数的单次调用。
 
-Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程语义，partition key = session_id），不同会话并行；turn 之间 scale-to-zero，`on_sleep`/`on_wake` 退化为存取两个动作。流式输出经高频 emit 事件转 SSE 推送——传输面由 Prism 的 WS 网关承载（Gravity 与 Prism 之间仍是场域事件，无直接连接）。
+Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程语义，partition key = session_id），不同会话并行；turn 之间默认 scale-to-zero，`on_sleep`/`on_wake` 退化为存取两个动作——保留期驻留是此默认的细化：驻留窗口内同会话 turn 复用执行体，超时/显式释放才落入存取两个动作（见统一调用模型一节）。流式输出经高频 emit 事件转 SSE 推送——传输面由 Prism 的 WS 网关承载（Gravity 与 Prism 之间仍是场域事件，无直接连接）。
 
 ### Probe：执行与触手
 
-Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krystallizer 中执行**。容器隔离，安全；skill 代码不被信任，Probe 给它一个受限世界。
+Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krystallizer 中执行**。容器隔离，安全；skill 代码不被信任，Probe 给它一个受限世界。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
+
+**user namespace 隔离**。场域 namespace 按用户划分（跨 namespace 事件不投递，Aura 既有机制），用户的每台机器是其 namespace 内的一个 Probe 实例。Probe 注册凭证即用户凭证——outbound 连接天然携带「我是谁的哪台机器」，控制面把能力清单写进该用户 namespace 的注册表。Gravity 与会话状态同在一个 user namespace 内，越权在 namespace 边界被挡住，不依赖调用侧记得检查。**tool 目标解析 = user namespace + node 别名 + 能力名**（如 `probe:home-pc:read_file`）；「把家里电脑的文件发到办公室电脑」就是两个 invoke 的编排（home 读 → office 写），编排逻辑在 Gravity/LLM，执行位置在注册表里，两者正交——Gravity 不区分远程/本地，区分发生在目标解析层。
+
+**数据路径留给 skill 与用户环境**。控制面只递指令和结果摘要：Result 是消息，保持小；工具执行产生的大产物（文件、二进制）不进控制面——skill 在 Probe 侧自行处置（本地文件系统、用户配置的传输工具、声明的传输类 skill），跨机器传输的可达性要求（直连/VPN）是 skill 层的声明，控制面不感知数据路径，Aura 保持对存储细节的无知。AI 生成的函数调用参数是指令语义（路径、选项、少量片段），天然量级有限；控制面只需一个宽松的消息上限防异常，不构成数据面设计。
 
 两种部署形态，同等支持：
 
 - **Aura 内嵌**：作为 Aura 执行基座（Wasmtime 沙箱谱系的重隔离端——Wasm 管不动真文件系统/真网络/系统包时，容器顶上），场域内调用触达。
-- **远程触手**：GitHub Actions runner 模式——Probe 主动 outbound 注册 + 拉任务（不开入站端口），部署在用户自己的电脑或目标服务器上，就是那台机器的操作触手：部署在哪，就能操作哪。控制面（Aura/Gravity）永远可达 Probe 的 outbound 连接，Probe 所在网络的入站拓扑无关紧要。
+- **远程触手**：部署在用户自己的电脑或目标服务器上，就是那台机器的操作触手：部署在哪，就能操作哪。内网/NAT 下的机器没有入站可达性，唯一可行拓扑是 **outbound 长连接**：Probe 启动时主动向控制面发起连接并注册（我在线、我能做什么），此后保持连接，任务由控制面沿连接下推（WS 帧）。连接方向 outbound，数据方向下行推送，不开入站端口——Probe 所在网络的入站拓扑无关紧要。长轮询（反复 HTTP 询问）是此模式的弱化实现。
+
+**连接面是 Probe Actor 的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的 mailbox 语义：帧下行 = 向该 Probe 实例投递事件，帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、Actor return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准 Actor 调用。同一节点的任务串行由 Actor mailbox 语义免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
 
 **skill 分发：每次 tool call 实时拉取，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 拉取是普通读取，不是需要失效策略的缓存问题。
 
 **拉取路径：Probe → Gravity → Krystallizer，不直连。** 三条理由：访问控制——Krystallizer 只需信任 Gravity 一层，容器（可能跑不信任 skill）不持有数据面凭证；网络拓扑——远程 Probe 只有 outbound 可达控制面，未必能直连存储网；注入点——Gravity 代取时做视图处理与 `tool_invoke_count` 权重回写，这是涌现回路的数据关口，直连会绕开。多一跳 RTT 被 LLM 推理间隙完全吸收（拉取只发生在 tool call 时，个位数次数），不构成瓶颈。
+
+### 统一调用模型：CallSlot
+
+本地调用（场内函数）与远程调用（触手上的工具执行）在框架层统一为同一个模型：发起 → call_id 关联 → 回填。这个模型不是新机制——**就是 Aura 的 `ctx.invoke()`**（oneshot + `pending_calls` 表 + `reply_to` 机制，见 [Aura 架构](aura-architecture.md) §5.14）：发起时登记 pending call、call_id 进任务上下文；执行完成按 call_id 找到条目，值放进 oneshot，发起方完成调用。调用方（Gravity 执行体）不感知执行位置——target 由 `invoke.toml` 注册表分派：HTTP 服务、场内 Actor、远程 Probe 是注册表里的三类条目，同一 API。这是「调用只有一种模式」在调用层的实现：调用模式统一了，传输才只需要裁决一次。错误处理沿用既定裁决——失败作为值放进 oneshot（Result），不另开第二通道。
+
+**两级等待**：等待端按调用性质分流，不是全局二选一。调用处永远只有一行 `slot.wait().await`，运行时在阻塞发生之前按声明分流——分流点在入口，不在等待中途。
+
+- **热路径（内存挂起）**：turn 内的 tool call 循环是高频操作——LLM 返回调用 → 执行 → 回填 → 下一次推理，一轮 turn 可能十几次。运行时在 pending call 上登记 waker，任务 park，结果到达时 waker 触发、值回填。这是「阻塞」的实际内容：**任务停驻（parked）而非线程阻塞**——async 任务停住只占内存不占执行线程，单个控制面可挂数千个 parked turn，无成本问题。零持久化。实现分两层：transport 有显式对端就是 oneshot——`recv().await` 未就绪时内部存下当前任务的 waker，`send()` 时唤醒，`ctx.invoke()` 的 Async responder 即此，无需自造轮子；到达是事件分发（场域事件总线，无显式 channel 对端）时才落到裸 waker/Notify。对调用方两者都是同一行 `await`。
+- **冷路径（事件源挂起）**：触达人类（权限确认）或外部系统的调用，等待分钟级以上。运行时**不让 wait 进入 park**：把转录落盘、向 turn 驱动返回 pending、任务结束、执行体释放（scale-to-zero），挂起状态写进会话事件流（「turn T 等待 call C」）；结果到达时框架查 call_id 定位挂起的 turn，把值放进上下文、重入执行，从转录断点继续——已成功的调用不重跑，转录是断点状态不是执行日志。进程崩溃重启后挂起的 turn 仍在事件流里，天然可恢复。
+
+**无 suspend/continue 指令，明确否决**。「给 channel 发 suspend 指令、执行者收到后挂起」是运行时中途没收一个正在阻塞的续体，隐含要求续体可序列化（Erlang hibernate、虚拟机快照那类）——通用 future 的局部变量快照在 Rust 中不可行，为它改造执行模型成本极高；而声明分流的结构里它没有存在的必要：冷调用在入口被拦截、从未阻塞。热调用的意外长等待（网络卡死、外部服务拖住）也不升级为挂起——**pending call 超时 = 失败值**（Result 经 oneshot 回填，LLM 决定重试或放弃）；把未声明的意外长等待升级成挂起，等于架空声明机制。
+
+**升级由静态声明驱动，不是运行时猜测**。每个工具在注册时声明执行性质（幂等快返回 vs 触达人类/外部系统）——声明的是工具性质，不随调用变。无冷调用的工具，整个循环都是热路径；声明了冷调用的工具，调用到它时才触发升级。声明与 `tool_invoke_count` 同走 Gravity 的工具注册信息，不新建系统。
+
+**执行体生命周期：保留期驻留，取代单趟释放**。纯单趟把热循环变成存储风暴（每次 tool call 一轮存/还原），纯常驻回到有状态服务。折中：turn 执行体在保留期内驻留内存，同一会话连续 tool call 走内存 oneshot；turn 结束或保留期超时才存会话 + 释放；保留期内同会话新 turn 复用驻留体（省取会话）。无状态语义不受破坏——它指**会话状态外置**（执行体不持有会话状态，状态全在 Krystallizer），驻留体是可随时丢弃的热缓存，崩溃后从事件流重建，丢的只是缓存。Aura 侧持久化增量只有 call_id 一个字段（进任务上下文/事件流，冷路径路由回挂起点用）；`pending_calls` 表是纯内存结构，随驻留体生灭。
+
+**历史与转录分离**：turn 内的工具调用循环维护一个工作转录（transcript，LLM 下一轮推理所需：调用、报错、重试），活在驻留体内存，随保留期消亡；会话历史只收净效果——turn 结束时写入最终结果，中间失败尝试是过程不是记忆。热路径全程零落盘；冷路径升级是唯一落盘时刻，落盘前完成剪裁（历史收最终态，转录收重放所需最小集）。全量保留的根源是「不知道挂起点在哪」——挂起点由工具的静态声明给出后，剪裁从写历史时的犹豫变成升级时的一次性裁决。
 
 ### skill 涌现闭环
 
@@ -322,7 +345,7 @@ Probe 拉取执行 → tool_invoke_count 回写权重 → 影响下次排序
 
 ## 传输裁决：入口 WS，内部无连接
 
-WS 用在唯一有状态的位置：Prism 与客户端之间（用户到入口，长连接天然贴合交互会话）。WS 不进入执行路径——Gravity 与 Prism/Probe 之间是 Aura 场域事件，无直接连接；turn 的执行体无状态单趟，连接钉在 Prism（常驻）上，不钉在 Gravity 上。
+WS 用在两个有状态的位置。其一是 Prism 与客户端之间（用户到入口，长连接天然贴合交互会话）。其二，范围限定：**WS 不进入场内执行路径**——场内 Gravity 与 Prism/Probe 之间是 Aura 场域事件，无直接连接；turn 的执行体不持有连接，连接钉在常驻组件上。远程 Probe 是例外：内网机器没有入站可达性，其 outbound 长连接是控制面触达它的唯一通道，任务沿连接下推——这条 WS 钉在控制面连接面上，与入口 WS 同一裁决；turn 的执行体收到的是沿连接下来的调用，本身仍单趟（保留期驻留，见统一调用模型一节）。
 
 这条裁决替代了此前的「HTTP + SSE 默认」方案。修正的理由：连接状态的问题不在 WS 本身，在**连接钉在哪**。Prism 基于 Aura（常驻、多实例由场域调度），把连接收在 Prism 上，WS 的负载均衡/断线重连由 Aura 的连接面统一解决一遍，不会渗入执行层；而 HTTP+SSE 方案会让每个组件各自暴露 HTTP 端点，入口协议碎片化。CLI 包装 WS 后，全部客户端（人、CLI、脚本）走同一条协议，**调用只有一种模式**在传输层也成立。
 
