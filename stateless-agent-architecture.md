@@ -295,7 +295,7 @@ Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程�
 
 ### Probe：执行与触手
 
-Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krystallizer 中执行**。容器隔离，安全；skill 代码不被信任，Probe 给它一个受限世界。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
+Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krystallizer 中执行**。隔离模型：**Probe 自身打包为容器**（base image + 按需安装依赖），隔离按节点切，不按 skill 切——同容器内的 skill 共享其文件系统，「受限世界」由 capability surface（应用层检查）执行，不靠容器边界。这在 user namespace 隔离（按 user 切，不按 skill 切）下成立；仅当多租户共享节点成为真实需求时才重提 per-skill 隔离。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
 
 **user namespace 隔离**。场域 namespace 按用户划分（跨 namespace 事件不投递，Aura 既有机制），用户的每台机器是其 namespace 内的一个 Probe 实例。Probe 注册凭证即用户凭证——outbound 连接天然携带「我是谁的哪台机器」，控制面把能力清单写进该用户 namespace 的注册表。Gravity 与会话状态同在一个 user namespace 内，越权在 namespace 边界被挡住，不依赖调用侧记得检查。**tool 目标解析 = user namespace + node 别名 + 能力名**（如 `probe:home-pc:read_file`）；「把家里电脑的文件发到办公室电脑」就是两个 invoke 的编排（home 读 → office 写），编排逻辑在 Gravity/LLM，执行位置在注册表里，两者正交——Gravity 不区分远程/本地，区分发生在目标解析层。
 
