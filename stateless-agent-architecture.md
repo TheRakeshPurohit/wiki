@@ -310,7 +310,11 @@ Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krys
 
 **skill 分发：每次 tool call 实时拉取，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 拉取是普通读取，不是需要失效策略的缓存问题。
 
-**拉取路径：Probe → Gravity → Krystallizer，不直连。** 三条理由：访问控制——Krystallizer 只需信任 Gravity 一层，容器（可能跑不信任 skill）不持有数据面凭证；网络拓扑——远程 Probe 只有 outbound 可达控制面，未必能直连存储网；注入点——Gravity 代取时做视图处理与 `tool_invoke_count` 权重回写，这是涌现回路的数据关口，直连会绕开。多一跳 RTT 被 LLM 推理间隙完全吸收（拉取只发生在 tool call 时，个位数次数），不构成瓶颈。
+**skill 体量的两种形态：内联与链接。** 一般 py/steel 脚本很小（KB 级），随任务帧内联（inline）直接下发，零额外往返。Wasm 产物可能到 MB 级，内联会撑大任务帧——控制面可提供**可选 HTTP 端口**下发大 skill：URL 带内容版本号（skill spec 的内容哈希），CDN/缓存层可据此缓存，Probe 侧按 (版本号) 命中后不再拉取——这是 CDN 友好缓存，不是 Probe 侧 skill 缓存（零缓存的裁决不变：内容变了版本号就变，URL 即失效策略）。两种形式由任务上下文声明：`inline`（字节在帧里）或 `link`（URL + 版本号 + 期望哈希）。
+
+**极端环境回退：只允许 WS 时走通道。** 内网策略可能禁止任意 HTTP 出站、只放行已建立的 WS 连接——此时 `link` 形态降级为经 WS 通道分块下发（同一帧协议的续帧），Probe 无需感知差异：任务上下文声明什么就消费什么，降级是控制面装配任务帧时的决策（探测/配置知道该节点能否出站 HTTP），不是 Probe 的运行时判断。
+
+**拉取路径：Probe → Gravity → Krystallizer，不直连。** 三条理由：访问控制——Krystallizer 只需信任 Gravity 一层，容器（可能跑不信任 skill）不持有数据面凭证；网络拓扑——远程 Probe 只有 outbound 可达控制面，未必能直连存储网；注入点——Gravity 代取时做视图处理与 `tool_invoke_count` 权重回写，这是涌现回路的数据关口，直连会绕开。多一跳 RTT 被 LLM 推理间隙完全吸收（拉取只发生在 tool call 时，个位数次数），不构成瓶颈。HTTP 大 skill 端口是此路径的例外形态：拉取的**决策**仍走 Probe → Gravity（要不要、哪个版本），只有**字节流**经 CDN 旁路——版本号 + 哈希校验保证旁路字节与决策一致。
 
 ### 统一调用模型：CallSlot
 
