@@ -765,6 +765,27 @@ pub enum RaftCommand {
 
 ## 5. 场域模型：Actor 间交互与外部世界
 
+### ctx 边界：什么在 ctx 上，什么不在
+
+注入 Actor 入口函数的 `ctx` 只收**实例身份相关 + 需要 Host 管控/记录**的运行时能力：
+
+| 在 ctx 上 | 职责 |
+|:--|:--|
+| `ctx.state` | 本实例状态（KV，Fjall/SlateDB，不走 Raft） |
+| `ctx.metadata` | 受控全局元数据（Openraft 强一致） |
+| `ctx.invoke()` | 唯一受控调用面——超时、审计、限流、可观测收口于此（§5.13） |
+
+不在 ctx 上的能力与其归属：
+
+- **emit / on**：场域 pub/sub，脚本层裸函数（emit）与激活期装配（on，对应 interface_schema 的静态契约）。事件投递的 partition 来自事件数据而非发射者身份，不依赖实例；emit 是进程内 fire-and-forget，没有需要管控的生命周期；on 放 ctx 会暗示运行时动态订阅，与静态契约矛盾。
+- **interface_schema() / set()**：定义期契约与部署面，执行中的 Actor 看不到。
+- **on_sleep / on_wake**：生命周期钩子是 Host → Actor 方向，ctx 是 Actor → Host 方向的使用接口，两者方向相反。
+- **入口函数 return**：语言原生行为，Host 拦截填入 reply_to，不需要 `ctx.return()`。
+- **@cron / on_debounce**：定时是声明式触发模式（投递事件唤醒 Actor），不是可调用的定时 API（无 `ctx.sleep()`/`ctx.every()`）。
+- **日志、纯计算、语言标准库**：凡需 Host 管控的外部交互都经 `ctx.invoke()` 注册目标编址，其余用宿主语言原生设施。
+
+新能力按此判据归位：实例绑定 + Host 管控 → 进 ctx；静态契约 / Host 驱动 / 场域层 → 排除。决策记录见 Aura 仓库 ADR-0011。
+
 ### 5.1 核心设计
 
 传统 Actor 框架（Akka、Erlang、Actix）的通信原语是 ActorRef 直发（tell/ask）——调用者必须知道目标 Actor 的地址。Aura 采用不同的原语：Actor 之间不直接寻址，而是通过共享的"场域"（Event Realm）用 `emit` / `on` 交互。
