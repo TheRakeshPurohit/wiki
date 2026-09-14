@@ -5,7 +5,7 @@
 
 **Status:** 持续演进
 **覆盖引擎：** Fjall（本地 NVMe）、SlateDB（S3 云原生）、redb（本地 B-tree）、SQLite 对比
-**架构：** [Aura 架构 §5](aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）
+**架构：** [Aura 架构 §5](aura-architecture.md) — 双引擎模式（Fjall / SlateDB+S3）；细节见 aura 仓库 [`docs/design/storage.md`](https://github.com/orbsh/aura/blob/main/docs/design/storage.md)
 **Cross-ref:** [Redis 批判](redis-critique.md) — Redis 为何被 KV 替代
 
 ## 核心论点
@@ -1456,7 +1456,7 @@ Business Coordination (locks, scheduling, election)
 
 **关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
 
-> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 [Aura 架构 §5.5](aura-architecture.md#55-核心源码实现openraft-状态机挂载-fjall)。
+> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md)（Openraft 状态机挂载 Fjall 的宿主实现）。
 
 ### 分布式场景：并发有序性与分片均衡
 

@@ -311,4 +311,4 @@ JSON Schema 验证日志格式会增加运行时开销。结构化日志的核�
 - [Lakehouse 研究](lakehouse-research.md) — Lakehouse 架构与日志攒批
 - [统一数据层](unified-data-layer.md) — 多模态数据存储分析
 - [Arrow HTAP 引擎](arrow-unified-htap-engine.md) — 列式分析与日志聚合
-- Aura 架构 [§6.15 MQ 分解架构](aura-architecture.md#615-mq-分解架构) — 日志作为边界事件的存储模式
+- Aura 架构 MQ 分解架构 — 日志作为边界事件的存储模式（详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §MQ 分解架构）

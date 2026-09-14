@@ -632,4 +632,4 @@ KV 路线的完整实现设计（属性图编码模式、delta 追加消除 read
 - **[Agent 记忆选型](agent-memory.md)**：现有方案分析（agentmemory vs cognee、四象限全景、与本文档的逐项对照）。
 - **[无状态 Agent 架构](stateless-agent-architecture.md)**：组件架构总纲——turn 模型、压缩双模式、Surface 架构语义、skill 涌现在架构中的位置。
 - **[Agent 复利](agent-compound-interest.md)**：复利机制中"记忆积累"在属性图中的具体实现路径。
-- **[知识原子事实抽取技能](../skills/knowledge-triplets/SKILL.md)**：抽取格式定义，本文档的写入层规范。
+- **知识原子事实抽取技能**（Hermes skill `knowledge-triplets`，本地 `~/.hermes/skills/`）：抽取格式定义，本文档的写入层规范。

@@ -164,5 +164,5 @@
 
 ## 📚 相关文档
 
-- [Neovim 0.12 部署计划](../../Configuration/nixos/docs/memos/neovim-0.12-deployment-plan.md)
+- [Neovim 0.12 部署计划](https://github.com/orbsh/nixos/blob/main/docs/memos/neovim-0.12-deployment-plan.md)
 - [编辑器选型分析 2026](./editor-selection-2026.md)
