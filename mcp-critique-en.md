@@ -37,6 +37,14 @@ But this doesn't change the fact that MCP is technically over-engineered. Standa
 
 **CLI + Skill alignment**: Skills can equally specify commands (e.g., `my-skill --schema`) that output strongly-typed parameter descriptions in milliseconds. The AI framework loads progressively on demand, routing to the corresponding Skill and fetching Schema only when needed — far more efficient than MCP's full loading. This is an information-theoretic advantage: on-demand retrieval > broadcast.
 
+#### Disclosure Depth: Paid Construction vs Free Inheritance
+
+On top of on-demand retrieval lies a deeper gap: **the cost and depth of implementing progressive disclosure**.
+
+MCP's progressive disclosure requires building interfaces level by level. Want a "details" layer? Add a details tool. Want a "reference" layer? Add another reference tool — the protocol has no hierarchical navigation primitive; every level is a hand-designed RPC with schema bloat and maintenance cost at each step. MCP is not just inflexible in implementation — it isn't how humans use tools either. Compensating with model fine-tuning on MCP usage patterns runs against the training data distribution; effectiveness is dubious.
+
+Skill's multi-level disclosure (summary → details → reference) needs extra handling only at the summary level (index or frontmatter); everything below is filesystem navigation: directory structure is the hierarchy, reading is drilling down. The content organization is isomorphic to product manuals — README → chapters → appendix — and LLM training corpora contain vast amounts of such documents; the navigation pattern is fully mastered. Skill's progressive disclosure rides on capabilities the model already has, for free; MCP's on-demand loading is a newly-built API surface for the model, paid per level.
+
 ### Pseudo-Advantage 2: Stateful Long Connections Avoiding File Lock Contention
 
 **MCP's claim**: Stateful long-lived connections avoid lock conflicts from concurrent file writes across instances.
@@ -131,6 +139,15 @@ metadata.json       ← Schema + version + dependencies
 
 This is not theoretical speculation — CLI + Skill's spawn model is already the local equivalent of Serverless. WASM Runtime simply extends this pattern from "local processes" to "cross-environment sandboxes."
 
+### The Right Posture for Stateful Upstreams: Thin Proxy, Not Shadow Service
+
+Facing a stateful upstream API (GitHub, Linear, database services), an MCP server has only two postures:
+
+- **Thin proxy**: forward only, never understand. Requests pass through untouched, tokens carried as-is; auth, permissions, and state all stay upstream. This is the correct strategy — and it needs no stateful long-lived protocol form at all: a run-and-exit CLI making direct HTTPS calls is the thinnest possible layer.
+- **Shadow service**: re-implement part of the upstream locally. Multi-step operations demand local session/account machinery; upstream functionality gets duplicated inside the MCP server — a federated pattern under a central system, worse than either the upstream alone or a thin proxy: consistency is unguaranteeable (the upstream evolves, the shadow lags), state lives in two places, failure points double.
+
+MCP's long-lived server form naturally pushes implementers toward the shadow service: the connection is already established, state is already in memory, and the temptation to "cache a little for better UX" is ever-present. The thin proxy — the only correct strategy — is instead most natural for a CLI that cold-starts and connects directly each time: a stateless process has nowhere to hide state even if it wanted to. The mismatch between protocol form and correct strategy is a criticism one level deeper than "clunky."
+
 ---
 
 ## VI. MCP vs CLI + Skill Comparison
@@ -147,6 +164,9 @@ This is not theoretical speculation — CLI + Skill's spawn model is already the
 | **Portability** | Protocol-bound, cross-client adaptation needed | Direct directory copy |
 | **Sovereignty** | Protocol-bound, tools on server | Local files, tool sovereignty with developer |
 | **Scale management** | Flat list, full loading | Search + tree + composition, on-demand loading |
+| **Disclosure depth** | Interfaces built per level (details/reference each an RPC) | Filesystem navigation (directories are the hierarchy, free) |
+| **Upstream integration** | Shadow-service temptation (long-lived form hoards state) | Thin proxy (stateless process has nowhere to hide state) |
+| **Engineering quality** | No spec mandate, up to each implementer | CLI conventions internalize error/logging practice |
 | **Ecosystem compat** | ✅ Cross-client standard | ❌ Per-framework implementation |
 
 ---
@@ -174,6 +194,23 @@ Skill implementation language choice is not a technical aesthetics problem — i
 ### Framework-Level Security: Framework Constructs Commands
 
 After receiving LLM's structured output (tool name + parameter list), the framework constructs commands using its own language's spawn API — LLM doesn't directly assemble command strings, framework controls execution. This is not fundamentally different from MCP's security model — MCP also has LLM providing parameters, framework/Server executing. Injection risk is identical on both routes.
+
+### Governance Parity: Filesystem ACL as the Enterprise Control Plane
+
+"MCP's network boundary offers better governance" doesn't hold from an enterprise-governance perspective. Enterprise control cares about audit, authorization, and asset compliance — and the two routes' control planes are at parity:
+
+- MCP: a central registry records each server's URL or stdio launch path; a gateway intercepts JSON-RPC traffic for auditing.
+- Skill: skills live in a governed directory tree (central private Git repo / package manager); the framework intercepts stdout/stderr and system calls when spawning child processes for full audit logging.
+
+Filesystem ACLs (user-group permissions, directory read/write limits) are a decades-proven, mature, low-cognitive-load control technology. A Skill is not a feral script — it is an enterprise static asset governed exactly like an MCP server. Any audit granularity a protocol gateway can achieve, process-level interception plus directory permissions achieve equally.
+
+### Engineering Quality as Spec Responsibility
+
+Error quality and structured logging are often treated as protocol-neutral "implementation details" — both can do it well, so it's not a differentiator. That reasoning misses **where the responsibility lands**: without a spec mandate, quality depends on each implementer's diligence, and diligence coverage depends on the cost-vs-incentive balance.
+
+Skill conventions internalize engineering practice naturally: a CLI written for humans has error messages as part of its interface (`Error: missing option '--repo'` is directly readable and fixable), frameworks like typer give structured help for free; logging with structlog accumulates structured events, and a single duckdb SQL query suffices for diagnosis. These are the natural way to write run-and-exit processes — the process is gone after execution, so all information must land in the output at the moment it happens.
+
+An MCP server is a long-lived service with heavier engineering obligations — ops, monitoring, process supervision, dependency management are all extra failure points — yet the protocol constrains none of it, and wrapping errors in JSON error codes cuts off the LLM's natural-language self-correction channel. Quality depends on the implementer, the spec doesn't mandate it, and operational complexity amplifies the cost of the debt. "Protocol-neutral" only sees "both can do it well," not "one spec makes doing it well the default, the other makes it voluntary."
 
 ### Skill-Level Security: Supply Chain Problem
 
