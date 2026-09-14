@@ -23,22 +23,25 @@ f(session, user_input) -> session'
 | **Krystallizer** | 结晶 | 会话真相唯一持有者：append-only 会话 + prefix checkpoint + 视图裁剪；技能图谱与涌现 | 记忆面（mem-core 嵌入或独立服务） |
 | **Prism** | 棱镜 | 入口：鉴权、请求解析、把 turn 投进场域。WS 网关 + CLI（包装 WS） | 基于 Aura，纯入口，无队列无状态 |
 | **Gravity** | 引力 | turn 执行器：取会话 → 跑 turn → 存增量。turn 被会话真相牵引运转；单趟执行（一个 turn 一趟），非常驻循环 | Aura 中的 Actor 类型（partition key = session_id）；自带 CLI 驱动循环，本地模式即循环执行 turn |
-| **Probe** | 探针 | skill 运行时：容器化执行环境 + 操作触手。skill 定义从 Krystallizer 实时拉取，执行结果作为 tool result 回流 | Aura 基座组件，也可独立部署为远程服务 |
+| **Probe** | 探针 | 操作执行环境：容器化执行环境 + 操作触手。接收下发的操作与参数（skill 对其不可见——skill 的解析与选择发生在 Gravity/LLM 侧），执行结果作为 tool result 回流 | Aura 基座组件，也可独立部署为远程服务 |
 
 ```
          请求
           │
-       ┌──▼──┐  turn 投递    ┌─────────────────┐
-       │Prism├──────────────►│ Gravity (Actor) │
-       └─────┘               └──┬────────┬─────┘
-                                │        │ tool call
-              fetch session     │        ▼
-              append delta   ┌──▼────────┐  skill spec  ┌───────┐
-              (full mode)    │Krystallizer├─────────────►│ Probe │
-                             │(memory +   │  (涌现式)     │local/ │
-                             │ skill 图谱)│◄─────────────│remote │
-                             └───────────┘  tool result └───────┘
+       ┌──▼──┐  turn 投递    ┌─────────────────────────┐
+       │Prism├──────────────►│ Gravity (Actor)          │
+       └─────┘               │  LLM 选择操作、生成参数    │
+                             └──┬──────────┬────────────┘
+                                │          │ 任务帧（操作+参数）
+              fetch session     │          ▼
+              append delta   ┌──▼─────────┐  操作执行    ┌───────┐
+              (full mode)    │Krystallizer│            │ Probe │
+                             │(memory +   │            │local/ │
+                             │ skill 图谱)│            │remote │
+                             └───────────┘◄────────────┘───────┘
+                                             tool result
 ```
+（skill 解析发生在 Gravity 侧：Krystallizer → Gravity 的会话取用里带上解析结果；Probe 只见操作与参数。）
 
 ### Prism：入口收缩
 
@@ -295,11 +298,11 @@ Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程�
 
 ### Probe：执行与触手
 
-Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krystallizer 中执行**。隔离模型：**Probe 自身打包为容器**（base image + 按需安装依赖），隔离按节点切，不按 skill 切——同容器内的 skill 共享其文件系统，「受限世界」由 capability surface（应用层检查）执行，不靠容器边界。这在 user namespace 隔离（按 user 切，不按 skill 切）下成立；仅当多租户共享节点成为真实需求时才重提 per-skill 隔离。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
+Probe 是操作的执行环境——**执行只提供运行时，不在 Krystallizer 中执行**。skill 对 Probe 不可见：skill 是 Krystallizer 图谱中涌现的子图，Gravity 驱动 LLM——LLM 选择操作、生成参数，这个选择就是 skill 的执行；Probe 拿到的只有操作和参数（外加操作携带的代码）。隔离模型：**Probe 自身打包为容器**（base image + 按需安装依赖），隔离按节点切，不按 skill 切——同容器内的操作共享其文件系统，「受限世界」由 capability surface（应用层检查）执行，不靠容器边界。这在 user namespace 隔离（按 user 切，不按 skill 切）下成立；仅当多租户共享节点成为真实需求时才重提 per-skill 隔离。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
 
 **user namespace 隔离**。场域 namespace 按用户划分（跨 namespace 事件不投递，Aura 既有机制），用户的每台机器是其 namespace 内的一个 Probe 实例。Probe 注册凭证即用户凭证——outbound 连接天然携带「我是谁的哪台机器」，控制面把能力清单写进该用户 namespace 的注册表。Gravity 与会话状态同在一个 user namespace 内，越权在 namespace 边界被挡住，不依赖调用侧记得检查。**tool 目标解析 = user namespace + node 别名 + 能力名**（如 `probe:home-pc:read_file`）；「把家里电脑的文件发到办公室电脑」就是两个 invoke 的编排（home 读 → office 写），编排逻辑在 Gravity/LLM，执行位置在注册表里，两者正交——Gravity 不区分远程/本地，区分发生在目标解析层。
 
-**数据路径留给 skill 与用户环境**。控制面只递指令和结果摘要：Result 是消息，保持小；工具执行产生的大产物（文件、二进制）不进控制面——skill 在 Probe 侧自行处置（本地文件系统、用户配置的传输工具、声明的传输类 skill），跨机器传输的可达性要求（直连/VPN）是 skill 层的声明，控制面不感知数据路径，Aura 保持对存储细节的无知。AI 生成的函数调用参数是指令语义（路径、选项、少量片段），天然量级有限；控制面只需一个宽松的消息上限防异常，不构成数据面设计。
+**数据路径留给操作与用户环境**。控制面只递指令和结果摘要：Result 是消息，保持小；工具执行产生的大产物（文件、二进制）不进控制面——操作在 Probe 侧自行处置（本地文件系统、用户配置的传输工具、声明的传输类操作），跨机器传输的可达性要求（直连/VPN）是 Gravity 侧 skill 元数据的声明，控制面不感知数据路径，Aura 保持对存储细节的无知。AI 生成的函数调用参数是指令语义（路径、选项、少量片段），天然量级有限；控制面只需一个宽松的消息上限防异常，不构成数据面设计。
 
 两种部署形态，同等支持：
 
@@ -308,13 +311,13 @@ Probe 是 skill 的运行时环境——**执行只提供运行时，不在 Krys
 
 **连接面是 Probe Actor 的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的 mailbox 语义：帧下行 = 向该 Probe 实例投递事件，帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、Actor return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准 Actor 调用。同一节点的任务串行由 Actor mailbox 语义免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
 
-**skill 分发：每次 tool call 实时拉取，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 拉取是普通读取，不是需要失效策略的缓存问题。
+**skill 分发：每次 tool call 实时解析，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 解析是普通读取，不是需要失效策略的缓存问题。分界：解析发生在 Gravity 侧（Krystallizer → Gravity，涌现回路的权重回写也在此），Probe 不感知 skill、不发起拉取、两次调用之间不持有任何东西——它收到的任务帧里是什么就执行什么。
 
-**skill 体量的两种形态：内联与链接。** 一般 py/steel 脚本很小（KB 级），随任务帧内联（inline）直接下发，零额外往返。Wasm 产物可能到 MB 级，内联会撑大任务帧——控制面可提供**可选 HTTP 端口**下发大 skill：URL 带内容版本号（skill spec 的内容哈希），CDN/缓存层可据此缓存，Probe 侧按 (版本号) 命中后不再拉取——这是 CDN 友好缓存，不是 Probe 侧 skill 缓存（零缓存的裁决不变：内容变了版本号就变，URL 即失效策略）。两种形式由任务上下文声明：`inline`（字节在帧里）或 `link`（URL + 版本号 + 期望哈希）。
+**操作代码的两种形态：内联与链接。** 一般 py/steel 脚本很小（KB 级），随任务帧内联（inline）直接下发，零额外往返。Wasm 产物可能到 MB 级，内联会撑大任务帧——控制面可提供**可选 HTTP 端口**下发大产物：URL 带内容版本号（代码的内容哈希），CDN/缓存层可据此缓存——这是 CDN 友好缓存，不是 Probe 侧代码缓存（零持有的裁决不变：内容变了版本号就变，URL 即失效策略）。两种形式由任务上下文声明：`inline`（字节在帧里）或 `link`（URL + 版本号 + 期望哈希）。
 
 **极端环境回退：只允许 WS 时走通道。** 内网策略可能禁止任意 HTTP 出站、只放行已建立的 WS 连接——此时 `link` 形态降级为经 WS 通道分块下发（同一帧协议的续帧），Probe 无需感知差异：任务上下文声明什么就消费什么，降级是控制面装配任务帧时的决策（探测/配置知道该节点能否出站 HTTP），不是 Probe 的运行时判断。
 
-**拉取路径：Probe → Gravity → Krystallizer，不直连。** 三条理由：访问控制——Krystallizer 只需信任 Gravity 一层，容器（可能跑不信任 skill）不持有数据面凭证；网络拓扑——远程 Probe 只有 outbound 可达控制面，未必能直连存储网；注入点——Gravity 代取时做视图处理与 `tool_invoke_count` 权重回写，这是涌现回路的数据关口，直连会绕开。多一跳 RTT 被 LLM 推理间隙完全吸收（拉取只发生在 tool call 时，个位数次数），不构成瓶颈。HTTP 大 skill 端口是此路径的例外形态：拉取的**决策**仍走 Probe → Gravity（要不要、哪个版本），只有**字节流**经 CDN 旁路——版本号 + 哈希校验保证旁路字节与决策一致。
+**解析路径：Krystallizer → Gravity，不经过 Probe，更不直连。** 三条理由：访问控制——Krystallizer 只需信任 Gravity 一层，容器（执行不受信任代码）不持有数据面凭证；网络拓扑——远程 Probe 只有 outbound 可达控制面，未必能直连存储网；注入点——Gravity 在此做视图处理与 `tool_invoke_count` 权重回写，这是涌现回路的数据关口，绕开即断。Probe 侧没有拉取动作：它收到的任务帧是 Gravity 组装完的成品。HTTP 大产物端口是此路径的例外形态：**决策**全在 Gravity（要不要、哪个版本），只有**字节流**经 CDN 旁路直达 Probe——版本号 + 哈希校验保证旁路字节与决策一致。
 
 ### 统一调用模型：CallSlot
 
@@ -342,7 +345,7 @@ skill 不是静态文件，是 Krystallizer 图谱中高工具指数的子图（
         ↓ 聚类涌现
 高权重子图 = skill 边界 → Gravity 运行时发现（向量搜索 + 权重排序）
         ↓ tool call
-Probe 拉取执行 → tool_invoke_count 回写权重 → 影响下次排序
+Gravity 组装任务帧下发 → Probe 执行 → tool_invoke_count 回写权重 → 影响下次排序
 ```
 
 涌现的原料回路复用 Krystallizer 既有机制（权重 delta 计数、图聚类），不新建系统。
