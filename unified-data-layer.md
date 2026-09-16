@@ -88,7 +88,7 @@ SurrealDB 的杀招「计算下推」本身也不免费——它把执行拆成�
 ## 存算分离与分层位置
 
 - **PostgreSQL（路径 A）**：单体扩展（插件/JSONB），存算分离由云厂商提供。
-- **KV（路径 B）**：嵌入式（Fjall + Openraft）或 S3 后端（SlateDB），进程内零 RTT 或对象存储持久化。
+- **KV（路径 B）**：嵌入式（Fjall，元数据单写无共识）或 S3 后端（SlateDB），进程内零 RTT 或对象存储持久化。
 - **DuckDB（路径 B）**：嵌入列式，存算分离由 Lakehouse 提供。
 - **Iceberg（路径 B）**：S3 + Catalog，存储与计算彻底解耦。
 
@@ -98,7 +98,7 @@ SurrealDB 的杀招「计算下推」本身也不免费——它把执行拆成�
 
 ## 交叉引用
 
-- **[KV 存储引擎](kv-storage-engine.md)**：嵌入式 KV 与分布式共识（Fjall + Openraft）设计；可预测查询模式与大规模场景下 KV 替代 PostgreSQL 的论证。
+- **[KV 存储引擎](kv-storage-engine.md)**：嵌入式 KV 设计（元数据单写无共识；数据级强一致复制交外部 TiKV 类方案）；可预测查询模式与大规模场景下 KV 替代 PostgreSQL 的论证。
 - **[Lakehouse 研究](lakehouse-research.md)**：分析层选型——Delta/Iceberg/Lance、对象存储、落地模式、Catalog 无状态化。
 - **[SurrealDB 评估档案](query-language-design.md)**：SurrealQL 语言哲学、图建模、挑战者逻辑的完整评估（为何未进核心）。
 - **[Redis 批判](redis-critique.md)**：网络 RTT 陷阱与缓存分层。

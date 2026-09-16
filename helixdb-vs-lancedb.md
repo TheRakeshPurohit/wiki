@@ -92,7 +92,7 @@ HelixDB 与 LanceDB 都依赖对象存储原生，这点与 Fjall 的"本地存�
 | 原子写 | 依赖对象存储 `If-None-Match` 条件写 | SlateDB 对象存储 LSM |
 | 底座关系 | 自研 Lance 格式 | SlateDB（与你在 kv 文档对比的底层同源） |
 
-**"Fjall + Openraft 不适合 S3"的论证**已在 [共识协议](consensus-protocol.md)「Raft 不适合什么」章完整展开（写放大、Raft 复制成本 vs S3 固定三副、存算分离），此处不重复——两个后续方案（LanceDB、HelixDB）都是对象存储原生的正面解法。
+**"Fjall + 共识复制不适合 S3"的论证**已在 [共识协议](consensus-protocol.md)「Raft 不适合什么」章完整展开（写放大、Raft 复制成本 vs S3 固定三副、存算分离），此处不重复——两个后续方案（LanceDB、HelixDB）都是对象存储原生的正面解法。
 
 多厂商对象存储适配（阿里云 OSS/华为 OBS/腾讯 COS/Cloudflare R2 的 `If-None-Match` 兼容矩阵）见附录。
 

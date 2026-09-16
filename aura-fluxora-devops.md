@@ -45,7 +45,7 @@ fjall partition: "actor_defs"
 
 - **版本化**：Fjall 的 LSM-Tree 天然支持版本化，每次 `set()` 保留新版本，旧版本可回滚
 - **去重**：`set()` 提交前先计算 `script_bytes` 的哈希，与最新版本比较——相同则忽略，不写入新版本
-- **跨节点同步**：Openraft 自动将脚本同步到所有节点，不需要在每个节点上手动放置脚本文件
+- **跨节点同步**：脚本随节点独立部署（各节点 meta 实例 + git/S3 静态资产分发），不需要在每个节点上手动放置脚本文件
 - **实例激活**：`on()` handler 在 Actor 实例激活时从 Fjall 读取最新版本脚本，加载到对应 VM 执行；实例驱逐后，下次激活重新读取
 
 ### 1.3 端点发现：`interface_schema()` 约定
@@ -131,7 +131,7 @@ set("order_actor", lang="python", script=script_bytes)
     ├── 2. 调用 Aura set() API
     ├── 3. Aura 验证 interface_schema() 结构
     ├── 4. 脚本写入 Fjall（版本化）
-    └── 5. Openraft 同步到所有节点
+    └── 5. 各节点独立部署（git/S3 分发脚本资产）
     ↓
 [Aura 运行新脚本（热重载）]
 ```
@@ -453,7 +453,7 @@ impl ScriptMetrics {
 | **回滚** | Fjall LSM-Tree 版本化，`auractl arena rollback` 指定旧版本 |
 | **GitOps** | ArgoCD 自动调用 `set()` + 环境隔离 |
 | **审计** | Fjall 元数据 + Git commit SHA 双重追踪 |
-| **跨节点同步** | Openraft 自动复制，无需手动部署脚本文件 |
+| **跨节点同步** | 脚本资产 git/S3 分发，无需手动部署脚本文件 |
 | **端点发现** | `interface_schema()` 约定，无需 YAML 清单文件 |
 | **性能** | Prometheus/Grafana 监控脚本执行指标 |
 
@@ -469,7 +469,7 @@ impl ScriptMetrics {
 6. **质量门禁**：脚本必须通过 lint、测试、`interface_schema()` 验证
 7. **性能监控**：实时监控脚本执行时间和内存使用
 8. **无清单文件**：`interface_schema()` 约定替代 YAML manifest，脚本自描述端点
-9. **存储即复制**：脚本存 Fjall，Openraft 自动跨节点同步，无需手动部署
+9. **存储即资产**：脚本存 Fjall（各节点 meta 实例 + git/S3 分发），无需手动部署
 
 ---
 

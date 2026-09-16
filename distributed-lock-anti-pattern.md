@@ -79,7 +79,7 @@
 
 Redis 常被辩护为"适合分布式锁"。这条辩护在两层崩塌：
 
-1. **锁的正解本来该是共识/lease**（etcd、Consul、Fjall+Openraft），天然强一致。
+1. **锁的正解本来该是共识/lease**（etcd、Consul）或元数据单写（aura 口径），天然强一致。
 2. Redlock 连这个"次优解"都不合格——不满足严格互斥的正确性保证。详见 [Redis 批判 §6.1](redis-critique.md)。
 
 ## 7. 真正需要"共识"而非"锁"
@@ -91,3 +91,4 @@ Redis 常被辩护为"适合分布式锁"。这条辩护在两层崩塌：
 - [Redis 批判 §6.1 分布式锁 / Redlock 论战](redis-critique.md)
 - [共识协议](consensus-protocol.md)
 - [Kv 存储引擎 — 共识与协调层级](kv-storage-engine.md)
+- [分布式协作拓扑](distributed-collaboration-topology.md) — TCC/幂等/回查在联邦事务中的展开（协调替代互斥的正面案例）

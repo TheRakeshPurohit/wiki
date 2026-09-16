@@ -448,7 +448,7 @@ class BlockOperations {
 | 组件 | Aura 中的对应 | 集成方式 |
 |------|--------------|----------|
 | 块存储 | Fjall Keyspace | `blocks` keyspace 直接用 Fjall |
-| 协同同步 | Openraft | Yjs 处理 CRDT 合并，Raft 处理元数据一致性 |
+| 协同同步 | 独立共识服务（etcd 类） | Yjs 处理 CRDT 合并，元数据一致性走外部共识或单写 |
 | 文本搜索 | Tantivy | 块内容索引到 Tantivy，支持全文搜索 |
 | 向量搜索 | LanceDB | 块内容 Embedding 存入 LanceDB，支持语义搜索 |
 | AI 生成 | Steel Lisp | Lisp 脚本生成 Block JSON → 验证 → 插入文档 |

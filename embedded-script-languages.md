@@ -128,7 +128,7 @@
 
 ### 4.3 用户驱动的多模态路由协议（User-Driven Polyglot Routing）
 
-在分布式智能体架构（Fjall + Openraft + Polyglot Core）中，用户意志通过 Raft 共识协议广播到整个集群。框架不再是法官，只是卑微的动力提供者；用户和 AI 的动态意志，才是决定哪种语言在这一毫秒登上多模态内存舞台的最高统帅。
+在分布式智能体架构（Fjall + 独立元数据 + Polyglot Core）中，用户意志直接写本节点元数据实例（控制平面单写），不经共识广播。框架不再是法官，只是卑微的动力提供者；用户和 AI 的动态意志，才是决定哪种语言在这一毫秒登上多模态内存舞台的最高统帅。
 
 #### 用户驱动的状态指令协议
 
@@ -161,7 +161,7 @@ pub enum RaftCommand {
 
 #### 动态多语言分流器：用户意志在内存中的极速变现
 
-当 Openraft 集群对用户提交的 `DispatchUserScript` 达成共识后，本地状态机根据用户选择，秒级将物理内存指针映射到对应的语言虚拟机：
+当用户提交的 `DispatchUserScript` 写入本节点元数据实例后，本地状态机根据用户选择，秒级将物理内存指针映射到对应的语言虚拟机：
 
 ```rust
 fn execute_user_chosen_engine(
@@ -226,7 +226,7 @@ fn execute_user_chosen_engine(
    当你托管在云端的 Hermes 大脑发现："接下来的任务需要去读取一个复杂的深度学习 .bin 权重文件，或者分析一段遗留的 PyTorch 矩阵"时，AI 会自己在分布式提案里写明：`engine: EngineType::PyO3`。它通过纯粹的内存指针，直接在当前 Rust 进程里无缝吃掉 Python 的 AI 生态。
 
 3. **多语言在 Fjall 磁盘里的完美大一统**：
-   不管用户刚才任性地选了 Lisp 还是 Python，它们对智能体状态的修改（Mutation），最终都会被反序列化回最基础的二进制内存块（`Vec<u8>`）。经由 Openraft 的强一致性网络广播达成多数派共识后，单次落盘、高度压缩地锁进本地的 Fjall LSM-Tree 物理硬盘中。
+   不管用户刚才任性地选了 Lisp 还是 Python，它们对智能体状态的修改（Mutation），最终都会被反序列化回最基础的二进制内存块（`Vec<u8>`）。单次落盘、高度压缩地锁进本地的 Fjall LSM-Tree 物理硬盘中。
 
 ## 五、被否决的候选者：Koto
 

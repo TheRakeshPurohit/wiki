@@ -121,7 +121,7 @@ Arrow 是全宇宙统一的内存列式布局标准。它不关心磁盘，它�
 
 ### 1.3 分布式存算一体架构下的"终极排兵布阵"
 
-在 **Fjall（本地快线）+ Openraft（分布式强一致共识）+ 多模态嵌入内核（用户自选语言沙箱）+ Polars（极速内存分析）+ LanceDB/S3（云端长期记忆）** 架构中，绝对不能盲目地"一个格式用到底"。必须遵循第一性原理，将其精密地卡位在最适合的生命周期节点上：
+在 **Fjall（本地快线）+ 独立元数据实例（单写无共识）+ 多模态嵌入内核（用户自选语言沙箱）+ Polars（极速内存分析）+ LanceDB/S3（云端长期记忆）** 架构中，绝对不能盲目地"一个格式用到底"。必须遵循第一性原理，将其精密地卡位在最适合的生命周期节点上：
 
 ```
 [ 现代分布式智能体全栈集群格式沙盘 ]
@@ -330,9 +330,9 @@ impl RealTimeHtapEngine {
 - **Raft → Bincode**：控制流与共识日志的"轻骑兵"（重行、重极速、重状态同步）
 - **Fjall → Arrow**：业务状态与内存分析的"装甲车"（重列、重向量化、重存算一体）
 
-### 5.2 Raft → Bincode：控制网络的极轻行式
+### 5.2 Raft → Bincode：控制网络的极轻行式（历史分析）
 
-**它在哪里**：死守在 Openraft 的网络 RPC 传输（心跳、选票、追加日志）以及本地磁盘的 RaftLog（预写日志 WAL）中。
+**它在哪里**：此类信令格式只在引入外部共识层时存在（心跳、选票、追加日志与 RaftLog）。aura 当前口径元数据单写无共识，本节保留为「若未来挂共识层」的序列化分析。
 
 **为什么这么配**：Raft 层的任务是高频、原子化地确认"当前是谁的任期、多数派是否达成、指令的时序是什么"。这些控制信令在 Rust 里是绝对死板、没有大批量分析需求的强类型行式结构体。
 
@@ -351,7 +351,7 @@ impl RealTimeHtapEngine {
 当用户下达了一次"对当前活跃智能体状态进行实时 Ad-hoc 跨表分析"的动态指令时，两者的闭环互补如下：
 
 ```rust
-// 位于 Openraft 状态机的物理应用钩子 (Apply Committed Entries)
+// 位于外部共识层状态机的物理应用钩子 (Apply Committed Entries)——仅数据级强一致复制场景（TiKV 类）存在
 async fn apply<I>(&self, entries: I) -> Result<Vec<Response>, StateMachineError> {
     for entry in entries {
         // 【第一步：解包 Raft 层的行式骨骼 (Bincode)】
@@ -394,7 +394,7 @@ async fn apply<I>(&self, entries: I) -> Result<Vec<Response>, StateMachineError>
 
 ### 6.1 数据格式的绝对大一统（Unified Mechanical Sympathy）
 
-数据在物理磁盘的 LSM 分区里（Fjall）是 Arrow，在跨节点的 RaftLog 日志复制里（Openraft）是 Arrow，在云端远端 S3 的长期记忆湖仓里（LanceDB）是 Arrow，在内存进行多核绞肉计算时（Polars）依然是 Arrow。数据在磁盘、网络、内存和多语言虚拟机之间流转，中间没有任何一次格式转换的开销，彻底消灭了结构漂移。
+数据在物理磁盘的 LSM 分区里（Fjall）是 Arrow，在云端远端 S3 的长期记忆湖仓里（LanceDB）是 Arrow，在内存进行多核绞肉计算时（Polars）依然是 Arrow。数据在磁盘、网络、内存和多语言虚拟机之间流转，中间没有任何一次格式转换的开销，彻底消灭了结构漂移。
 
 ### 6.2 物理世界完美的内嵌 HTAP 引擎
 
@@ -432,7 +432,6 @@ Arrow 大一统 HTAP 引擎是 [Aura 架构](aura-architecture.md) 的**存储�
 [现代 Actors 架构]
 ├── Actor 引擎（Tokio 异步调度）
 ├── 多语言沙箱（Steel/Rune/PyO3/Wasm）
-├── 分布式共识（Openraft）
 └── 存储层
     ├── 工作记忆：Fjall（现在是 Arrow IPC 格式） ✨ 升级
     ├── 长期记忆：LanceDB + S3（底层已是 Arrow）
@@ -453,9 +452,6 @@ Arrow 大一统是 Fjall + LanceDB 存算分层的物理实现层：
 [智能体活跃期]
   ↓
 Fjall（Arrow IPC 格式，微秒级读写）
-  ↓ Openraft RaftLog 复制
-[多节点强一致共识]
-  ↓
 [梦境整理循环]
   ↓ PyO3 向量化
 LanceDB + S3（Lance 格式，底层 Arrow 对齐）
