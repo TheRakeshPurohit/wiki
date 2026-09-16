@@ -253,6 +253,8 @@ M 问"有没有更好的方法让 AI 更了解我们的代码，不用每次都�
 
 存储选型、key 编码、检索实现见 [KV 存储引擎](kv-storage-engine.md)（属性图编码模式、delta 追加消除 read-modify-write、二级索引更新策略、WriteBatch 事务、向量冬眠/载入生命周期）。检索侧自建：arroy（HNSW）向量 + 手写 BM25 倒排 + RRF 融合，分词与打分全链路可控——向量与全文检索是 KV 路线需自建补齐的两模块，pg_search 黑盒 tokenizer 不可控正是 KV 路线的核心换取项。
 
+**存储承载按运行形态分流**（ADR-0007）：CLI/独立进程形态自持 Fjall 目录；Aura actor 形态（wasm 沙箱）不能自持文件系统——`VirtualStorage` 实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储。schema 语义（derive、Table/EdgeTable、WriteBatch 组帧）自持，走静态 OKM derive，不需要 okm-dynamic。
+
 ## skillforge 实现现状
 
 ### 当前方案（Phase 2.5）

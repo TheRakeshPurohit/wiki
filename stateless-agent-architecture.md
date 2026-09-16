@@ -292,7 +292,7 @@ memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pend
 
 框架适配之上是会话即数据的无状态模式——三步调用收缩为「取会话 → 执行 → 存会话」，压缩决策沉到 Krystallizer 内部（被动模式 Gravity 无感），见本文压缩双模式一节与 [Krystallizer](krystallizer.md)。
 
-**自带 CLI 驱动循环**：Gravity 提供本地 CLI 形态——进程内循环执行 turn（取会话 → 跑 → 存，下一 turn），这是本地/单机模式；同一 Gravity 函数在 Aura 中注册为 Actor 类型时，每条 turn 事件触发一趟执行，是分布式模式。同一执行函数，三种驱动：CLI for 循环（本地）、Aura Actor（分布式）、函数计算（serverless）——CLI 就是函数的 for 循环，Actor 就是函数的单次调用。
+**自带 CLI 驱动循环**：Gravity 提供本地 CLI 形态——进程内循环执行 turn（取会话 → 跑 → 存，下一 turn），这是本地/单机模式；同一 Gravity 函数在 Aura 中注册为 Actor 类型时，每条 turn 事件触发一趟执行，是分布式模式。同一执行函数，三种驱动：CLI for 循环（本地）、Aura Actor（分布式）、函数计算（serverless）——CLI 就是函数的 for 循环，Actor 就是函数的单次调用。发布形态上 Gravity 编译为 `.wasm` 产物运行时上传 Aura（`set(lang="wasm", bytes)`），不是编译进 aura 二进制——Aura 是平台不是应用框架，Agent 应用加功能靠上传新产物，不靠重打包引擎；存储经 `VirtualStorage` 帧上抛由 host 承载（Krystallizer ADR-0007 存储承载分流）。
 
 Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程语义，partition key = session_id），不同会话并行；turn 之间默认 scale-to-zero，`on_sleep`/`on_wake` 退化为存取两个动作——保留期驻留是此默认的细化：驻留窗口内同会话 turn 复用执行体，超时/显式释放才落入存取两个动作（见统一调用模型一节）。流式输出经高频 emit 事件转 SSE 推送——传输面由 Prism 的 WS 网关承载（Gravity 与 Prism 之间仍是场域事件，无直接连接）。
 
@@ -309,7 +309,7 @@ Probe 是操作的执行环境——**执行只提供运行时，不在 Krystall
 - **Aura 内嵌**：作为 Aura 执行基座（Wasmtime 沙箱谱系的重隔离端——Wasm 管不动真文件系统/真网络/系统包时，容器顶上），场域内调用触达。
 - **远程触手**：部署在用户自己的电脑或目标服务器上，就是那台机器的操作触手：部署在哪，就能操作哪。内网/NAT 下的机器没有入站可达性，唯一可行拓扑是 **outbound 长连接**：Probe 启动时主动向控制面发起连接并注册（我在线、我能做什么），此后保持连接，任务由控制面沿连接下推（WS 帧）。连接方向 outbound，数据方向下行推送，不开入站端口——Probe 所在网络的入站拓扑无关紧要。长轮询（反复 HTTP 询问）是此模式的弱化实现。
 
-**连接面是 Probe Actor 的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的 mailbox 语义：帧下行 = 向该 Probe 实例投递事件，帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、Actor return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准 Actor 调用。同一节点的任务串行由 Actor mailbox 语义免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
+**连接面是 Probe Actor 的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的事件投递语义：帧下行 = 向该 Probe 实例的事件队列写入（probe Actor 是自己命令队列的单例订阅者），帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、Actor return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准 Actor 调用。同一节点的任务串行由 per-subscription cursor 的串行消费免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
 
 **skill 分发：每次 tool call 实时解析，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 解析是普通读取，不是需要失效策略的缓存问题。分界：解析发生在 Gravity 侧（Krystallizer → Gravity，涌现回路的权重回写也在此），Probe 不感知 skill、不发起拉取、两次调用之间不持有任何东西——它收到的任务帧里是什么就执行什么。
 
