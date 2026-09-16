@@ -1455,9 +1455,9 @@ Application layer (locks, scheduling, configuration, sessions)
   Node1  Node2  Node3    (single-machine or cluster deployment)
 ```
 
-**Key insight**: Fjall is an in-process embedded engine — local reads involve zero network hops. In multi-node deployments, metadata consensus is handled by an independent consensus layer (see the [Consensus Protocol document](consensus-protocol-en.md)).
+**Key insight**: Fjall is an in-process embedded engine — local reads involve zero network hops. Metadata consistency needs no consensus layer: aura's ruling is a per-node meta instance (control-plane single-writer, see [Aura Architecture](aura-architecture-en.md)); consensus applies only to data-level strong-consistency replication via external off-the-shelf systems (see the [Consensus Protocol document](consensus-protocol-en.md)).
 
-> **Openraft example**: Fjall + Openraft integration is achieved via state-machine mounting — Raft commits log entries → the state machine `apply`s them into local Fjall. See [Aura Architecture §5.5](aura-architecture-en.md).
+> **Openraft example (historical analysis)**: Fjall + Openraft integration was analyzed as a candidate path for data-level strong-consistency replication — Raft commits log entries → the state machine `apply`s them into local Fjall. This path is explicitly not part of aura's default architecture (metadata single-writer without consensus; replication delegated to external TiKV-class systems).
 
 ### Distributed Scenarios: Concurrent Ordering and Shard Balancing
 
@@ -1697,7 +1697,7 @@ Fjall and SlateDB are both pure-Rust LSM-Tree KV engines (Apache-2.0) with simil
 
 **Capacity ceiling**: data cannot exceed the local high-performance disk. When you need unlimited storage, don't bolt cold-data offloading onto Fjall — use SlateDB directly.
 
-**Cluster deployment**: in multi-node scenarios, metadata consensus is handled by an independent consensus layer (see §Distributed KV chapter and the [Consensus Protocol document](consensus-protocol-en.md) it references). Fjall itself focuses on the local storage engine's responsibilities.
+**Cluster deployment**: in multi-node scenarios, metadata is per-node independent (control-plane single-writer, no consensus — aura's ruling; see §Distributed KV chapter and the [Consensus Protocol document](consensus-protocol-en.md) it references). Fjall itself focuses on the local storage engine's responsibilities.
 
 #### Path Two: SlateDB + S3
 

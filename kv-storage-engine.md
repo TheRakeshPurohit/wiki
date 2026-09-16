@@ -1454,9 +1454,9 @@ Business Coordination (locks, scheduling, election)
   节点1  节点2  节点3    （单机或集群部署）
 ```
 
-**关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。多节点部署时，元数据共识由独立的共识层处理（见 [共识协议文档](consensus-protocol.md)）。
+**关键洞察**：Fjall 是进程内嵌入式引擎——本地读取无网络跳数。元数据一致性不需要共识层：aura 的口径是每节点独立 meta 实例（控制平面单写，见 [Aura 架构](aura-architecture.md)）；共识仅在数据级强一致复制场景由外部现成方案承担（见 [共识协议文档](consensus-protocol.md)）。
 
-> **Openraft 示例**：Fjall + Openraft 的集成通过状态机挂载实现——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md)（Openraft 状态机挂载 Fjall 的宿主实现）。
+> **Openraft 示例（历史分析）**：Fjall + Openraft 的集成曾作为数据级强一致复制的候选路径分析——Raft 提交日志条目 → 状态机 `apply` 写入本地 Fjall。该路径已明确不在 aura 默认架构内（元数据单写无共识，数据复制交外部 TiKV 类方案）；分析保留于 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) 与 [共识协议文档](consensus-protocol.md)。
 
 ### 分布式场景：并发有序性与分片均衡
 
@@ -1696,7 +1696,7 @@ Fjall 和 SlateDB 都是纯 Rust LSM-Tree KV 引擎（Apache-2.0），底层数�
 
 **容量上限**：数据不能超过本地高性能磁盘。需要无限存储时，不要在 Fjall 上加冷数据卸载——直接用 SlateDB。
 
-**集群部署**：多节点场景下，元数据共识由独立的共识层处理（见 §分布式 KV 章节及其引用的 [共识协议文档](consensus-protocol.md)）。Fjall 本身专注本地存储引擎职责。
+**集群部署**：多节点场景下，元数据每节点独立（控制平面单写，无共识——aura 口径）；数据级强一致复制需求由外部现成方案承担（见 §分布式 KV 章节及其引用的 [共识协议文档](consensus-protocol.md)）。Fjall 本身专注本地存储引擎职责。
 
 #### 路径二：SlateDB + S3
 
