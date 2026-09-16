@@ -440,8 +440,9 @@ PostgreSQL 的 WAL 是事件日志，表是 reducer（对 WAL 的确定性重放
 
 本文档与以下架构分析形成完整的决策闭环：
 
-- **[KV 存储引擎](kv-storage-engine.md)**：Fjall + Openraft 双引擎模式中 Raft 的角色定位
+- **[KV 存储引擎](kv-storage-engine.md)**：Fjall/SlateDB 双引擎模式（元数据每节点独立，无共识）
 - **[序列化协议分析对比](serialization-protocol-comparison.md)**：Raft 控制流的编码选择（Protobuf vs Bincode）
-- **[Aura 架构](aura-architecture.md)**：Fjall + Raft 在完整架构中的位置
+- **[分布式协作拓扑](distributed-collaboration-topology.md)**：Raft 定位的拓扑推广——控制面/数据面分工、大节点联邦与柔性事务、CRDT 的主权分界
+- **[Aura 架构](aura-architecture.md)**：元数据单写（无共识）、数据面本地的完整架构位置
 - **[HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)**：对象存储上 AI 数据栈的两种路线对比
 - **[Redis 批判](redis-critique.md)**：Redis 为何被 KV 替代
