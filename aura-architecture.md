@@ -60,9 +60,9 @@ Aura 将这种融合标准化为一个可复用的引擎：
 |------|------------|----------------|
 | 服务编排 | 自建 Actor 系统 + 手写状态机 | 场域模型（emit/on/on_join/on_batch）+ `interface_schema()` 自动路由 |
 | 状态管理 | Redis / Memcached / 自建 HashMap | Fjall LSM-Tree（WAL 断电保护 + Scale-to-Zero） |
-| 跨节点协调 | 各服务自行实现 or 不实现 | Openraft 元数据共识（Actor 注册/路由/配置）；Actor 数据走 Fjall+落湖 或 SlateDB+S3 |
+| 跨节点协调 | 各服务自行实现 or 不实现 | 元数据每节点独立（meta okm 实例，控制平面单写，无共识）；Actor 数据走 Fjall+落湖 或 SlateDB+S3；联邦节点间经 well-known 协议认证 |
 | 多语言支持 | 各服务独立运行时（微服务模式） | 进程内嵌入（Steel/Python/Wasm），零序列化 |
-| 部署 | Docker + K8s + Helm + 服务网格 | 单二进制，`scp` 即部署，加 `--raft-nodes` 同步元数据即可多机组网 |
+| 部署 | Docker + K8s + Helm + 服务网格 | 单二进制，`scp` 即部署；多机组网走联邦（well-known 协议认证），无需共享元数据设施 |
 
 标准化的意义在于：开发者不再需要为每个项目重新设计"怎么把多个框架拼在一起"，而是直接使用一个经过验证的融合引擎，将精力集中在业务逻辑上。
 
@@ -134,11 +134,11 @@ Rust 原生实现的 Actor 引擎利用 Tokio MPSC 管道建立低开销的 Host
 |---------|------|-------------------|---------|---------|
 | **Steel (Lisp/Scheme)** | 脚本语言 | 字节码虚拟机 + 卫生宏 | 100% 无二义性，天然沙箱隔离（默认不带危险系统 I/O）| 高危策略防线、权限路由、复杂元编程 DSL |
 | **Python (PyO3 内嵌)** | 脚本语言 | CPython 解释器内嵌 (GIL 内存级捕获) | 零开销复用全球最庞大的 AI/Data 生态圈 | 遗留 AI 代码资产重组、Tokenizer 矩阵计算、Numpy/HuggingFace 调用 |
-| **Wasm (Wasmtime)** | 沙箱运行时 | Cranelift JIT 编译器 / 硬件沙箱 | 接近原生 CPU 性能，硬件级隔离 | 第三方不信任代码托管。wasm-gc + WASI 成熟后可扩展为统一运行时（详见 [Wasm 统一运行时](wasm-unified-runtime.md)） |
+| **Wasm (Wasmtime)** | 沙箱运行时 | Cranelift JIT 编译器 / 硬件沙箱 | 接近原生 CPU 性能，硬件级隔离 | 第三方不信任代码托管；存储型 Rust 服务（k10r/gravity 一类，存储经帧上抛由 host 承载）。wasm-gc + WASI 成熟后可扩展为统一运行时（详见 [Wasm 统一运行时](wasm-unified-runtime.md)） |
 | **Rust 主外壳** | 宿主 | Tokio 异步协程 + MPSC 状态管道 | 低开销启动，27MB 内存，Scale to Zero 核心设计 | 分布式网关、系统 I/O、事件派发 |
-| **持久化** | 存储层 | Fjall/SlateDB + Openraft 元数据共识 | LSM-Tree + Raft 共识 | 无外部缓存中间层，单次事务原子固化 |
+| **持久化** | 存储层 | Fjall/SlateDB（data/meta 两实例分离，元数据单写无共识） | LSM-Tree + Raft 共识 | 无外部缓存中间层，单次事务原子固化 |
 
-**关键澄清**：脚本语言（Steel/Python）是 Actor 的业务逻辑载体，每个 Actor 选一种。Wasm 是隔离运行时，用于托管第三方不信任代码——编写语言通常是 Rust，但 host 不关心，只消费 `.wasm` 二进制。语言用途没有硬性规定——Steel 可以写业务逻辑，Python 可以写策略，只要开发者认为合适即可。
+**关键澄清**：脚本语言（Steel/Python）是 Actor 的业务逻辑载体，每个 Actor 选一种。Wasm 是隔离运行时——初版定位是「托管第三方不信任代码」（编写语言通常是 Rust，但 host 不关心，只消费 `.wasm` 二进制）；随着 k10r、gravity 一类 Rust 服务以 wasm Actor 形态进场域，定位扩展为**重隔离的服务承载，且是 Rust 服务的唯一发布形态**：服务编译为 `.wasm` 运行时上传（`set(lang="wasm", bytes)`），不编译进 host——编译进 host 会让每个应用 fork 一份 aura（加服务就要重打包），平台退化成框架。引擎因此**不提供进程内 Rust Actor**——框架自身机制（evictor 类）就是 realm 内的普通逻辑，包装成 Actor 绕一圈没有意义；Rust 代码成为 Actor 只有一条路：编译为 wasm 上传，不是 dylib、不是编译期、不是闭包。存储也不进沙箱——服务自带的 OKM schema 原样编译进 wasm，`VirtualStorage` 的实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储（Krystallizer ADR-0007 存储承载分流；静态 derive，不需要 okm-dynamic）。语言用途没有硬性规定——Steel 可以写业务逻辑，Python 可以写策略，只要开发者认为合适即可。
 
 **持久化选型补充**：Actor 消息有强**时间局部性**——热点集中在最近写入的状态，SlateDB 刚写入即落在 memtable / 缓存，冷读 S3 只在偶发点查触发，可接受。因此 **SlateDB 可取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）；仅当热路径对进程内 ns-μs 有硬要求且读取无时间局部性时才退回 Fjall。若需强一致分布式复制，不自建——直接用 FoundationDB / TiKV。详见 [KV 存储引擎](kv-storage-engine.md) §两条分布路径/强一致分布式 与 [统一数据层](unified-data-layer.md)。
 
@@ -417,11 +417,11 @@ def handle(ctx, user_message=None):
 
 **CBOR 改进方向**：当前 CBOR 的键名（key name）在高频小消息场景有开销——每个字段都带完整字符串键名。改进方向：消除键名开销（键名索引化或列族式存储），动态列式布局（类似 LSM-Tree 的列族设计），但不能拖累查询性能。这是工程优化，不是架构变更——CBOR 作为跨语言数据交换格式的选择不变，只是编码效率提升。注意：这不是走向"schema 约束"的方向（Rust 结构体状态已经是类型安全的），而是保持动态性的同时压缩编码体积。
 
-- **状态落盘的原子化**：多语言在一轮交互中通过 `ctx.state` 操作逐字段写 WAL 落盘。Fjall 的 LSM-Tree 天然支持高频小写入。Actor 状态写入本地 Fjall（不走 Raft），全局元数据（Actor 注册、用户状态、配置）通过 Openraft 强一致同步到所有节点。
+- **状态落盘的原子化**：多语言在一轮交互中通过 `ctx.state` 操作逐字段写 WAL 落盘。Fjall 的 LSM-Tree 天然支持高频小写入。Actor 状态写入本地 Fjall（不走网络路径）；元数据（Actor 注册、路由、本节点配置）写 meta okm 实例，控制平面单写 + 节点缓存——**用户数据（含登录态）绑定所属节点，不做全局同步**：用户登录其它节点，该节点没有它的历史数据，跨节点只按 well-known 协议认证身份。
 
 **网线里没有多轮的 RTT 消耗，没有外部缓存的易失性风险，没有多库同步的分布式 Bug。**
 
-用 Rust 搭了外骨骼，用 Lisp 锁定了边界，用 Python 接入了生态，用 Wasm 隔离了黑盒，持久化层用 Fjall/SlateDB + Openraft 元数据共识。
+用 Rust 搭了外骨骼，用 Lisp 锁定了边界，用 Python 接入了生态，用 Wasm 隔离了黑盒，持久化层用 Fjall/SlateDB（data/meta 两实例分离）。
 
 
 ## 3. 存储架构
@@ -429,8 +429,8 @@ def handle(ctx, user_message=None):
 存储层通过 trait 实现引擎可插拔——存储引擎（KV 读写）与分发层（多节点协调）正交组合。要点：
 
 - **双轨实现**：`FjallEngine`（本地 NVMe，同步 I/O 经 spawn_blocking 包装，私有部署亚毫秒延迟）与 `SlateEngine`（SlateDB → S3，天生 async，云原生无状态计算）
-- **双 API 分离**：`ctx.state`（Actor 状态，KV，不走 Raft）与 `ctx.metadata`（注册表/分片映射/计数器等全局元数据，强一致）
-- **单机起手 ≠ 分布式宿命**：Fjall 单机起步，数据不复制；SlateDB+S3 是云原生态；元数据共识（Openraft）只在多写入点真实出现时引入
+- **双 API 分离**：`ctx.state`（Actor 状态，KV，不走网络路径）与 `ctx.metadata`（注册表/分片映射/本节点配置等受控元数据，meta okm 实例单写）
+- **单机起手 ≠ 分布式宿命**：Fjall 单机起步，数据不复制；SlateDB+S3 是云原生态；元数据不引入共识——每节点独立，控制平面单写；跨节点按联邦形态（well-known 协议认证）演进
 - Actor 状态有强时间局部性（热点集中在最近写入），SlateDB memtable 命中即可接受冷读 S3，可取代「Fjall + Lakehouse」两件套
 
 完整设计细节（trait 签名、AuraCollection 绑定容器、分发层、配置评估、多模态路由）见 **aura 仓库 [`docs/design/storage.md`](https://github.com/orbsh/aura/blob/main/docs/design/storage.md)**。
@@ -446,7 +446,7 @@ def handle(ctx, user_message=None):
 |------|-----------|------|
 | **Actor 状态持久化（Fjall）** | CBOR | 动态结构化数据，自描述，跨语言（Steel/Python/Rust）编解码 |
 | **Actor 输入/输出载荷** | `ciborium::Value`（进程内）/ CBOR bytes（跨边界） | 进程内为内存值树，零序列化；持久化/复制/外部投递时序列化为 CBOR bytes |
-| **Raft 元数据（LogId 等）** | Postcard | Openraft 内部用，与 Raft 控制流统一格式 |
+| **Raft 元数据（LogId 等）** | Postcard | 仅外部强一致方案（TiKV 等）用；本架构默认无共识层 |
 | **Raft 控制流与 RPC** | Postcard | 纯 Rust 声明式、Postcard-Schema 宏支持 Schema 演进 |
 | **分析查询路径** | Arrow IPC | 列式对齐，Fjall 读出后 Polars 零拷贝转铸 DataFrame |
 | **KV value 只读点查（候选）** | rkyv | 纯 Rust mmap 零拷贝，O(1) 点查；仅进程内热路径，跨语言/出口仍走 CBOR/Arrow（见序列化文档方案 B3 落点边界） |
@@ -464,11 +464,11 @@ def handle(ctx, user_message=None):
 场域（Event Realm）是引擎内部的事件空间：Actor 不直接寻址，通过 `emit(name, data)` / `on(name, fn)` 交互——发射者不关心谁处理，处理者不关心谁发射。事件名就是引用，partition key 就是实例定位。要点：
 
 - **ctx 边界**（ADR-0011）：ctx 只收实例绑定 + Host 管控的能力（state / metadata / invoke）；emit/on、契约、钩子留在场域层/静态契约
-- **interface_schema()**：声明 receives（事件名 → key 字段 → schema）、emits 白名单（未声明的拒绝发射）、returns（声明了才能被 `ctx.invoke()` 同步调用）
+- **interface_schema()**：由 `@on` 装饰器推导（receives：事件名 → key 字段；通配符入 wildcard_receives）——emits 不声明、不收集、不校验（ADR-0012）：接收者集合是运行时事实，无订阅者的 emit 落入 dead-event ring，那是可观测的审计面
 - **实例化与分片**：同一 partition key 串行（状态一致），异 key 并行；跨节点经一致性哈希放置——路由不变性保证请求跟着数据走
 - **跨 Partition 查询**：投影 Actor（持续聚合，推荐）/ Arrow HTAP（ad-hoc 列式扫描）
 - **统一调用模型**：`ctx.invoke()` 是唯一受控调用面；冷调用（触达人类/外部系统）wait 不进入 park，挂起写事件流，`resolve_call` 重入
-- **投递语义**：进程内事件因果有序，元数据事件序由共识日志排定
+- **投递语义**：进程内事件因果有序；无共识层——跨节点按联邦形态，域间消息显式寻址（不做全局事件排序）
 
 完整设计细节（路由表结构、四种触发模式 on_join/on_batch/on_debounce、Collector、通配符匹配、投递代码、宿主实现、MQ 分解）见 **aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md)**。
 
@@ -485,21 +485,22 @@ Rivet Actors 提供了优秀的 Actor 开发体验：TypeScript SDK、自动 HTT
 | **语言** | TypeScript/JavaScript（V8 隔离） | Rust 核心 + Steel Lisp/Python/Wasm 嵌入（进程内，无 IPC） |
 | **系统启动** | 数百毫秒（Node.js 进程 + V8 初始化） | 毫秒级（Tokio 运行时 + Fjall 打开） |
 | **Actor 唤醒** | 几毫秒（V8 虚拟机激活） | 微秒级（Steel 字节码 VM 瞬时创建；Python PyO3 ~1ms） |
-| **状态存储** | SQLite（同机共生，但单机瓶颈） | Fjall LSM-Tree（嵌入式；跨节点元数据由 Openraft 协调，数据落湖/S3） |
+| **状态存储** | SQLite（同机共生，但单机瓶颈） | Fjall LSM-Tree（嵌入式；元数据每节点独立单写，数据落湖/S3） |
 | **类型安全** | TypeScript（运行时类型，编译期弱） | Rust 编译期强类型 + Steel Lisp 的 S-表达式零二义性 |
 | **多语言** | 仅 JS/TS | Rust/Steel/Python/Wasm 四语言进程内混合 |
 | **状态持久化** | SQLite 文件 | Fjall KV + CBOR 序列化 |
 
 ### 6.2 Actor 定义与生命周期
 
-Actor 通过 `set(lang, script)` 提交实现（详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §Actor 定义接口）。脚本内导出 `interface_schema()` 声明事件契约，定义单一入口函数（事件名映射为参数）。
+Actor 通过 `set(lang, script)` 提交实现（详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §Actor 定义接口）。Actor 是**多入口**的：每个 handler 用 `@on(event, key=...)` 装饰器声明监听的事件（python 装饰器 / steel `on` 函数 / wasm 导出约定），事件名即 handler 寻址名；`interface_schema` 由装饰器推导（receives 不再手工声明；emits 不声明不收集，ADR-0012），声明了 key 的事件按 `(event, partition)` 队列投递，无 key 按 event 单队列——事件不属于任何 Actor，一个事件队列可有多个订阅者 Actor（一对多是结构性的）。上传时 Host 自省一次并把元数据持久化到 meta store；执行路径永不调用 `interface_schema`。
 
 生命周期：
 
-1. **唤醒（on_wake）**：有事件到达时，Host 从 Fjall 恢复 Actor 状态到内存
-2. **注册**：调用 `interface_schema()` 构建路由表，绑定入口函数
-3. **处理**：进入事件循环，收到事件 → 路由到入口函数对应参数 → 入口函数内可 `emit()`，状态立即持久化
-4. **休眠（on_sleep）**：空闲后状态落盘到 Fjall，内存归零（Scale-to-Zero）
+1. **上传（set）**：独立生命周期，可以永远不执行——Host 自省 `interface_schema()`（或从 `@on` 装饰器推导）一次，元数据（receives/lifecycle）与脚本一并持久化到 meta store，receives 派生投递路由
+2. **唤醒（on_wake）**：有事件到达时，Host 从 Fjall 恢复 Actor 状态到内存（脚本从 meta 实例读取最新版本）
+3. **处理**：按事件名寻址 handler 执行；handler 内可 `emit()`，状态立即持久化；永不调用 `interface_schema`
+4. **休眠（on_sleep）**：空闲后状态落盘到 Fjall，内存归零（Scale-to-Zero；per-type idle_ttl 决定驻留窗口）
+5. **版本变更**：新 `set` 重新自省一次、更新持久化元数据与路由；此前旧元数据治理
 
 定时任务通过声明式注解，不需要外部 CronJob：
 
@@ -517,7 +518,7 @@ def daily_sync(ctx):
 
 ### 6.3 事件发现：interface_schema() 约定
 
-脚本导出 `interface_schema()`，返回 receives/emits 列表。Host 启动时调用一次，构建事件路由表。详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §interface_schema。
+脚本以 `@on` 装饰器声明接收的事件；Host 上传时自省一次（或从装饰器推导）构建事件路由表，元数据持久化到 meta store，执行路径永不自省。详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §interface_schema。
 
 **热重载**：脚本修改 → 重新加载 → 重新 `interface_schema()` → 路由表更新。无需重编译 Rust host。
 
@@ -593,8 +594,8 @@ $ aura build --release
 $ scp target/release/order_service user@server:/opt/aura/
 $ ssh user@server "aura serve order_service --port 8080"
 
-# 多机部署——加一行 Openraft 配置即可组网（--raft-nodes 同步元数据，数据落湖/S3）
-$ aura serve order_service --raft-nodes "node1:9004,node2:9004,node3:9004"
+# 多机部署——联邦形态：各节点独立部署，well-known 协议认证互认（数据不全局同步，跟随所属节点）
+$ aura serve order_service --config /etc/aura/aura.kdl
 ```
 
 **与 K8S 部署的对比**：
@@ -604,7 +605,7 @@ $ aura serve order_service --raft-nodes "node1:9004,node2:9004,node3:9004"
 | 构建 | Dockerfile → docker build → push registry | `aura build --release` |
 | 配置 | Deployment YAML + Service YAML + Ingress YAML | `aura serve --port 8080` |
 | 状态存储 | PVC + StorageClass + PV | Fjall 内嵌（自动） |
-| 多机元数据同步 | StatefulSet + etcd + headless Service | `--raft-nodes` 一行配置（同步元数据） |
+| 多机元数据同步 | StatefulSet + etcd + headless Service | 无需同步——元数据每节点独立（控制平面单写），联邦间 well-known 协议认证 |
 | 扩缩容 | HPA + Metrics Server + CPU/内存阈值 | Actor 自动 Scale-to-Zero |
 | 证书 | cert-manager + ClusterIssuer + Certificate CRD | 内置 Let's Encrypt（可选） |
 
@@ -620,7 +621,7 @@ Rivet 的 Actor 逻辑只能用 JS。Aura 的每个 Actor 可自由选择脚本�
 Rivet 的 Actor 休眠依赖 V8 堆快照，唤醒时需要反序列化整个堆。Aura 的 Actor 休眠是将 Rust 结构体通过 CBOR 序列化写入 Fjall，唤醒时从磁盘直接反序列化到内存——不依赖 V8 堆格式，不受 GC 暂停影响。
 
 **4. 分布式状态复制**
-Rivet 的状态是单机 SQLite，多副本需要外部同步。Aura 通过 Openraft 实现元数据强一致性同步（Actor 注册、用户状态、配置），Actor 状态走 SlateDB+S3 或本地 Fjall，无需外部组件。
+Rivet 的状态是单机 SQLite，多副本需要外部同步。Aura 的元数据每节点独立（控制平面单写，无共识），Actor 状态走 SlateDB+S3 或本地 Fjall，无需外部组件；联邦节点间 well-known 协议认证，数据跟随所属节点。
 
 ### 6.8 DX 设计原则总结
 
@@ -628,7 +629,7 @@ Rivet 的状态是单机 SQLite，多副本需要外部同步。Aura 通过 Open
 2. **状态即代码**：Actor 状态是 CBOR Value 树（`ctx.state`），通过 `ctx.state` 操作立即写 WAL 落盘。Rust Actor 享有编译期类型安全，脚本 Actor 享有 JSON Schema 校验
 3. **声明式生命周期**：`on_wake`/`on_sleep`/`cron` 注解声明 Actor 行为，不需要外部调度器
 4. **本地即生产**：本地开发用 Fjall 临时目录，生产用 Fjall 持久目录，行为 100% 一致——没有"本地能跑线上炸了"的问题
-5. **渐进式复杂度**：单机 → 多机组网只需加一行 `--raft-nodes`（同步元数据；数据侧本地落湖或 SlateDB+S3），不需要重写代码或引入新组件
+5. **渐进式复杂度**：单机 → 多机组网走联邦形态（各节点独立 + well-known 协议认证；数据侧本地落湖或 SlateDB+S3），不需要重写代码或引入新组件
 
 ### 6.9 auractl：CLI 管理工具
 
@@ -699,7 +700,7 @@ auractl fjall rollback cart_actor --version 2
 | **语言开销与大小** | 厚重（容器 Pod 级）| 中等（V8 进程隔离）| 中等（依赖的多运行时环境较庞大）| 极轻（单二进制文件，单会话 ~27MB 内存）|
 | **语言生态友好度** | 模型无关，全语系支持 | 偏向 JavaScript/TypeScript | 极度偏向 Python | 移除 JS 污染，对 Rust/Lisp 原生极佳 |
 | **冷启动 / 恢复延迟** | ~200 毫秒 (Pod 内存快照解冻) | 几毫秒级 (V8 虚拟机瞬时激活) | 数十毫秒 (FaaS 工作进程调度) | 启动为 Tokio 运行时初始化（毫秒级）；Actor 唤醒微秒级 (嵌入式 VM 瞬时创建) |
-| **状态持有与防失忆** | 事件日志回放 (WAL / Replay) | 计算与 SQLite 存储同机共生 | 分布式异步工作队列（偏向无状态短时任务）| Fjall/SlateDB 嵌入式存储 + Openraft 元数据共识 |
+| **状态持有与防失忆** | 事件日志回放 (WAL / Replay) | 计算与 SQLite 存储同机共生 | 分布式异步工作队列（偏向无状态短时任务）| Fjall/SlateDB 嵌入式存储（元数据每节点独立单写，无共识） |
 | **空格敏感/边界歧义** | 视容器内运行的特定语言而定 | 视 JS/TS 闭包习惯而定 | 存在 Python 缩进与类型隐式转化断层 | 零二义性（S-表达式小括号确定性边界）|
 
 > Rivet 的 DX 层面详细对比见 [§6.1](#61-rivet-actors-的-dx-基线与-aura-的改进点)。
@@ -735,11 +736,11 @@ auractl fjall rollback cart_actor --version 2
 
 正如在常规开发中，我们在主进程里手写一个 `Mutex<HashMap>` 或者拉起一个 Tokio 状态通道作为执行期的缓存和业务状态机，这不妨碍我们在需要持久化的时候，用一条单次事务连接（Single-Trip）把数据顺手写入 PostgreSQL、或者归档进 S3 的 LanceDB 里。
 
-如果顺着这层"起手式不等于终极数据宿命"的最高务实哲学，来重新审视"任何项目直接以 Fjall + Openraft 起手"的合理性，核心的技术分水岭就不再是"能不能用别的数据引擎"，而是你从第一天开始，往你的二进制文件里注入的**"架构心智负荷与锁定代价"**有多重。
+如果顺着这层"起手式不等于终极数据宿命"的最高务实哲学，来重新审视"任何项目直接以 Fjall 起手"的合理性，核心的技术分水岭就不再是"能不能用别的数据引擎"，而是你从第一天开始，往你的二进制文件里注入的**"架构心智负荷与锁定代价"**有多重。
 
 ### 8.2 三种起手模式对比表
 
-| 维度 | Mutex<HashMap> | Openraft 起手 | **Tokio Actor + Fjall** ✨ |
+| 维度 | Mutex<HashMap> | 外部共识起手 | **Tokio Actor + Fjall** ✨ |
 |------|---------------|--------------|---------------------------|
 | **编码摩擦** | 极低 | 极高（状态机抽象） | **低**（简单 KV 接口） |
 | **断电保护** | ❌ 无 | ✅ WAL + RaftLog | **✅ WAL** |
@@ -747,13 +748,13 @@ auractl fjall rollback cart_actor --version 2
 | **持久化** | ❌ 无（重启后状态丢失） | ✅（元数据 Raft + 数据 Fjall/S3） | **✅ Fjall 磁盘** |
 | **未来扩展性** | ✅ 无限 | ⚠️ 元数据绑 Raft（数据仍可 S3/落湖） | **✅ 无限** |
 | **心智负荷** | 极低 | 中（共识依赖） | **低** |
-| **推荐场景** | 原型验证 | 确定需要多机元数据协调 | **通用起手式** ✨ |
+| **推荐场景** | 原型验证 | 确定需要数据级强一致复制（直接用 TiKV 等） | **通用起手式** ✨ |
 
 **模式一：Mutex<HashMap> 起手（零依赖体验）**——项目刚敲下第一行代码时，状态就是 Rust 原生类型，不需要写任何序列化宏。致命缺陷：无断电保护、无 Scale-to-Zero、无持久化。
 
-**模式二：Openraft 起手（元数据协调枷锁）**——Openraft 只同步元数据（Actor 注册/路由/配置），不复制 Actor 数据、也不要求每个业务动作都经 `RaftCommand` 广播；但引入它仍是为跨节点协调的共识依赖，会把数据落湖/S3 之外的协调逻辑绑进 Raft。适合确定要多机元数据协调的场景；业务边界未定型时可不急于引入。
+**模式二：外部共识起手（元数据协调枷锁）**——引入共识（Openraft 或 etcd）做跨节点协调，即使用途收窄到元数据（Actor 注册/路由/配置）、不复制 Actor 数据，仍为协调逻辑绑进 Raft 的共识依赖。本架构已明确**不引入共识**：元数据每节点独立（控制平面单写），多机走联邦形态。共识只在「数据级强一致复制」真实出现时由外部现成方案（TiKV 等）承担。
 
-**模式三：Tokio Actor + 单机 Fjall 起手（工程学的最高折中）✨**——用 Fjall 替代 HashMap 几乎没有增加编码摩擦，却带来了：✅ 本地 bare-metal 级别的断电崩溃物理保护（WAL）、✅ 闲时内存自动归零（Scale-to-Zero）、✅ 读写速度快到物理硬件的极限、✅ 布隆过滤器微秒级定位。如果项目做大了需要多机灾备，由于已经是 Actor + Fjall 架构，随时可以轻松地把 Openraft 的元数据协调作为一层"轻量保护膜"盖在 Fjall 之上（数据仍本地 + 落湖/S3）。**起手式不锁定终极宿命。**
+**模式三：Tokio Actor + 单机 Fjall 起手（工程学的最高折中）✨**——用 Fjall 替代 HashMap 几乎没有增加编码摩擦，却带来了：✅ 本地 bare-metal 级别的断电崩溃物理保护（WAL）、✅ 闲时内存自动归零（Scale-to-Zero）、✅ 读写速度快到物理硬件的极限、✅ 布隆过滤器微秒级定位。如果项目做大了需要多机形态，由于已经是 Actor + Fjall 架构，直接演进到联邦模式（各节点独立 + well-known 协议认证，数据仍本地 + 落湖/S3），无需引入共识。**起手式不锁定终极宿命。**
 
 ### 8.3 起手式代码示例
 
@@ -822,35 +823,35 @@ impl ActorState {
 }
 ```
 
-#### 未来演进：Openraft 只做元数据，数据不复制
+#### 元数据演进：每节点独立，联邦认证
 
 ```rust
-// 多机时：Openraft 只同步元数据（Actor 注册/路由），数据直写本地 Fjall（后落湖），不经 Raft 写路径
-use openraft::Raft;
+// 多机形态：元数据每节点独立（meta okm 实例，控制平面单写），数据直写本地 Fjall（后落湖）
+// 跨节点不做共识——联邦节点间经 well-known 协议认证身份，用户数据跟随所属节点
 
 struct DistributedActorState {
-    registry: Raft<FluxarrowTypeConfig>, // 元数据：Actor => 所在节点
-    actor: Arc<ActorState>,              // 复用上面的单机 Fjall 实现
-    store: Option<ObjectStoreClient>,    // 数据兜底：落湖 / SlateDB+S3
+    meta: Arc<MetaStore>,               // 元数据：Actor 注册/路由（本节点实例）
+    actor: Arc<ActorState>,             // 复用上面的单机 Fjall 实现
+    store: Option<ObjectStoreClient>,   // 数据兜底：落湖 / SlateDB+S3
 }
 
 impl DistributedActorState {
     async fn upsert(&self, key: &str, value: Vec<u8>) -> anyhow::Result<()> {
-        // 数据直写本地 Fjall；落湖 / S3 异步兜底——不经过 Raft 日志
+        // 数据直写本地 Fjall；落湖 / S3 异步兜底——无共识写路径
         self.actor.upsert(key, value).await?;
         Ok(())
     }
 
     async fn locate(&self, actor: &str) -> anyhow::Result<NodeId> {
-        // 仅元数据（Actor 注册/路由）走 Raft
-        Ok(self.registry.metrics().await?.current_leader)
+        // 元数据本节点读（控制平面单写 + 节点缓存）
+        self.meta.locate(actor).await
     }
 }
 ```
 
 ### 8.4 技术现实主义的胜利
 
-状态管理框架只是工具，它不是禁锢业务宿命的牢笼。在项目的第一天，直接引入 Openraft 这样厚重的分布式网络共识逻辑，往往会因为过度设计（Over-engineering）而把早期的业务演进速度活生生拖垮。
+状态管理框架只是工具，它不是禁锢业务宿命的牢笼。在项目的第一天，直接引入分布式网络共识这样厚重的逻辑，往往会因为过度设计（Over-engineering）而把早期的业务演进速度活生生拖垮。
 
 但如果采用**"最轻量的 Tokio Actor 消息管道 + 单机内嵌 Fjall"**作为新项目的通用起手核心——这既提供了启动速度、内存安全和冬眠效率，又把面向所有外部数据库（Postgres, S3, LanceDB）进行后期大一统演进的大门敞开着。单机运行完全没有问题，它是这套架构走向工业化最稳健、最清醒、低开销的第一步。
 
@@ -859,7 +860,7 @@ impl DistributedActorState {
 
 ## 9. 工业适用性诊断与通用场景
 
-这套由 Fjall（本地存储）+ Openraft（元数据共识）+ 多模态嵌入式内核（Steel/PyO3/Wasm 用户自主驱动沙箱）铸造的纯 Rust 存算一体架构，在工业落地中具有极强的普适性。它不仅兼容网关、FaaS、任务平台和游戏场景，甚至能在这几个场景里引发架构颠覆。
+这套由 Fjall（本地存储）+ 独立元数据实例（单写无共识）+ 多模态嵌入式内核（Steel/PyO3/Wasm 用户自主驱动沙箱）铸造的纯 Rust 存算一体架构，在工业落地中具有极强的普适性。它不仅兼容网关、FaaS、任务平台和游戏场景，甚至能在这几个场景里引发架构颠覆。
 
 ### 9.1 四大核心场景的工程适用性诊断
 
@@ -869,7 +870,7 @@ impl DistributedActorState {
 
 **在本架构下**：每个 API 路由策略或每个租户都是集群里的一个分布式 Actor。网关收到请求后，不需要经过任何网络跳转，直接在进程内存里、通过 Fjall 快速捞出该路由的最新规则，并由用户动态指定的 Steel Lisp 沙箱一秒执行。
 
-**关键点**：由于 Openraft 保证了配置的全网强一致性复制，你修改网关规则后，全球所有分布式边缘节点会秒级同步，且没有外部缓存单线程死锁或集群脑裂的风险。
+**关键点**：由于元数据每节点独立（控制平面单写 + 节点缓存），你修改本节点网关规则后立即生效，且没有外部缓存单线程死锁或集群脑裂的风险。
 
 #### FaaS 平台场景：互补（打通"有状态 Serverless"的死穴）
 
@@ -893,25 +894,25 @@ Rivet Actors 为什么要用这一套设计？因为他们原本就是做多人�
 
 **在本架构下**：你用纯 Rust 实现了比 Rivet 更纯粹、更干净的原生游戏运行时。
 
-**关键点**：一个游戏房间就是一个 Actor，玩家的所有走位、血量、装备变动（State Mutate），直接高频（每秒 60 次）缓存在该 Actor 的内存中，通过 Openraft 实现多副本冗余。游戏结束时，Fjall 异步执行一次大块物理刷盘。由于彻底踢出了 JS/V8 的垃圾回收（GC）开销，主程序可以跑到上千帧的平滑度，单机挂载数万玩家房间系统也绝不卡顿。
+**关键点**：一个游戏房间就是一个 Actor，玩家的所有走位、血量、装备变动（State Mutate），直接高频（每秒 60 次）缓存在该 Actor 的内存中，随写随落 Fjall WAL（同房间状态不跨节点复制，房间归属固定节点——强一致复制的诉求交给外部 TiKV 类方案）。游戏结束时，Fjall 异步执行一次大块物理刷盘。由于彻底踢出了 JS/V8 的垃圾回收（GC）开销，主程序可以跑到上千帧的平滑度，单机挂载数万玩家房间系统也绝不卡顿。
 
 ### 9.2 三个全新硬核应用场景
 
-除了上述四个经典领域，这套 Fjall + Openraft + 用户主导多语言沙箱的全栈架构，还能在以下三个涉及通用、前沿开发的环境中展现出适用性：
+除了上述四个经典领域，这套 Fjall + 独立元数据 + 用户主导多语言沙箱的全栈架构，还能在以下三个涉及通用、前沿开发的环境中展现出适用性：
 
 #### 分布式工业物联网与边缘计算（Edge AI & IoT Gateways）
 
 在风力发电厂、车联网、无人机编排或自动化工厂机房中，硬件设备往往处于"弱网、低功耗、本地磁盘寸土寸金"的恶劣物理环境里。你不可能在边缘机房里塞进庞大的 K8s 集群或者 PostgreSQL 数据库。
 
-**怎么玩**：把这个单文件二进制程序直接扔在边缘网关（如树莓派或工业单板机）上。由于 Fjall 的 LSM 结构极度抗断电损耗，Openraft 可以在多台网关之间自愈组网。采集到高频传感器数据时，PyO3 Python 直接在本地内存中运行 Numpy 异常检测；发现危机时立刻切换到 Steel Lisp 运行确定性的关断策略脚本。微秒级响应，完全不需要连向云端。
+**怎么玩**：把这个单文件二进制程序直接扔在边缘网关（如树莓派或工业单板机）上。由于 Fjall 的 LSM 结构极度抗断电损耗，边缘节点各自独立自治（元数据本地单写，联邦间 well-known 协议认证）。采集到高频传感器数据时，PyO3 Python 直接在本地内存中运行 Numpy 异常检测；发现危机时立刻切换到 Steel Lisp 运行确定性的关断策略脚本。微秒级响应，完全不需要连向云端。
 
 #### 现代 Web 3.0 / 联盟链与可信去中心化账本（Consensus Ledgers）
 
-传统的区块链底层（如以太坊节点）在执行智能合约时，架构笨重。Openraft 本身就是分布式共识的代名词，通过将用户的转账逻辑、合约条件写成 Steel Lisp 或 Wasm 字节码，全球 5 台或 11 台受信服务器运行这套二进制程序，用户提交的脚本在 Openraft 达成全网多数派共识后，在本地 Fjall 物理安全落盘。用不到 2000 行的 Rust 核心，实现了一个响应速度突破上万 TPS、且具备跨国多机房灾备能力的超高性能专属去中心化状态账本。
+传统的区块链底层（如以太坊节点）在执行智能合约时，架构笨重。需要全网共识的账本场景，共识层直接采用成熟方案（把多数派共识交给专门的区块链/账本引擎），合约逻辑写成 Steel Lisp 或 Wasm 字节码在本架构执行；用不到 2000 行的 Rust 核心，实现了一个响应速度突破上万 TPS、且具备跨国多机房灾备能力的超高性能专属去中心化状态账本。
 
 #### 企业私有化"无头"AI 程序员 Agent 矩阵（Headless Coding Matrix）
 
-当公司需要部署 1000 个无处不在、24/7 在后台自动审查 Git 代码、跑自动测试并修改 Bug 的"AI 程序员"时，每个 AI 程序员就是一个常驻或冬眠的分布式 Actor。AI 需要去外网爬取 API 文档时，调用 Python（PyO3）异步网络库；当它要结合本地文件跑 PyTorch 权重或者语义分析时，调用 PyO3 Python；当它要执行危险的本地编译时，直接锁死在 Wasm 沙箱里防止它误删真实硬盘。所有的思考逻辑、进度、避坑备忘录，完全不需要依赖外部队列，被 Openraft 多数派共识后持久化在本地 Fjall 数据库中。
+当公司需要部署 1000 个无处不在、24/7 在后台自动审查 Git 代码、跑自动测试并修改 Bug 的"AI 程序员"时，每个 AI 程序员就是一个常驻或冬眠的分布式 Actor。AI 需要去外网爬取 API 文档时，调用 Python（PyO3）异步网络库；当它要结合本地文件跑 PyTorch 权重或者语义分析时，调用 PyO3 Python；当它要执行危险的本地编译时，直接锁死在 Wasm 沙箱里防止它误删真实硬盘。所有的思考逻辑、进度、避坑备忘录，完全不需要依赖外部队列，直接持久化在本地 Fjall 数据库中。
 
 ### 9.3 架构师的核心优势
 
@@ -933,7 +934,7 @@ Aura 的核心场景是高并发有状态流（游戏、IM、秒杀、AI 智能�
 | 业务数据类型 | 传统做法 | Aura 映射 |
 |---|---|---|
 | 高频状态事务（购物车、库存、Session） | Redis | 工作记忆（SlateDB+S3）：Actor 进程内 KV，S3 自动复制，0 网络 RTT |
-| 流水事件（订单历史、审计日志） | 日志表或 Kafka | Openraft WAL：共识达成即安全，确定性时序 |
+| 流水事件（订单历史、审计日志） | 日志表或 Kafka | Fjall WAL 本地落盘（存算分离下由 S3 承担长期安全） |
 | 海量历史只读分析（报表、全文检索） | 读写分离、Elasticsearch | 长期记忆（LanceDB + S3）：窗口结单转列式 Lance，S3 托管 |
 
 ### 10.2 适合的子场景
