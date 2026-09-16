@@ -464,10 +464,11 @@ def handle(ctx, user_message=None):
 
 - **ctx 边界**（ADR-0011）：ctx 只收实例绑定 + Host 管控的能力（state / metadata / invoke）；emit/on、契约、钩子留在场域层/静态契约
 - **interface_schema()**：由 `@on` 装饰器推导（receives：事件名 → key 字段；通配符入 wildcard_receives）——emits 不声明、不收集、不校验（ADR-0012）：接收者集合是运行时事实，无订阅者的 emit 落入 dead-event ring，那是可观测的审计面
-- **实例化与分片**：同一 partition key 串行（状态一致），异 key 并行；跨节点经一致性哈希放置——路由不变性保证请求跟着数据走
+- **实例化与分片**：同一 partition key 串行（状态一致），异 key 并行；**数据跟随所属节点（联邦裁决）**——partition key 作用域是节点内部，无全局放置、无跨节点重分片
 - **跨 Partition 查询**：投影 Actor（持续聚合，推荐）/ Arrow HTAP（ad-hoc 列式扫描）
 - **统一调用模型**：`ctx.invoke()` 是唯一受控调用面；冷调用（触达人类/外部系统）wait 不进入 park，挂起写事件流，`resolve_call` 重入
 - **投递语义**：进程内事件因果有序；无共识层——跨节点按联邦形态，域间消息显式寻址（不做全局事件排序）
+- **持久事件队列（4.5c step 2b）**：事件投递的存储形态是 okm 内嵌持久分区（`[mq-data][event][part_id][time]` + `[mq-cursor][event][part_id][actor]`），不是内存 channel——emit 即落盘（被动保存与 ctx.state 主动保存同引擎双轨）、实例驱逐期间的积压在重新激活后照常送达（scale-to-zero 不丢触发）、慢消费者积压可见且可「跳到最新」（skip-to-now 兜底阀门）、N 个订阅者 = 一个分区 + N 个游标（per-actor mailbox 的 N 份复制从结构上消失）。「不引入队列组件」指不引入外部重型队列；嵌入式持久分区是事件被动保存的自然形态。当前实现为 broadcast 过渡形态，持久化重写在 4.5c step 2b
 
 完整设计细节（路由表结构、四种触发模式 on_join/on_batch/on_debounce、Collector、通配符匹配、投递代码、宿主实现、MQ 分解）见 **aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md)**。
 
@@ -496,7 +497,7 @@ Actor 通过 `set(lang, script)` 提交实现（详见 aura 仓库 [`docs/design
 生命周期：
 
 1. **上传（set）**：独立生命周期，可以永远不执行——Host 自省 `interface_schema()`（或从 `@on` 装饰器推导）一次，元数据（receives/lifecycle）与脚本一并持久化到 meta store，receives 派生投递路由
-2. **唤醒（on_wake）**：有事件到达时，Host 从 Fjall 恢复 Actor 状态到内存（脚本从 meta 实例读取最新版本）
+2. **唤醒（on_wake）**：有事件到达时，Host 从 Fjall 恢复 Actor 状态到内存（脚本从 meta 实例读取最新版本）；持久队列里该实例未消费的积压事件按游标继续送达
 3. **处理**：按事件名寻址 handler 执行；handler 内可 `emit()`，状态立即持久化；永不调用 `interface_schema`
 4. **休眠（on_sleep）**：空闲后状态落盘到 Fjall，内存归零（Scale-to-Zero；per-type idle_ttl 决定驻留窗口）
 5. **版本变更**：新 `set` 重新自省一次、更新持久化元数据与路由；此前旧元数据治理
