@@ -46,7 +46,7 @@
 | [统一数据层](unified-data-layer.md) | | SurrealDB 多模型引擎、SurrealQL 人体工程学、与 PG 的分层选型 |
 | [湖仓研究](lakehouse-research.md) | | Iceberg/LanceDB/Delta Lake 选型 |
 | [HelixDB vs LanceDB](helixdb-vs-lancedb.md) | | 对象存储上 AI 数据栈的两种路线对比 |
-| [Aura 架构 §5](aura-architecture.md) | | Fjall + Openraft 分布式存算一体 |
+| [Aura 架构 §5](aura-architecture.md) | | Fjall + 独立元数据（单写无共识）分布式存算一体 |
 | [Arrow HTAP 引擎](arrow-unified-htap-engine.md) | | Arrow 统一 HTAP 引擎设计 |
 | [文件系统方案](filesystem-solution.md) | | 文件系统选型 |
 | [拥塞控制设计](congestion-control-design.md) | | 网络拥塞控制 |
@@ -162,4 +162,5 @@
 | [RisingWave CDC](projects/risingwave-cdc.md) | | RisingWave CDC 方案 |
 | [KV 存储引擎架构](kv-storage-engine.md) | [KV Storage Engine](kv-storage-engine-en.md) | 嵌入式 KV 架构设计、复合键编码与用例 |
 | [共识协议](consensus-protocol.md) | | Raft 共识协议的本质、边界与正确用途：元数据共识 vs 数据存储 |
+| [分布式协作拓扑](distributed-collaboration-topology.md) | | 拓扑/信任边界与一致性算法的正交选择：单体红利、大节点联邦、TCC 柔性事务、CRDT 主权分界 |
 | [OKM：Object-Keyspace Mapping](https://github.com/orbsh/okm) | | 对标 ORM 的 KV 键空间映射过程宏（文档已并入项目仓库） |
