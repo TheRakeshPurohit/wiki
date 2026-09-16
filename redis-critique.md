@@ -228,7 +228,7 @@ def get_users(user_ids):
 
 当你需要扩展到单个 Redis 实例之外时，成本和复杂性会爆炸：
 - **缓存**：流式计算（RisingWave/Flink）+ CDN **便宜 900 倍**，且可无限水平扩展。Redis Cluster 需要手动管理槽位，跨槽操作失败，重新分片痛苦不堪。
-- **会话**：这是一个伪装成缓存问题的**分布式协调问题**。逻辑很简单（存储/检索用户状态），但 Redis Cluster 引入了单点故障风险。现代分布式 KV 存储（etcd、Consul、Fjall+Openraft）提供正确的共识保证。
+- **会话**：这是一个伪装成缓存问题的**分布式协调问题**。逻辑很简单（存储/检索用户状态），但 Redis Cluster 引入了单点故障风险。现代分布式 KV 存储（etcd、Consul）与共识 lease 提供正确的协调保证；aura 的口径是元数据单写无共识（用户数据绑定所属节点）。
 - **排行榜**：在大规模（1 亿+条目）下，专用算法（Count-Min Sketch、T-Digest）或流处理引擎处理聚合更高效。在中等规模（100 万条目）下，PostgreSQL 配合适当索引可实现**100 万并发查询**——Redis 的吞吐优势消失了，因为它被单核性能（~10 万 QPS）瓶颈限制。
 
 **混合部署概率**：在 N 台机器的集群中，应用和 Redis 在同一台机器上的概率是 1/N。即使是同机部署，预期延迟仍然是 ~1ms。
@@ -626,7 +626,7 @@ Redis 的 RESP（Redis Serialization Protocol）是基于行切分的纯文本�
 
 ### Bincode：零元数据开销的序列化
 
-Bincode 是 Rust 原生的纯二进制序列化格式。一个包含 `i32` 和 `bool` 的结构体序列化后恰好 5 字节——无字段名、无分隔符、无类型标记。反序列化不需要解析：CPU 从磁盘（Fjall）或网络（Openraft 的二进制 RaftLog）读出字节，在几个时钟周期内直接 cast 为 Rust 内存结构体。
+Bincode 是 Rust 原生的纯二进制序列化格式。一个包含 `i32` 和 `bool` 的结构体序列化后恰好 5 字节——无字段名、无分隔符、无类型标记。反序列化不需要解析：CPU 从磁盘（Fjall）或网络（节点间帧协议）读出字节，在几个时钟周期内直接 cast 为 Rust 内存结构体。
 
 ### CBOR：兼顾动态扩展与硬件吞吐
 
@@ -671,13 +671,13 @@ Redis 的持久化（快照 + AOF）不是它天然需要的，而是被"想当�
 Redis 唯一剩下的合理性是**惯性**——来自 PHP 时代的历史约束。
 
 1. **用于缓存/状态**：**Fjall**（嵌入式 LSM-Tree KV，Rust 原生）— 完整架构见 [Aura 架构](aura-architecture.md) §5。
-2. **用于分布式状态**：**Fjall + Openraft**（嵌入式 Raft 共识）— 本批判的建设性对应物。在 L0（进程内 KV）和 L3（强一致性分布式协调）两个层面替代 Redis。
+2. **用于分布式状态**：**Fjall（本地）+ 元数据单写 + 联邦认证** — 本批判的建设性对应物。在 L0（进程内 KV）替代 Redis；L3（强一致性分布式协调）按需交给 etcd 类共识服务或外部 TiKV。
 
 ---
 
 ## 交叉引用
 
-- **[Aura 架构](aura-architecture.md)**：Fjall + Openraft 的完整架构设计——存算一体的现代分布式 Actor 引擎。
+- **[Aura 架构](aura-architecture.md)**：Fjall + 独立元数据（单写无共识）的完整架构设计——存算一体的现代分布式 Actor 引擎。
 - **[嵌入式脚本语言](embedded-script-languages.md)**：本批判在脚本层的对应物。
 - **[Fractal.md](Fractal.md)**：第一性原理工程决策闭环——Redis、Koto、Helix 共享的"奥卡姆剃刀"方法论。
 - **[agentmemory](agent-memory.md)**：Agent 记忆层的持久化方案。agentmemory 选择 SQLite + 本地 embedding 而非 Redis，印证了本批判的核心论点——网络延迟主导了 Redis 的微秒级处理优势，嵌入式本地存储是更优解。
