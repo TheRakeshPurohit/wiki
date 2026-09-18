@@ -102,6 +102,18 @@ The fundamental reason for the CLI revival is not nostalgia — it's that **stru
 
 The greatest achievement of the CLI revival is Nushell — replacing text streams with structured data, SQL semantics over awk/sed/grep text processing, and Rust syntax over POSIX shell syntax. See [Nushell Introduction](nushell-introduction.md).
 
+## Core and Interface Split: The Architecture of Client Software
+
+The text vs. visualization debate lands on client software as the Core–interface split.
+
+Modern client software generally has two layers: a pure business-logic Core, and an audience-facing interface layer. Interfaces take different shapes for different audiences — **GUI for mass adoption** (casual users want menu guidance), **CLI for composing with other tools** (the glue layer for advanced users), **HTTP for serving and remote access**. The test of a healthy architecture is **automatability**: with a CLI/HTTP interface, scheduled operations are just a crontab composition; GUI-first software must build everything in — timers, remote control, automation panels — and grows into a Frankenstein.
+
+**The Clash model (HTTP-first)** is the mature paradigm today: the Core is a headless service exposing only an HTTP API; GUI and CLI are both wrappers around that interface. Clean decoupling — Core developers never touch UI frameworks; outsourced ecosystem — the community spontaneously grows wrappers, and the wrapper's feel is the wrapper developer's problem; automatability comes for free — curl is the entry point. Whether the GUI is any good is not the Core's responsibility: casual users don't care (a usable shell exists), and advanced users skip the shell and hit the API directly.
+
+**The qBittorrent counterexample (remote screen-casting)**: its Web UI is not interface decoupling — Qt's built-in web interface ported the desktop interaction logic (tables, context menus, multi-select and drag) verbatim into the browser, merely replacing it with a remotely operable but worse-feeling surface. The essential difference is **whose interaction logic it implements**: a web interface that replicates the GUI's interaction logic is screen-casting; one that exposes the Core's capability surface (clash's rules/proxies/connections API) is true interfacing. Screen-casting only solves the rigid need of "not at my desk"; it can never build an automation ecosystem.
+
+This split aligns with this document's core thesis: the interface shape determines whether operations are text (composable, scriptable, auditable) or visual (a finite state machine). A Core exposing an interface surface = leaving the door open for text; GUI-only = locking users into the visual paradigm.
+
 ## Infrastructure: GUI vs Configuration Files
 
 Infrastructure is the most representative battleground in the GUI vs text debate.
@@ -157,3 +169,8 @@ The structural defects of visual forms (inefficiency, inflexibility, poor compos
 - **[Dify Critique](dify-critique.md)**: Dify is a textbook case of the myth of visualization — replacing text-based programming with drag-and-drop orchestration, using visualization to mask paradigmatic contradictions.
 - **[Harbor Critique](harbor-critique.md)**: Harbor's web UI is another product of the myth of visualization — wrapping simple API operations in a graphical interface.
 - **[Nushell Introduction](nushell-introduction.md)**: Nushell demonstrates the structural advantages of text-based forms in the AI era.
+- **[Serialization Protocol Comparison](serialization-protocol-comparison.md)**: transport-channel selection (gRPC vs. WS/WebTransport) — the protocol-layer companion to the Core/interface split.
+
+## Revision
+
+- 2026-09-17: added "Core and Interface Split" — the Core/interface layering of client software (GUI for adoption, CLI for composition, HTTP for serving), the Clash model vs. the qBittorrent screen-casting counterexample, with the test being whose interaction logic the interface implements; content migrated here after being mistakenly placed in Fractal.md.
