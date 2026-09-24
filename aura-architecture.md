@@ -138,7 +138,22 @@ Rust 原生实现的 Actor 引擎利用 Tokio MPSC 管道建立低开销的 Host
 | **Rust 主外壳** | 宿主 | Tokio 异步协程 + MPSC 状态管道 | 低开销启动，27MB 内存，Scale to Zero 核心设计 | 分布式网关、系统 I/O、事件派发 |
 | **持久化** | 存储层 | Fjall/SlateDB（data/meta 两实例分离，元数据单写无共识） | LSM-Tree + Raft 共识 | 无外部缓存中间层，单次事务原子固化 |
 
-**关键澄清**：脚本语言（Steel/Python）是 Actor 的业务逻辑载体，每个 Actor 选一种。Wasm 是隔离运行时——初版定位是「托管第三方不信任代码」（编写语言通常是 Rust，但 host 不关心，只消费 `.wasm` 二进制）；随着 k10r、gravity 一类 Rust 服务以 wasm Actor 形态进场域，定位扩展为**重隔离的服务承载，且是 Rust 服务的唯一发布形态**：服务编译为 `.wasm` 运行时上传（`set(lang="wasm", bytes)`），不编译进 host——编译进 host 会让每个应用 fork 一份 aura（加服务就要重打包），平台退化成框架。引擎因此**不提供进程内 Rust Actor**——框架自身机制（evictor 类）就是 realm 内的普通逻辑，包装成 Actor 绕一圈没有意义；Rust 代码成为 Actor 只有一条路：编译为 wasm 上传，不是 dylib、不是编译期、不是闭包。存储也不进沙箱——服务自带的 OKM schema 原样编译进 wasm，`VirtualStorage` 的实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储（Krystallizer ADR-0007 存储承载分流；静态 derive，不需要 okm-dynamic）。语言用途没有硬性规定——Steel 可以写业务逻辑，Python 可以写策略，只要开发者认为合适即可。
+**关键澄清**：
+
+- **脚本语言（Steel/Python）是 Actor 的业务逻辑载体**，每个 Actor 选一种。
+- **Wasm 是隔离运行时**，定位经历了一次扩展：
+  - 初版定位是「托管第三方不信任代码」——编写语言通常是 Rust，但 host 不关心，只消费 `.wasm` 二进制。
+  - 随着 k10r、gravity 一类 Rust 服务以 wasm Actor 形态进场域，定位扩展为**重隔离的服务承载，且是 Rust 服务的唯一发布形态**：服务编译为 `.wasm` 运行时上传（`set(lang="wasm", bytes)`），不编译进 host。
+  - 编译进 host 的后果：每个应用 fork 一份 aura，加服务就要重打包，平台退化成框架。
+- **引擎不提供进程内 Rust Actor**：框架自身机制（evictor 类）就是 realm 内的普通逻辑，包装成 Actor 绕一圈没有意义。Rust 代码成为 Actor 只有一条路：编译为 wasm 上传——不是 dylib、不是编译期、不是闭包。
+- **存储也不进沙箱**：服务自带的 OKM schema 原样编译进 wasm，`VirtualStorage` 的实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储（Krystallizer ADR-0007 存储承载分流；静态 derive，不需要 okm-dynamic）。
+- **wasm carrier ABI 已落地**：
+  - handler 以事件名导出（多入口）。
+  - 值以 CBOR 过线性内存：host 经 guest 的 `aura_alloc` 写入参数、调用 `(ptr, len) -> i64`，返回打包 `(ptr:u32)<<32|len:u32`。
+  - ctx bridge host imports 注册在 `aura_host` 命名空间，统一签名。
+  - `interface_schema` 显式导出优先，否则由导出清单推导。
+  - JSON 只在 host 侧 `ResidentSession` 边界出现，存储层与 wasm 桥零 JSON 文本。
+- **语言用途没有硬性规定**：Steel 可以写业务逻辑，Python 可以写策略，只要开发者认为合适即可。
 
 **持久化选型补充**：Actor 消息有强**时间局部性**——热点集中在最近写入的状态，SlateDB 刚写入即落在 memtable / 缓存，冷读 S3 只在偶发点查触发，可接受。因此 **SlateDB 可取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）；仅当热路径对进程内 ns-μs 有硬要求且读取无时间局部性时才退回 Fjall。若需强一致分布式复制，不自建——直接用 FoundationDB / TiKV。详见 [KV 存储引擎](kv-storage-engine.md) §两条分布路径/强一致分布式 与 [统一数据层](unified-data-layer.md)。
 
