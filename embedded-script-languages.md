@@ -122,8 +122,8 @@
 
 同时保持：
 
-- **零 Redis 污染**：所有状态在 Actor 内存中，单次事务写入 PostgreSQL
-- **~20ms 系统启动**：二进制启动 + Tokio 运行时初始化 + Fjall 打开（Actor 唤醒为微秒级，嵌入式 VM 瞬时创建）
+- **零 Redis 污染**：所有状态在摊位内存中，单次事务写入 PostgreSQL
+- **~20ms 系统启动**：二进制启动 + Tokio 运行时初始化 + Fjall 打开（摊位唤醒为微秒级，嵌入式 VM 瞬时创建）
 - **零拷贝数据交互**：四种运行时共享同一内存地址空间，指针直接传递
 
 ### 4.3 用户驱动的多模态路由协议（User-Driven Polyglot Routing）
@@ -144,7 +144,7 @@ pub enum EngineType {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum RaftCommand {
-    UpdateActorState {
+    UpdateBoothState {
         agent_id: String,
         serialized_context: Vec<u8>,
     },
@@ -172,7 +172,7 @@ fn execute_user_chosen_engine(
     input_data: &str,
 ) -> Result<String, String> {
     // 1. 从 Fjall LSM-Tree 中闪速捞出该智能体的持久化状态
-    let raw_state = self.actor_partition.get(agent_id.as_bytes())
+    let raw_state = self.booth_partition.get(agent_id.as_bytes())
         .unwrap().unwrap_or_default();
     let current_status: String = bincode::deserialize(&raw_state)
         .unwrap_or("idle".to_string());

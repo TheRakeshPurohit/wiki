@@ -61,7 +61,7 @@ etcd 底层是纯 Go 的单机 MVCC KV（BoltDB），默认配额硬性锁在 2-
 
 跨区域节点地位绝对平等：不共享共识日志、不选全局 Leader、不追求单一视图。跨区域业务（A 省用户在 B 省就医报销）走联邦标准接口，各自维护独立本地视图，事后对账。信任边界在此处发挥作用——节点互不信任，所以身份绑定所属节点、能力声明走注册表，而非共享一个权限中心。
 
-这正是 [Aura 架构](aura-architecture.md) 的拓扑判断在组织尺度上的映射：场域内 Actor 状态本地写（不走 Raft），元数据才走共识；Probe 出站注册、用户 namespace 隔离——同一套「控制面小而强、数据面本地而快」的分解。
+这正是 [Aura 架构](aura-architecture.md) 的拓扑判断在组织尺度上的映射：场域内摊位状态本地写（不走 Raft），元数据才走共识；Probe 出站注册、用户 namespace 隔离——同一套「控制面小而强、数据面本地而快」的分解。
 
 ## 4. 联邦柔性事务：TCC 与两个自愈补丁
 
@@ -167,6 +167,6 @@ Nostr 类纯公共中继协议是维度 A 取「公共、无主权」的解：�
 - **[共识协议](consensus-protocol.md)**：Raft 机制细节、写放大账目、etcd 案例、何时用/不用 Raft 的决策矩阵——本文控制面结论的机制基础。
 - **[AI 时代的组织和个人](ai-era-organization-individual.md)**：液态组织（联邦化 OPC）的经济层——代币结算、投票定价、AI 主持人协调；本文 §7 补其协议层。
 - **[分布式锁反模式](distributed-lock-anti-pattern.md)**：TCC/幂等/回查是协调不是互斥的判据来源；「锁掩盖协调缺失」在联邦事务中的正面展开。
-- **[Aura 架构](aura-architecture.md)**：「控制面小而强、数据面本地而快」的引擎级落地——Actor 状态本地写、元数据走共识、用户 namespace 隔离。
+- **[Aura 架构](aura-architecture.md)**：「控制面小而强、数据面本地而快」的引擎级落地——摊位状态本地写、元数据走共识、用户 namespace 隔离。
 - **[KV 存储引擎](kv-storage-engine.md)**：共识与协调层级的存储选型（Fjall/SlateDB 双引擎）。
 - **[Redis 批判](redis-critique.md)**：跨联邦缓存与锁为什么交给 KV 与共识层。

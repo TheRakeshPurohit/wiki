@@ -1103,7 +1103,7 @@ meta:entry_point      → [u32]                   ← 图入口节点
 **工业级离线冬眠与零延迟唤醒**（以 Fjall 为例）：向量检索不必 7×24 常驻内存。HNSW 图序列化后持久化到 KV，节点启动/唤醒时反序列化载入内存，查询走内存图，无新向量插入时将图快照 + 原始向量打包写回 KV、内存释放冬眠。整个生命周期是"载入 → 内存查询 → 落盘冬眠"的循环：
 
 ```rust
-// 伪代码：在宿主 Actor 的 KV 存储中融合向量持久化
+// 伪代码：在宿主摊位的 KV 存储中融合向量持久化
 pub fn save_vector_node(&self, partition: &PartitionHandle, vector_id: &str, embedding: &[f32]) {
     // postcard 紧凑序列化（定论见序列化协议分析对比）
     let serialized_vec = postcard::to_allocvec(embedding).unwrap();
@@ -1509,7 +1509,7 @@ Fjall + Tokio + WS 的组合提供等价的网络接口，同时突破单线程�
 
 **存储层**：Fjall 的 `Arc<Keyspace>` 实现线程安全。多线程可同时对同一个 Keyspace 发起读写，LSM-Tree 的无锁读路径（MemTable + SSTable）和后台 compaction 线程天然并发。
 
-**进程内读写路径**：当 WS 服务与 Fjall 嵌入同一进程时，热路径（Actor 状态读写）仍走进程内直接调用（ns 级），WS 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
+**进程内读写路径**：当 WS 服务与 Fjall 嵌入同一进程时，热路径（摊位状态读写）仍走进程内直接调用（ns 级），WS 仅用于跨进程的外部接入。双路径并存：进程内零 RTT + 网络请求标准化。
 
 > **Tonic + gRPC 已废弃**：早期版本的网络接入用 Tonic + gRPC，现已整体放弃，原因（通道取舍汇总见上文「KV server 的构成」）：
 > - **不灵活**：gRPC 把 RPC 与序列化捆绑成一套（Tonic 就是这套绑定的 Rust 实现），调度、中间件、连接形态全被 HTTP/2 + Protobuf 的框架钉死，想换负载均衡、想换编码都是引入新组件而非改配置；

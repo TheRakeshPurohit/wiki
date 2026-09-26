@@ -30,23 +30,23 @@
 | 类型 | 存储位置 | 更新方式 | 适用场景 |
 |------|---------|---------|---------|
 | **核心逻辑** | 编译进二进制 | 重新部署 | 稳定的基础功能 |
-| **动态策略** | Fjall `actor_defs` 分区 | `set()` API 热部署 | 频繁变化的业务规则 |
+| **动态策略** | Fjall `booth_defs` 分区 | `set()` API 热部署 | 频繁变化的业务规则 |
 | **用户脚本** | 用户上传 | Web UI | 自定义扩展 |
 
 ### 1.2 脚本持久化：Fjall 存储
 
-脚本不再从文件系统读取，而是存储在 Fjall 的 `actor_defs` 分区中。Actor 定义本身是持久化、可复制的状态：
+脚本不再从文件系统读取，而是存储在 Fjall 的 `booth_defs` 分区中。摊位定义本身是持久化、可复制的状态：
 
 ```
-fjall partition: "actor_defs"
-  key:   <actor_type_name>
+fjall partition: "booth_defs"
+  key:   <booth_type_name>
   value: CBOR { lang, script_bytes, version, content_hash, committed_at, committed_by }
 ```
 
 - **版本化**：Fjall 的 LSM-Tree 天然支持版本化，每次 `set()` 保留新版本，旧版本可回滚
 - **去重**：`set()` 提交前先计算 `script_bytes` 的哈希，与最新版本比较——相同则忽略，不写入新版本
 - **跨节点同步**：脚本随节点独立部署（各节点 meta 实例 + git/S3 静态资产分发），不需要在每个节点上手动放置脚本文件
-- **实例激活**：`on()` handler 在 Actor 实例激活时从 Fjall 读取最新版本脚本，加载到对应 VM 执行；实例驱逐后，下次激活重新读取
+- **实例激活**：`on()` handler 在摊位实例激活时从 Fjall 读取最新版本脚本，加载到对应 VM 执行；实例驱逐后，下次激活重新读取
 
 ### 1.3 端点发现：`interface_schema()` 约定
 
@@ -70,19 +70,19 @@ def interface_schema():
     }
 ```
 
-- **脚本即文档**：看到 `interface_schema()` 就知道这个 Actor 接收什么事件、发射什么事件
-- **路由表构建**：Host 启动时调用 `interface_schema()`，构建事件路由表（事件名 → partition key → JSON Schema → Actor 定义 → on handler）
+- **脚本即文档**：看到 `interface_schema()` 就知道这个摊位接收什么事件、发射什么事件
+- **路由表构建**：Host 启动时调用 `interface_schema()`，构建事件路由表（事件名 → partition key → JSON Schema → 摊位定义 → on handler）
 - **热重载入口**：脚本修改 → 重新加载 → 重新 `interface_schema()` → 路由表更新，无需重编译 Rust host
-- **Rust actor**：`#[aura::schema]` 宏在编译期自动生成，不需要手写
+- **Rust 摊位**：`#[aura::schema]` 宏在编译期自动生成，不需要手写
 
 ### 1.4 `set()` API：热部署
 
 ```python
-# 运行时提交或更新 Actor 定义
-set("order_actor", lang="python", script=script_bytes)
+# 运行时提交或更新摊位定义
+set("order_booth", lang="python", script=script_bytes)
 ```
 
-`set()` 定义的是**类型**，不是实例。Actor 实例由 Arena 根据 partition key 按需激活。运行时调用 `set()` 可热替换 Actor 实现——不仅换行为，还换语言。
+`set()` 定义的是**类型**，不是实例。摊位实例由 Arena 根据 partition key 按需激活。运行时调用 `set()` 可热替换摊位实现——不仅换行为，还换语言。
 
 ### 1.5 架构拓扑
 
@@ -168,12 +168,12 @@ jobs:
         run: |
           # 遍历 scripts/ 目录，逐个调用 set() API
           for f in scripts/**/*.py; do
-            actor_name=$(basename "$f" .py)
-            auractl arena set "$actor_name" python "$f"
+            booth_name=$(basename "$f" .py)
+            auractl arena set "$booth_name" python "$f"
           done
           for f in scripts/**/*.scm; do
-            actor_name=$(basename "$f" .scm)
-            auractl arena set "$actor_name" steel "$f"
+            booth_name=$(basename "$f" .scm)
+            auractl arena set "$booth_name" steel "$f"
           done
 ```
 
@@ -219,7 +219,7 @@ mod tests {
         let mut harness = ArenaHarness::new();
 
         // 加载脚本
-        harness.set("chat_actor", "python", include_bytes!("../scripts/chat/on_message.py"));
+        harness.set("chat_booth", "python", include_bytes!("../scripts/chat/on_message.py"));
 
         // 投递事件
         harness.emit("on_message", serde_json::json!({
@@ -237,7 +237,7 @@ mod tests {
 
 ### 3.2 多语言测试
 
-ArenaHarness 不关心脚本语言——它通过 `set()` 加载脚本，通过 `emit()` 投递事件，通过 `collect_emits()` 验证结果。同一个测试可以覆盖 Python、Steel Lisp、Wasm 写的 Actor。
+ArenaHarness 不关心脚本语言——它通过 `set()` 加载脚本，通过 `emit()` 投递事件，通过 `collect_emits()` 验证结果。同一个测试可以覆盖 Python、Steel Lisp、Wasm 写的摊位。
 
 ---
 
@@ -284,12 +284,12 @@ def on_message(ctx, event):
 
 ```bash
 # 单文件启动——不需要 Docker、不需要 etcd、不需要数据库
-$ aura dev order_actor.py
+$ aura dev order_booth.py
 
 # 输出：
-# [Aura] Actor order_actor 已启动
+# [Aura] 摊位 order_booth 已启动
 # [Aura] 场域: default
-# [Aura] 状态: Fjall 本地模式 (./data/actors/)
+# [Aura] 状态: Fjall 本地模式 (./data/摊位/)
 # [Aura] 热重载: 监听文件变化，修改即生效
 ```
 
@@ -300,10 +300,10 @@ $ aura dev order_actor.py
 ```bash
 # 启用追踪
 curl -X POST https://aura.example.com/api/debug/trace \
-  -d '{"actor": "chat_actor", "enabled": true}'
+  -d '{"booth": "chat_booth", "enabled": true}'
 
 # 获取执行日志
-curl https://aura.example.com/api/debug/log?actor=chat_actor
+curl https://aura.example.com/api/debug/log?booth=chat_booth
 ```
 
 ---
@@ -316,18 +316,18 @@ Fjall 的 LSM-Tree 保留每次 `set()` 的版本。回滚即指定旧版本号�
 
 ```bash
 # auractl 回滚
-auractl arena rollback chat_actor --to-version 3
+auractl arena rollback chat_booth --to-version 3
 
 # 或通过 API
-curl -X POST https://aura.example.com/api/actors/rollback \
-  -d '{"actor": "chat_actor", "version": 3}'
+curl -X POST https://aura.example.com/api/摊位/rollback \
+  -d '{"booth": "chat_booth", "version": 3}'
 ```
 
 ### 6.2 版本历史
 
 ```bash
 # 查看版本历史
-auractl arena history chat_actor
+auractl arena history chat_booth
 
 # 输出：
 # version 5  python  2026-07-06T15:30:00Z  deployed_by=alice  git=abc123
@@ -345,7 +345,7 @@ Fjall 中每次 `set()` 自动记录元数据（`committed_at`、`committed_by`�
 
 ```bash
 # 查询脚本变更历史
-curl https://aura.example.com/api/audit/actors/chat_actor
+curl https://aura.example.com/api/audit/摊位/chat_booth
 
 # 响应示例
 {
@@ -432,10 +432,10 @@ pub struct ScriptMetrics {
 }
 
 impl ScriptMetrics {
-    pub fn record(&self, actor_name: &str) {
-        metrics::histogram!("script_execution_time", self.execution_time.as_millis() as f64, "actor" => actor_name);
-        metrics::gauge!("script_memory_usage", self.memory_usage as f64, "actor" => actor_name);
-        metrics::counter!("script_errors", self.error_count, "actor" => actor_name);
+    pub fn record(&self, booth_name: &str) {
+        metrics::histogram!("script_execution_time", self.execution_time.as_millis() as f64, "booth" => booth_name);
+        metrics::gauge!("script_memory_usage", self.memory_usage as f64, "booth" => booth_name);
+        metrics::counter!("script_errors", self.error_count, "booth" => booth_name);
     }
 }
 ```
@@ -477,7 +477,7 @@ impl ScriptMetrics {
 
 本文档是 Aura + Fluxora DevOps 的完整设计，与以下详细分析形成完整的决策闭环：
 
-- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎。
+- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式摊位引擎。
 - **[Fluxora 架构](projects/fluxora-architecture.md)**：事件驱动 UI 框架，含未来迁移到 Aura 的路径。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体。
 

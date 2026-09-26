@@ -22,14 +22,14 @@ f(session, user_input) -> session'
 |:--|:--|:--|:--|
 | **Krystallizer** | 结晶 | 会话真相唯一持有者：append-only 会话 + prefix checkpoint + 视图裁剪；技能图谱与涌现 | 记忆面（mem-core 嵌入或独立服务） |
 | **Prism** | 棱镜 | 入口：鉴权、请求解析、把 turn 投进场域。WS 网关 + CLI（包装 WS） | 基于 Aura，纯入口，无队列无状态 |
-| **Gravity** | 引力 | turn 执行器：取会话 → 跑 turn → 存增量。turn 被会话真相牵引运转；单趟执行（一个 turn 一趟），非常驻循环 | Aura 中的 Actor 类型（partition key = session_id）；自带 CLI 驱动循环，本地模式即循环执行 turn |
+| **Gravity** | 引力 | turn 执行器：取会话 → 跑 turn → 存增量。turn 被会话真相牵引运转；单趟执行（一个 turn 一趟），非常驻循环 | Aura 中的摊位类型（partition key = session_id）；自带 CLI 驱动循环，本地模式即循环执行 turn |
 | **Probe** | 探针 | 操作执行环境：容器化执行环境 + 操作触手。接收下发的操作与参数（skill 对其不可见——skill 的解析与选择发生在 Gravity/LLM 侧），执行结果作为 tool result 回流 | Aura 基座组件，也可独立部署为远程服务 |
 
 ```
          请求
           │
        ┌──▼──┐  turn 投递    ┌─────────────────────────┐
-       │Prism├──────────────►│ Gravity (Actor)          │
+       │Prism├──────────────►│ Gravity (摊位)          │
        └─────┘               │  LLM 选择操作、生成参数    │
                              └──┬──────────┬────────────┘
                                 │          │ 任务帧（操作+参数）
@@ -61,11 +61,11 @@ Gravity 的全部职责：Krystallizer full 模式取会话 → LLM 调用与工
 
 - **被动（默认）**：压缩决策在 Krystallizer——它持有全部上下文，信息最全。决策输入是多维的，不止单一阈值：
   - **体量**：消息数/token 量达到阈值（原实现是固定条数如 100 条，剪裁边界应按**结构单元**对齐——一个闭合的工具调用对或一条独立消息，而不是固定条数切一刀；切点落在工具对中间就扩展到对齐为止）
-  - **时间间隔**：最后一条消息距今较长（如缓存 TTL 的量级），前段大概率冷却——赶在缓存失效前把不变前缀固化成 checkpoint。注意这一维**不能走被动模式**：被动压缩挂在 fetch 上，有 turn 才有 fetch，而间隔触发的场景恰恰是没有 turn。时间数据（消息时间戳）在 Krystallizer，但 Krystallizer 不能主动唤起 Gravity——发起只能来自客户端侧：CLI 循环的空闲 tick（本地部署），或 Prism 保持的连接上定时触发压缩 turn 投递（服务端部署，客户端只是个手机 App 也可以由它发）；Aura 部署时也可由 `@cron`/`on_debounce` 注解的 Actor 代发。属主动模式的一种，所需时间戳从 fetch 的会话视图即可获得。Aura 无需新增定时机制——`@cron` 与 debounce timer 已覆盖，定时执行压缩 turn 是它们的用例而非新原语
+  - **时间间隔**：最后一条消息距今较长（如缓存 TTL 的量级），前段大概率冷却——赶在缓存失效前把不变前缀固化成 checkpoint。注意这一维**不能走被动模式**：被动压缩挂在 fetch 上，有 turn 才有 fetch，而间隔触发的场景恰恰是没有 turn。时间数据（消息时间戳）在 Krystallizer，但 Krystallizer 不能主动唤起 Gravity——发起只能来自客户端侧：CLI 循环的空闲 tick（本地部署），或 Prism 保持的连接上定时触发压缩 turn 投递（服务端部署，客户端只是个手机 App 也可以由它发）；Aura 部署时也可由 `@cron`/`on_debounce` 注解的摊位代发。属主动模式的一种，所需时间戳从 fetch 的会话视图即可获得。Aura 无需新增定时机制——`@cron` 与 debounce timer 已覆盖，定时执行压缩 turn 是它们的用例而非新原语
   - **权重**：旧消息被引用的密度低（图谱写入的 tool_invoke_count 侧写）
 
   达到条件时，`fetch_session` 返回的视图尾部**自带压缩尾提示词**：Gravity 收到什么执行什么，不感知这是压缩 turn；LLM 输出中的 `memory_store`/`checkpoint` tool call 自然回流，Krystallizer 在 append 时识别并处理（摘要入 checkpoint、facts 入图谱、截断旧消息）。对 Gravity 而言压缩 turn 与普通 turn 无差别——调用只有一种模式。剪裁产物**不限定条数**：压缩区间多大、留多少尾部，由决策维度算出，不是固定一两条。
-- **主动（外部信号 / 空闲定时）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层）；空闲触发（CLI 空闲 tick、Prism 连接上的定时投递、Aura `@cron` Actor）则在无 turn 到来时代替用户发起。两者都由 Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。Krystallizer 被动等 fetch，永远不能唤起 Gravity——发起权只在有 LLM 的一侧。
+- **主动（外部信号 / 空闲定时）**：上游推理变慢、用户长时间无输入等事件只有 Gravity 感知得到（Krystallizer 看不见传输层）；空闲触发（CLI 空闲 tick、Prism 连接上的定时投递、Aura `@cron` 摊位）则在无 turn 到来时代替用户发起。两者都由 Gravity 主动调用压缩原语，**直接结束本轮**——本轮没有正常回复，是纯压缩 turn，不混合「回答 + 压缩」两个任务。Krystallizer 被动等 fetch，永远不能唤起 Gravity——发起权只在有 LLM 的一侧。
 
 **pending 输入缓冲**：用户输入可能多条（连发几条才合并为一个 turn）。fetch 会话时 pending 输入落进 Krystallizer 的缓冲；压缩发生时缓冲一并进入 prompt 视图（压缩看到完整信息），commit 时缓冲随截断一并清理。缓冲在任何路径下都不丢输入：不压缩则正常 turn 消费缓冲，压缩则被摘要吸收。
 
@@ -292,15 +292,15 @@ memory.write_assistant_message(session_id, assistant)  # 写入 DB + 清空 pend
 
 框架适配之上是会话即数据的无状态模式——三步调用收缩为「取会话 → 执行 → 存会话」，压缩决策沉到 Krystallizer 内部（被动模式 Gravity 无感），见本文压缩双模式一节与 [Krystallizer](krystallizer.md)。
 
-**自带 CLI 驱动循环**：Gravity 提供本地 CLI 形态——进程内循环执行 turn（取会话 → 跑 → 存，下一 turn），这是本地/单机模式；同一 Gravity 函数在 Aura 中注册为 Actor 类型时，每条 turn 事件触发一趟执行，是分布式模式。同一执行函数，三种驱动：CLI for 循环（本地）、Aura Actor（分布式）、函数计算（serverless）——CLI 就是函数的 for 循环，Actor 就是函数的单次调用。发布形态上 Gravity 编译为 `.wasm` 产物运行时上传 Aura（`set(lang="wasm", bytes)`），不是编译进 aura 二进制——Aura 是平台不是应用框架，Agent 应用加功能靠上传新产物，不靠重打包引擎；存储经 `VirtualStorage` 帧上抛由 host 承载（Krystallizer ADR-0007 存储承载分流）。
+**自带 CLI 驱动循环**：Gravity 提供本地 CLI 形态——进程内循环执行 turn（取会话 → 跑 → 存，下一 turn），这是本地/单机模式；同一 Gravity 函数在 Aura 中注册为摊位类型时，每条 turn 事件触发一趟执行，是分布式模式。同一执行函数，三种驱动：CLI for 循环（本地）、Aura 摊位（分布式）、函数计算（serverless）——CLI 就是函数的 for 循环，摊位就是函数的单次调用。发布形态上 Gravity 编译为 `.wasm` 产物运行时上传 Aura（`set(lang="wasm", bytes)`），不是编译进 aura 二进制——Aura 是平台不是应用框架，Agent 应用加功能靠上传新产物，不靠重打包引擎；存储经 `VirtualStorage` 帧上抛由 host 承载（Krystallizer ADR-0007 存储承载分流）。
 
-Aura 中 Gravity 是一个 Actor 类型：同一会话串行（Actor 单线程语义，partition key = session_id），不同会话并行；turn 之间默认 scale-to-zero，`on_sleep`/`on_wake` 退化为存取两个动作——保留期驻留是此默认的细化：驻留窗口内同会话 turn 复用执行体，超时/显式释放才落入存取两个动作（见统一调用模型一节）。流式输出经高频 emit 事件转 SSE 推送——传输面由 Prism 的 WS 网关承载（Gravity 与 Prism 之间仍是场域事件，无直接连接）。
+Aura 中 Gravity 是一个摊位类型：同一会话串行（摊位单线程语义，partition key = session_id），不同会话并行；turn 之间默认 scale-to-zero，`on_sleep`/`on_wake` 退化为存取两个动作——保留期驻留是此默认的细化：驻留窗口内同会话 turn 复用执行体，超时/显式释放才落入存取两个动作（见统一调用模型一节）。流式输出经高频 emit 事件转 SSE 推送——传输面由 Prism 的 WS 网关承载（Gravity 与 Prism 之间仍是场域事件，无直接连接）。
 
 ### Probe：执行与触手
 
-Probe 是操作的执行环境——**执行只提供运行时，不在 Krystallizer 中执行**。skill 对 Probe 不可见：skill 是 Krystallizer 图谱中涌现的子图，Gravity 驱动 LLM——LLM 选择操作、生成参数，这个选择就是 skill 的执行；Probe 拿到的只有操作和参数（外加操作携带的代码）。隔离模型：**Probe 自身打包为容器**（base image + 按需安装依赖），隔离按节点切，不按 skill 切——同容器内的操作共享其文件系统，「受限世界」由 capability surface（应用层检查）执行，不靠容器边界。这在 user namespace 隔离（按 user 切，不按 skill 切）下成立；仅当多租户共享节点成为真实需求时才重提 per-skill 隔离。**Probe 注册为 Aura Actor 类型**（actor_type = Probe，partition_key = node_id），控制面对它的调用走标准 `ctx.invoke()` 路由，与场内 Actor 无异。
+Probe 是操作的执行环境——**执行只提供运行时，不在 Krystallizer 中执行**。skill 对 Probe 不可见：skill 是 Krystallizer 图谱中涌现的子图，Gravity 驱动 LLM——LLM 选择操作、生成参数，这个选择就是 skill 的执行；Probe 拿到的只有操作和参数（外加操作携带的代码）。隔离模型：**Probe 自身打包为容器**（base image + 按需安装依赖），隔离按节点切，不按 skill 切——同容器内的操作共享其文件系统，「受限世界」由 capability surface（应用层检查）执行，不靠容器边界。这在 realm 隔离机制（Phase 3.6，构造期前缀隔离，绑定维度是应用决定——按 user 切是 gravity 的选择，不是框架预设；不按 skill 切；ADR-0028 由 namespace 改名）下成立；仅当多租户共享节点成为真实需求时才重提 per-skill 隔离。**Probe 绑定为摊位类型的执行 affinity**（类型声明指向 node 别名），控制面对它的调用走标准 invoke 路由，与场内摊位无异。
 
-**user namespace 隔离**。场域 namespace 按用户划分（跨 namespace 事件不投递，Aura 既有机制），用户的每台机器是其 namespace 内的一个 Probe 实例。Probe 注册凭证即用户凭证——outbound 连接天然携带「我是谁的哪台机器」，控制面把能力清单写进该用户 namespace 的注册表。Gravity 与会话状态同在一个 user namespace 内，越权在 namespace 边界被挡住，不依赖调用侧记得检查。**tool 目标解析 = user namespace + node 别名 + 能力名**（如 `probe:home-pc:read_file`）；「把家里电脑的文件发到办公室电脑」就是两个 invoke 的编排（home 读 → office 写），编排逻辑在 Gravity/LLM，执行位置在注册表里，两者正交——Gravity 不区分远程/本地，区分发生在目标解析层。
+**Probe 绑定 = 类型 affinity，信任 = 节点身份（Aura PLAN 4.10 / ADR-0015 裁决）**。Probe 绑定到摊位 TYPE（affinity 是元数据：类型声明指向哪个 Probe 节点，注册表记录摊位→probe 绑定），从不绑用户——「probe 注册凭证 = 用户凭证 → 推导 namespace（现名 realm）」已被取代：那是把租户假设（用户存在）焊进基座层；无用户应用（内网算力网格：每节点一个 probe，摊位侧分片任务）是一等公民。信任问题与用户问题分离：「这台机器可以执行」是部署层裁决，走节点身份握手（ed25519，ADR-0015——节点本地生成密钥对，gateway challenge 应答，别名冲突拒绝而不顶替；2026-09-25 归属修订：握手/登记表/审批端点住 **prism 网关**（prism PLAN Phase 1.8），aura 侧已落地的是顶替可见性 + 未认证姿态启动披露——当前注册仍丢弃凭证，防护即网络边界）；「这是谁的请求」是应用层裁决，身份随 payload 元数据携带（gravity 自己区分用户——可按用户组织类型/实例，框架不预设用户维度）。realm 隔离机制保留（构造期前缀隔离，跨 realm 不可表达），绑什么维度是应用的决定。**tool 目标解析 = 类型 affinity + node 别名**；「把家里电脑的文件发到办公室电脑」就是两个 invoke 的编排（home 读 → office 写），编排逻辑在 Gravity/LLM，执行位置在注册表里，两者正交——Gravity 不区分远程/本地，区分发生在目标解析层。
 
 **数据路径留给操作与用户环境**。控制面只递指令和结果摘要：Result 是消息，保持小；工具执行产生的大产物（文件、二进制）不进控制面——操作在 Probe 侧自行处置（本地文件系统、用户配置的传输工具、声明的传输类操作），跨机器传输的可达性要求（直连/VPN）是 Gravity 侧 skill 元数据的声明，控制面不感知数据路径，Aura 保持对存储细节的无知。AI 生成的函数调用参数是指令语义（路径、选项、少量片段），天然量级有限；控制面只需一个宽松的消息上限防异常，不构成数据面设计。
 
@@ -309,7 +309,7 @@ Probe 是操作的执行环境——**执行只提供运行时，不在 Krystall
 - **Aura 内嵌**：作为 Aura 执行基座（Wasmtime 沙箱谱系的重隔离端——Wasm 管不动真文件系统/真网络/系统包时，容器顶上），场域内调用触达。
 - **远程触手**：部署在用户自己的电脑或目标服务器上，就是那台机器的操作触手：部署在哪，就能操作哪。内网/NAT 下的机器没有入站可达性，唯一可行拓扑是 **outbound 长连接**：Probe 启动时主动向控制面发起连接并注册（我在线、我能做什么），此后保持连接，任务由控制面沿连接下推（WS 帧）。连接方向 outbound，数据方向下行推送，不开入站端口——Probe 所在网络的入站拓扑无关紧要。长轮询（反复 HTTP 询问）是此模式的弱化实现。
 
-**连接面是 Probe Actor 的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的事件投递语义：帧下行 = 向该 Probe 实例的事件队列写入（probe Actor 是自己命令队列的单例订阅者），帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、Actor return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准 Actor 调用。同一节点的任务串行由 per-subscription cursor 的串行消费免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
+**连接面是 Probe 摊位的 transport 适配器，不是旁路**。WS 连接把 outbound 长连接包装成 Realm 的事件投递语义：帧下行 = 向该 Probe 实例的事件队列写入（probe 摊位是自己命令队列的单例订阅者），帧上行 = 该实例的 return（reply_to 回填，走 `resolve_call` 与 HTTP 响应、摊位 return 同一投递通道）。`ctx.invoke("probe:<node_id>:<tool>")` 的最后一跳落在连接面上，Gravity 写的只是标准摊位调用。同一节点的任务串行由 per-subscription cursor 的串行消费免费获得；超时/错误复用 `pending_calls` 的 deadline 扫描。
 
 **skill 分发：每次 tool call 实时解析，零缓存。** 涌现的前提是零陈旧窗口——一个实例踩坑解决后存进图谱，任何地方的下一次执行立即拿到新版。skill 生命周期对齐到 tool call 粒度，与「调用只有一种模式」同构：skill 解析是普通读取，不是需要失效策略的缓存问题。分界：解析发生在 Gravity 侧（Krystallizer → Gravity，涌现回路的权重回写也在此），Probe 不感知 skill、不发起拉取、两次调用之间不持有任何东西——它收到的任务帧里是什么就执行什么。
 
@@ -321,7 +321,7 @@ Probe 是操作的执行环境——**执行只提供运行时，不在 Krystall
 
 ### 统一调用模型：CallSlot
 
-本地调用（场内函数）与远程调用（触手上的工具执行）在框架层统一为同一个模型：发起 → call_id 关联 → 回填。这个模型不是新机制——**就是 Aura 的 `ctx.invoke()`**（oneshot + `pending_calls` 表 + `reply_to` 机制，见 [Aura 架构](aura-architecture.md) §5.14）：发起时登记 pending call、call_id 进任务上下文；执行完成按 call_id 找到条目，值放进 oneshot，发起方完成调用。调用方（Gravity 执行体）不感知执行位置——target 由 `invoke.toml` 注册表分派：HTTP 服务、场内 Actor、远程 Probe 是注册表里的三类条目，同一 API。这是「调用只有一种模式」在调用层的实现：调用模式统一了，传输才只需要裁决一次。错误处理沿用既定裁决——失败作为值放进 oneshot（Result），不另开第二通道。
+本地调用（场内函数）与远程调用（触手上的工具执行）在框架层统一为同一个模型：发起 → call_id 关联 → 回填。这个模型不是新机制——**就是 Aura 的 `ctx.invoke()`**（oneshot + `pending_calls` 表 + `reply_to` 机制，见 [Aura 架构](aura-architecture.md) §5.14）：发起时登记 pending call、call_id 进任务上下文；执行完成按 call_id 找到条目，值放进 oneshot，发起方完成调用。调用方（Gravity 执行体）不感知执行位置——target 由 `invoke.toml` 注册表分派：HTTP 服务、场内摊位、远程 Probe 是注册表里的三类条目，同一 API。这是「调用只有一种模式」在调用层的实现：调用模式统一了，传输才只需要裁决一次。错误处理沿用既定裁决——失败作为值放进 oneshot（Result），不另开第二通道。
 
 **两级等待**：等待端按调用性质分流，不是全局二选一。调用处永远只有一行 `slot.wait().await`，运行时在阻塞发生之前按声明分流——分流点在入口，不在等待中途。
 
@@ -366,7 +366,7 @@ WS 用在两个有状态的位置。其一是 Prism 与客户端之间（用户�
 | 循环形态 | 常驻 loop，内存累积 | 纯函数 `f(session, input) -> session'` |
 | 多实例 | 粘性会话 / 状态同步 | 免费——turn 落任何实例 |
 | 挂起恢复 | 自研持久化 | scale-to-zero = 存取两个动作 |
-| 部署 | 常驻服务 | 本地循环 / Aura Actor / 函数计算同构 |
+| 部署 | 常驻服务 | 本地循环 / Aura 摊位 / 函数计算同构 |
 | 工具执行 | 进程内或 RPC | Probe（容器/触手），skill 实时涌现 |
 | 传输 | 常见 WS 长连接贯穿执行层 | 入口 WS（Prism），执行路径无连接 |
 
@@ -374,5 +374,5 @@ WS 用在两个有状态的位置。其一是 Prism 与客户端之间（用户�
 
 - **[Krystallizer](krystallizer.md)**：记忆系统实现——会话控制原语、full 模式、视图层裁剪、技能图谱。
 - **[Agent 记忆选型](agent-memory.md)**：记忆架构通用分析——Surface/Engine 两层、注入方式、外部开源方案对比。
-- **[Aura 架构](aura-architecture.md)**：引擎基座——场域模型、Actor 语义、MQ 分解、多语言内嵌拓扑。
+- **[Aura 架构](aura-architecture.md)**：引擎基座——场域模型、摊位语义、MQ 分解、多语言内嵌拓扑。
 - **[图谱化记忆](graph-memory.md)**：skill 涌现的概念设计——计算时机光谱、聚簇策略、权重系统。

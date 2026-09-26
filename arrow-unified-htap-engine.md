@@ -158,13 +158,13 @@ Arrow 是全宇宙统一的内存列式布局标准。它不关心磁盘，它�
 
 #### 历史海量审计数据的冷库（冷归档 → Parquet）
 
-派遣 Apache Parquet 离线结算。当 AI 智能体几个月前的庞大对话历史、企业多年前的账单流水需要进冷库时，主 Actor 启动后台进程，将 Lance 格式解开、转为 Parquet 格式进行字典和 RLE 深度高压缩，扔进最便宜的 S3 归档存储里。这能让你的服务器硬件运维账单瞬间省下 90%。
+派遣 Apache Parquet 离线结算。当 AI 智能体几个月前的庞大对话历史、企业多年前的账单流水需要进冷库时，主摊位启动后台进程，将 Lance 格式解开、转为 Parquet 格式进行字典和 RLE 深度高压缩，扔进最便宜的 S3 归档存储里。这能让你的服务器硬件运维账单瞬间省下 90%。
 
 ---
 
 ## 二、全链路"零解析"数据流向（Arrow 大一统）
 
-在这种模式下，主 Actor 在处理高频事务和改码状态时，不再使用 Bincode 或 MsgPack 等不透明的紧凑二进制，而是直接使用 Apache Arrow 的 IPC（进程间通信）流式字节流进行物理落盘。
+在这种模式下，主摊位在处理高频事务和改码状态时，不再使用 Bincode 或 MsgPack 等不透明的紧凑二进制，而是直接使用 Apache Arrow 的 IPC（进程间通信）流式字节流进行物理落盘。
 
 ```
 [ 高频写入流 ] ──► 状态变更 ──► 组装为 Arrow RecordBatch ──► 内存直接序列化 ──► 轰入本地 Fjall 磁盘
@@ -190,7 +190,7 @@ Polars 的底层和内部数据表示原生就是基于 Apache Arrow 内存结�
 
 ## 三、强硬核 Rust 落地：Polars + Arrow + Fjall 存算一体引擎
 
-引入 `arrow-array`、`arrow-ipc`（或 `polars-arrow`）的核心序列化组件。让主 Actor 在执行写操作时把数据打包成 Arrow 物理流送进 Fjall，在读操作时直接用 Polars 接管分析：
+引入 `arrow-array`、`arrow-ipc`（或 `polars-arrow`）的核心序列化组件。让主摊位在执行写操作时把数据打包成 Arrow 物理流送进 Fjall，在读操作时直接用 Polars 接管分析：
 
 ```rust
 // src/htap_engine.rs
@@ -398,7 +398,7 @@ async fn apply<I>(&self, entries: I) -> Result<Vec<Response>, StateMachineError>
 
 ### 6.2 物理世界完美的内嵌 HTAP 引擎
 
-系统既能像冲锋枪一样，每秒处理上百万次轻量、无锁的本地随机状态自增；又能让后台的管理或审计 Actor，直接在 100% 绝对实时的数据流上调起极其复杂的 Polars 延迟图执行计划，完成任意维度的、榨干多核硬件极限的 Ad-hoc 报表分析。
+系统既能像冲锋枪一样，每秒处理上百万次轻量、无锁的本地随机状态自增；又能让后台的管理或审计摊位，直接在 100% 绝对实时的数据流上调起极其复杂的 Polars 延迟图执行计划，完成任意维度的、榨干多核硬件极限的 Ad-hoc 报表分析。
 
 ### 6.3 极致的心理学安全感
 
@@ -430,7 +430,7 @@ Arrow 大一统 HTAP 引擎是 [Aura 架构](aura-architecture.md) 的**存储�
 
 ```
 [现代 Actors 架构]
-├── Actor 引擎（Tokio 异步调度）
+├── 摊位引擎（Tokio 异步调度）
 ├── 多语言沙箱（Steel/Rune/PyO3/Wasm）
 └── 存储层
     ├── 工作记忆：Fjall（现在是 Arrow IPC 格式） ✨ 升级
@@ -485,7 +485,7 @@ Steel Lisp 策略层（DataFrame 作为一等公民函数参数）
 
 本文档是 Arrow 大一统 HTAP 引擎的完整设计，与以下详细分析形成完整的决策闭环：
 
-- **[Aura 架构](aura-architecture.md)**：完整的 Actor 引擎、多语言沙箱与分布式共识实现。
+- **[Aura 架构](aura-architecture.md)**：完整的摊位引擎、多语言沙箱与分布式共识实现。
 - **[Aura + Fluxora DevOps](aura-fluxora-devops.md)**：脚本即代码（Script-as-Code）的工程实践，含 GitOps 工作流、CI/CD 配置、脚本测试与调试。
 - **[序列化协议分析对比](serialization-protocol-comparison.md)**：IDL vs Code-First 的分析对账，含 Avro Schema Evolution 与 prost-derive 代码示例。
 - **[HelixDB vs LanceDB 对象存储 AI 栈](helixdb-vs-lancedb.md)**：对象存储上 AI 数据栈的两种路线的详细对比。

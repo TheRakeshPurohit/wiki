@@ -49,7 +49,7 @@ PostgreSQL 的泛化能力使它成为探索期的最优默认：
 
 ### 两条分布路径：Fjall + Lakehouse vs SlateDB + S3
 
-分水岭先看**时间局部性**：若热数据是近期写入、能被 memtable / 本地缓存兜住（Actor 消息、会话状态这类），冷读概率低——SlateDB 的 S3 往返只在偶发点查触发，可接受，甚至可**取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）。仅当热读取对进程内 ns-μs 有硬要求、且读取无时间局部性时，Fjall 才是必需。
+分水岭先看**时间局部性**：若热数据是近期写入、能被 memtable / 本地缓存兜住（摊位消息、会话状态这类），冷读概率低——SlateDB 的 S3 往返只在偶发点查触发，可接受，甚至可**取代「Fjall + Lakehouse」两件套**（单真相、免 flush 管线）。仅当热读取对进程内 ns-μs 有硬要求、且读取无时间局部性时，Fjall 才是必需。
 
 | 维度 | Fjall + Iceberg | SlateDB + S3 |
 |:---|:---|:---|

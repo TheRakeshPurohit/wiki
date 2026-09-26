@@ -677,7 +677,7 @@ Redis 唯一剩下的合理性是**惯性**——来自 PHP 时代的历史约�
 
 ## 交叉引用
 
-- **[Aura 架构](aura-architecture.md)**：Fjall + 独立元数据（单写无共识）的完整架构设计——存算一体的现代分布式 Actor 引擎。
+- **[Aura 架构](aura-architecture.md)**：Fjall + 独立元数据（单写无共识）的完整架构设计——存算一体的现代分布式摊位引擎。
 - **[嵌入式脚本语言](embedded-script-languages.md)**：本批判在脚本层的对应物。
 - **[Fractal.md](Fractal.md)**：第一性原理工程决策闭环——Redis、Koto、Helix 共享的"奥卡姆剃刀"方法论。
 - **[agentmemory](agent-memory.md)**：Agent 记忆层的持久化方案。agentmemory 选择 SQLite + 本地 embedding 而非 Redis，印证了本批判的核心论点——网络延迟主导了 Redis 的微秒级处理优势，嵌入式本地存储是更优解。

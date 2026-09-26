@@ -501,7 +501,7 @@ let value: T = ciborium::de::from_reader::<T, _>(&mut cursor)?;
 
 ## 未来迁移路径：Aura 底层
 
-当 Fluxora 成熟时，可以选择将底层从 Kafka 迁移到 **Aura**（存算一体的现代分布式 Actor 引擎）。
+当 Fluxora 成熟时，可以选择将底层从 Kafka 迁移到 **Aura**（存算一体的现代分布式摊位引擎）。
 
 ### 迁移收益
 
@@ -509,7 +509,7 @@ let value: T = ciborium::de::from_reader::<T, _>(&mut cursor)?;
 |------|--------------|-------------|
 | **部署复杂度** | 需要 Kafka 集群 | 单二进制，14ms 启动 |
 | **一致性** | 最终一致 | 强一致（Raft） |
-| **状态存储** | 无（无状态服务） | Fjall（有状态 Actor） |
+| **状态存储** | 无（无状态服务） | Fjall（有状态摊位） |
 | **分析能力** | 无 | Polars 内存联邦查询 |
 | **运维成本** | 高（Kafka 集群管理） | 低（单二进制） |
 
@@ -593,7 +593,7 @@ cargo build -p ui         # 构建 UI（WASM）
 
 本文档是 Fluxora 项目的完整设计，与以下详细分析形成完整的决策闭环：
 
-- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，Fluxora 未来可选接入的底层基础设施。
+- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式摊位引擎，Fluxora 未来可选接入的底层基础设施。
 - **[反应式架构](flux-architecture.md)**：Fluxora 是反应式架构的激进实践——UI 和协议层完全事件驱动，无 HTTP 请求-响应模型。
 - **[Aura + Fluxora DevOps](aura-fluxora-devops.md)**：脚本即代码（Script-as-Code）的工程实践，含 GitOps 工作流、CI/CD 配置、脚本测试与调试。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体。

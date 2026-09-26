@@ -46,7 +46,7 @@ f(session, user_input) -> session'
 
 Agent 按 `session_id` 取完整会话 → 执行 → 把新会话写回。循环对会话的全部职责是**追加**（含工具结果写入）：从不改写历史、从不从零拼装上下文、调用之间不持有会话状态。所有函数调用——记忆调用也不例外——对循环都是普通记录，调用只有一种模式。
 
-这与 Aura 的「API 有状态、运维无状态」立场同构：会话持久化与恢复沉到记忆系统，actor/executor 在调用之间无状态，scale-to-zero 顺势免费获得——`on_sleep`/`on_wake` 退化为存取两个动作。
+这与 Aura 的「API 有状态、运维无状态」立场同构：会话持久化与恢复沉到记忆系统，摊位/executor 在调用之间无状态，scale-to-zero 顺势免费获得——`on_sleep`/`on_wake` 退化为存取两个动作。
 
 **视图层裁剪是另一套机制，不是循环逻辑。** 把函数调用格式从序列化视图中裁掉，发生在记忆系统的序列化路径上。存储层永远持有完整、未裁剪的会话；视图被裁剪，存储不被裁剪，裁剪严格只在读侧——任何写路径裁剪会让「存储的会话」与「agent 看到的会话」分叉成两个真相。
 
@@ -253,7 +253,7 @@ M 问"有没有更好的方法让 AI 更了解我们的代码，不用每次都�
 
 存储选型、key 编码、检索实现见 [KV 存储引擎](kv-storage-engine.md)（属性图编码模式、delta 追加消除 read-modify-write、二级索引更新策略、WriteBatch 事务、向量冬眠/载入生命周期）。检索侧自建：arroy（HNSW）向量 + 手写 BM25 倒排 + RRF 融合，分词与打分全链路可控——向量与全文检索是 KV 路线需自建补齐的两模块，pg_search 黑盒 tokenizer 不可控正是 KV 路线的核心换取项。
 
-**存储承载按运行形态分流**（ADR-0007）：CLI/独立进程形态自持 Fjall 目录；Aura actor 形态（wasm 沙箱）不能自持文件系统——`VirtualStorage` 实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储。schema 语义（derive、Table/EdgeTable、WriteBatch 组帧）自持，走静态 OKM derive，不需要 okm-dynamic。
+**存储承载按运行形态分流**（ADR-0007）：CLI/独立进程形态自持 Fjall 目录；Aura 摊位形态（wasm 沙箱）不能自持文件系统——`VirtualStorage` 实现替换为帧上抛（okm-wire 帧），host 侧 NestStorage 执行器在 registry 分配的 app ns 前缀下承载物理存储。schema 语义（derive、Table/EdgeTable、WriteBatch 组帧）自持，走静态 OKM derive，不需要 okm-dynamic。
 
 ## skillforge 实现现状
 

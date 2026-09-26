@@ -72,7 +72,7 @@ use serde::{Serialize, Deserialize};
 // 彻底蒸发 .proto 文件和 build.rs！你的代码就是唯一的真实源（Single Source of Truth）
 
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
-pub struct UpdateActorStateCommand {
+pub struct UpdateBoothStateCommand {
     // 标记为 PB 字段 ID 1，编译期自动执行 Varint 高压缩
     #[prost(string, tag = "1")]
     pub agent_id: String,
@@ -83,7 +83,7 @@ pub struct UpdateActorStateCommand {
 }
 
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
-pub struct TerminateActorCommand {
+pub struct TerminateBoothCommand {
     #[prost(string, tag = "1")]
     pub agent_id: String,
 }
@@ -92,10 +92,10 @@ pub struct TerminateActorCommand {
 #[derive(Clone, PartialEq, ::prost::Oneof, Serialize, Deserialize)]
 pub enum RaftCommandPayload {
     #[prost(message, tag = "1")]
-    Update(UpdateActorStateCommand),
+    Update(UpdateBoothStateCommand),
     
     #[prost(message, tag = "2")]
-    Terminate(TerminateActorCommand),
+    Terminate(TerminateBoothCommand),
 }
 
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
@@ -189,7 +189,7 @@ Bincode 的"裸金属肌肉"在 Fluxora（AI-native UI 框架）项目中被实�
 ```rust
 // 不需要 .proto，Rust 类型即定义，编译期映射为 PB 兼容二进制
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
-pub struct UpdateActorStateCommand {
+pub struct UpdateBoothStateCommand {
     #[prost(string, tag = "1")]
     pub agent_id: String,
 }
@@ -295,7 +295,7 @@ Avro 的排布： [值 1] -> [值 2] -> [值 3] （纯粹到极致的肌肉数�
 
 这是 Avro 称霸大数据管道（如 Kafka/流式计算）的绝对大杀器，也是它比 Bincode 强悍得多的地方。
 
-**痛点**：写 Rust 时，如果你用 Bincode 存了数据，明天你的 Actor 升级了，在结构体里加了一个新字段，旧节点读到新数据会瞬间崩掉（Panic）。
+**痛点**：写 Rust 时，如果你用 Bincode 存了数据，明天你的摊位升级了，在结构体里加了一个新字段，旧节点读到新数据会瞬间崩掉（Panic）。
 
 **Avro 的解法**：在 Avro 中，只要新老节点手里各有一份对应的 JSON 说明书，Avro 的解码器（基于 `apache-avro` crate）会在内存里自动执行 **"Schema 校验与对齐（Schema Resolution）"**。
 
@@ -423,7 +423,7 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
         "null",
         {
           "type": "record",
-          "name": "UpdateActorStateCommand",
+          "name": "UpdateBoothStateCommand",
           "fields": [
             {
               "name": "agent_id",
@@ -437,7 +437,7 @@ Avro 无论多么精简，其本质依然是**行式存储（Row-oriented）**�
         },
         {
           "type": "record",
-          "name": "TerminateActorCommand",
+          "name": "TerminateBoothCommand",
           "fields": [
             {
               "name": "agent_id",
@@ -466,20 +466,20 @@ use serde::{Serialize, Deserialize};
 const AVRO_SCHEMA: &str = include_str!("../schemas/aura_raft_command.avsc");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateActorStateCommand {
+pub struct UpdateBoothStateCommand {
     pub agent_id: String,
     pub arrow_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminateActorCommand {
+pub struct TerminateBoothCommand {
     pub agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftCommandPayload {
-    Update(UpdateActorStateCommand),
-    Terminate(TerminateActorCommand),
+    Update(UpdateBoothStateCommand),
+    Terminate(TerminateBoothCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,7 +580,7 @@ pub struct Brick {
 }
 ```
 
-**Gateway 延迟解包外壳**：网关层只需解析路由元数据，Payload 用 `&'a [u8]` 零拷贝转发给下游 Actor：
+**Gateway 延迟解包外壳**：网关层只需解析路由元数据，Payload 用 `&'a [u8]` 零拷贝转发给下游摊位：
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -642,7 +642,7 @@ Core 与同机 GUI 的通信不需要回环网络：localhost 环回仍走完整
 
 本文档是序列化协议的分析对比，与以下文档形成完整的分析闭环：
 
-- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式 Actor 引擎，采用分层序列化策略。
+- **[Aura 架构](aura-architecture.md)**：存算一体的现代分布式摊位引擎，采用分层序列化策略。
 - **[Arrow 大一统 HTAP 引擎](arrow-unified-htap-engine.md)**：Fjall + Arrow + Polars 全链路存算一体，含 7 种数据格式底层字节排布对撞。
 - **[块级编辑器架构](block-editor-architecture.md)**：类 Notion 的 Block Editor，Yjs CRDT 协同 + Fjall 存储。
 - **[可视化迷思](visual-myth.md)**：Core 与接口分层——通道层选型的架构上下文（GUI/CLI/HTTP 接口按人群分形态）。

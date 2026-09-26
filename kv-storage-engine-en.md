@@ -1103,7 +1103,7 @@ The library handles graph building and distance computation; KV handles persisti
 **Industrial-grade offline hibernation and zero-latency wake-up** (using fjall as the example): vector retrieval does not need to be resident in memory 7×24. The HNSW graph is serialized and persisted to KV; on node start/wake-up it is deserialized into memory and queries run against the in-memory graph; when no new vectors are inserted, the graph snapshot + raw vectors are packed back to KV and the memory is released into hibernation. The whole lifecycle is a "load → in-memory query → persist and hibernate" cycle:
 
 ```rust
-// Pseudocode: fusing vector persistence into the host Actor's KV store
+// Pseudocode: fusing vector persistence into the host Booth's KV store
 pub fn save_vector_node(&self, partition: &PartitionHandle, vector_id: &str, embedding: &[f32]) {
     // postcard compact serialization (verdict from the serialization protocol comparison)
     let serialized_vec = postcard::to_allocvec(embedding).unwrap();
@@ -1510,7 +1510,7 @@ The Fjall + Tokio + WS combination provides an equivalent network interface whil
 
 **Storage layer**: Fjall's `Arc<Keyspace>` provides thread safety. Multiple threads can read and write the same Keyspace concurrently; the LSM-Tree's lock-free read path (MemTable + SSTable) and background compaction threads are naturally concurrent.
 
-**In-process read/write path**: When the WS service and Fjall are embedded in the same process, the hot path (Actor state read/write) still uses in-process direct calls (ns-level); WS is only for cross-process external access. Dual paths coexist: in-process zero RTT + standardized network requests.
+**In-process read/write path**: When the WS service and Fjall are embedded in the same process, the hot path (Booth state read/write) still uses in-process direct calls (ns-level); WS is only for cross-process external access. Dual paths coexist: in-process zero RTT + standardized network requests.
 
 > **Tonic + gRPC deprecated**: Early versions used Tonic + gRPC for network access; it has since been abandoned entirely. Reasons (channel trade-offs summarized in "The KV Server's Composition" above):
 > - **Inflexible**: gRPC binds RPC and serialization into one package (Tonic is Rust's implementation of that package); scheduling, middleware, and connection forms are all nailed down by the HTTP/2 + Protobuf framework — switching load balancers or encodings means introducing new components rather than changing configuration;

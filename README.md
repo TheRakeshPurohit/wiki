@@ -73,7 +73,7 @@
 
 | 文档 | English | 内容 |
 |:--|:--|:--|
-| [Aura 架构](aura-architecture.md) | | Event Realm、Actor、事件组合原语、interface_schema |
+| [Aura 架构](aura-architecture.md) | | Event Realm、摊位、事件组合原语、interface_schema |
 | [长连接工程挑战](long-lived-connection-engineering.md) | | WS/WT 长连接的物理限制（背压、碎片化、连接倾斜）与解法 |
 | [Aura Fluxora DevOps](aura-fluxora-devops.md) | | Aura 与 Fluxora 的 DevOps 集成 |
 | [Flux 架构](flux-architecture.md) | | 响应式通信模式：从被动拉取到主动推送，Fluxora = Flux + Aura |
