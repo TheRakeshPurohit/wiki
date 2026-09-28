@@ -61,13 +61,16 @@ Differences from cache trees:
 ### Context Cache Utilization
 
 ```
-Context Cache (unchanged): [conversation history]                 ← trunk
-bypass branch (new computation): [tail prompt + user question] ← leaf
-  → LLM completes both in a single turn: answer user + execute tail prompt task
-  → After turn ends, leaf falls off (tail prompt discarded), only results remain
+Context Cache (unchanged): [conversation history]        ← trunk
+main branch (critical path):   [history + user question]        → normal answer
+bypass branch (new computation): [history + tail prompt]   ← leaf (fired in parallel)
+  → the leaf is its own request: dedicated attention, pays only its delta
+    (prefix KV shared with the main branch)
+  → after the request ends, the leaf falls off (tail prompt discarded),
+    its result lands in external state, the trunk keeps growing
 ```
 
-Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack frame; tail prompts reuse the current Context Cache. Both are "tail" operations that reuse existing state.
+Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack frame; tail prompts reuse the current Context Cache. Both are "tail" operations that reuse existing state. (The old form prepended the tail prompt to the user question and completed answer + task in one turn — the compression scenario now uses the parallel side branch, see below; external-state sedimentation tasks generally belong on the bypass, not in the main branch's attention.)
 
 ### Core Properties
 
@@ -76,26 +79,20 @@ Analogy to TCO (Tail Call Optimization): tail calls reuse the current stack fram
 - **One-shot**: Removed from prompt after turn ends, not written to session
 - **Control**: Injector decides when and what to inject; Agent only executes
 
-### Compression Scenario: In-Place Replacement When Leaf Falls
+### Compression Scenario: Parallel Side Branch
 
 Tail prompts use the vine pattern — one main trunk sprouts leaves, then continues growing. The compression scenario's special case — when the leaf falls, the preceding trunk is also replaced (checkpoint replaces old history).
 
+Form revision (2026-09-28): compression no longer mixes into the answer turn (the old "answer first, then call tools" shape did two jobs in one turn) — it runs as a **side branch parallel to the main branch**: the main branch answers the user as normal, the compression instruction is forked from the same immutable prefix in parallel; prefix KV is shared, the branch pays only its delta, and the summary lands before the next user request.
+
 ```
-Context Cache (unchanged):
-  [ckpt_0] + [msg_101..msg_150]
+Immutable prefix [H] = [ckpt_0] + [msg_101..msg_150]   ← in cache, shared by both branches
 
-Newly appended messages (only uncached portion):
-  tail prompt: "First answer the user's question, then analyze above conversation,
-                call memory_store to extract preferences/facts, mark checkpoint."
-  user message: "Why is Fluxora's component set closed?"
-
-Agent completes three things in one turn (note order):
-  1. "Fluxora's component set is closed because..."       ← answer user question first
-  2. tool_call: memory_store(...)                          ← then memory operations
-  3. tool_call: memory_checkpoint(...)                     ← finally mark checkpoint
+Main branch (critical path): [H] + [user message]        → normal answer
+Compression side branch:     [H] + [compression instr.]  → tool_call: memory_checkpoint / memory_store
 ```
 
-After turn ends, session stores clean history:
+After the requests end, session stores clean history:
 
 ```
 Stored in session:
@@ -105,16 +102,17 @@ NOT:
   [checkpoint_1] + [tail prompt + "Why is Fluxora's component set closed?"] + ["Fluxora's component set is closed because..."]
 ```
 
-Tail prompt discarded, no residue.
+Both requests discard their tail prompts; no residue. Full mechanism: the "compression is a parallel side branch" section in [stateless-agent-architecture.md](stateless-agent-architecture.md).
 
 ### Comparison with Traditional Approaches
 
-| Dimension | Traditional Compression | Tail Prompt |
-|:--|:--|:--|
-| LLM Call | Independent API call | Reuses Agent's normal turn |
-| Context Cache | Computes from scratch (0% hit rate) | History portion uses cache (~99% hit rate) |
-| Attention | Fully concentrated on compression task | Split (answer user + execute task) |
-| Control | Compression module controls | Injector controls (via prompt + tools) |
+| Dimension | Traditional (independent call) | Mixed into turn (old form) | Parallel side branch (current) |
+|:--|:--|:--|:--|
+| LLM Call | Independent API call, prefix-unrelated | Reuses answer turn | Independent branch, shares prefix with main |
+| Context Cache | From scratch (0% hit) | History cached (~99%) | History cached (~99%), one KV for both branches |
+| Attention | Fully on compression | Split (answer + compress in one turn) | Dedicated (branch does only compression) |
+| User Latency | Serial when model is busy | Preempts conversation rhythm | Zero (hidden in the typing gap) |
+| Control | Compression module controls | Injector controls | Injector controls |
 
 ### Cost Analysis
 
@@ -125,9 +123,9 @@ The traditional compression argument ("auxiliary model is cheaper than cache") d
 - Amortized per call: 8.3% / 100 = **0.083%**
 - Trade-off: compression quality loss (information dropped, compressor lacks Agent context)
 
-Tail prompting is itself compression, but higher quality — it leverages the Agent's normal turn attention to compress, rather than a standalone call. Without tail prompting, using the main model on full context is slow and expensive; tail prompting lets the main model compress incidentally during its normal turn, solving this problem.
+Side-branch compression uses the main model plus a compression instruction: the history portion hits cache (~99%), and the instruction owns the entire request's attention — higher quality than the mixed-turn form (which split attention between answering and compressing) and far cheaper than a standalone auxiliary call (whose prefix hit is 0%).
 
-The auxiliary model, while fast per-token, has no Context Cache (0% hit rate) and must recompute the full input. Main model + tail prompt benefits from ~99% cache hit rate on history, often resulting in lower actual latency.
+The auxiliary model, while fast per-token, has no Context Cache (0% hit rate) and must recompute the full input.
 
 ## References
 

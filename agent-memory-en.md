@@ -196,30 +196,29 @@ Turn 1: [ckpt] + [msg_101]
 Turn 2: [ckpt] + [msg_101] + [msg_102]       ← Previous tokens use Context Cache
 Turn 3: [ckpt] + [msg_101] + [msg_102] + [msg_103]
 ...
-Turn N: Reaching threshold → Integrate into next Agent turn for compression
-Turn N+1: [ckpt_1] + [User question X] + [Agent answer Y]
+Turn N: Reaching threshold → Fork a parallel compression side branch from the immutable prefix (off the critical path)
+Turn N+1: [ckpt_1] + [User question X] + [Agent answer Y]   ← new prefix already in place
 ```
 
 **Write Flow**:
 1. Each message appended to session_messages table
 2. Check if messages since last checkpoint >= threshold
-3. Reached threshold → Mark for compression → On next user question, append compression instruction as normal message to prompt end
+3. Reached threshold → Mark for compression → On the next user question, fire the compression instruction as a **parallel side branch** (not in the main branch's prompt)
 
-**Prefix Checkpoint**: After threshold is reached, on the next user question, the memory system appends a special message (not system prompt) at prompt end:
+**Prefix Checkpoint**: After threshold is reached, the memory system forks two read branches in parallel (see the "compression is a parallel side branch" section in the zh doc / stateless-agent-architecture):
 
 ```
-Context Cache (unchanged):
+Context Cache (shared by both branches, unchanged):
   [ckpt] + [msg_101..msg_150]
 
-Newly appended message (only uncached part):
-  "First answer the user's question, then analyze the above conversation,
-   call memory_store to extract preferences/facts, mark checkpoint"
+Main branch (user critical path):  + [User question]          → answer Y
+Compression side branch (parallel): + [compression instruction] → summary S
 
-Agent completes three things in one turn (note the order):
-  1. "Y"                              ← Answer user question first (user experience priority)
-  2. tool_call: memory_store(...)    ← Then memory operations
-  3. tool_call: checkpoint(...)       ← Finally mark checkpoint
+Side-branch output: tool_call: memory_checkpoint(session_id, summary)
+  — once S lands, the session swaps to [S] + [recent tail] before U_{n+1} arrives
 ```
+
+Each branch pays only its own delta; the prefix KV is computed once. The main branch never waits for the side branch; the side branch never enters the dialogue stream.
 
 **History Purity**: Compression instructions are temporary — they only exist in that turn's prompt, never written to session. Session always contains clean history:
 
@@ -231,19 +230,18 @@ Not:
   [checkpoint_1] + [Compression instruction + User's original message X] + [Agent answer Y]
 ```
 
-Even if the prompt modifies the user message to trigger compression (appending instructions), the session must **restore to original content** after turn ends. This ensures:
+The compression instruction lives only in the side branch's request — the main branch's user message is never modified, never written to session. This ensures:
 - History is replayable — anytime session is reloaded, content is real conversation
 - No pseudo-instructions — session won't contain residual system instructions like "analyze the above conversation, call memory_store"
 - Logical coherence — checkpoint + original message + answer form complete causal chain
 
-**Order matters**: Must answer user question first, then do memory operations. User asked a question — if they see a bunch of tool calls running first, experience is poor. The instruction explicitly requires "answer first, process memory later" — user sees the answer as first output, memory operations are completed "incidentally."
+**Main branch and side branch mind their own business**: the main branch's first output is the answer — the user never sees tool calls running first. The side branch's tool calls flow back only into the append path, never into the dialogue stream. The old mixed-turn ordering constraint ("answer first, process memory later") simply disappears: two tasks live in two requests, nothing to order.
 
 **Why this design**:
-- **No Agent loop modification** — Compression through normal tool calls, memory system fully controls
-- **No separate LLM call** — Reuses Agent's normal turn, answer + compress share Context Cache
-- **Cache naturally hits** — History fully cached, only compression instruction + user question are new tokens
-- **User experience seamless** — Answers user normally, behind-the-scenes completes compression and memory extraction
-- **History auto-cleanup** — After turn ends old messages no longer needed, history becomes `checkpoint_1 + X + Y`
+- **No Agent loop modification** — Compression through normal tool calls on the side branch, memory system fully controls
+- **Cache naturally hits** — Both branches share the prefix KV; each pays only its delta
+- **User experience seamless** — Answer latency = a normal turn; compression and memory extraction happen in the branch alongside
+- **History auto-cleanup** — Once the side branch lands, old messages are no longer needed, history becomes `checkpoint_1 + X + Y`
 
 **Why cache-friendly**: Checkpoint is immutable once written, all subsequent turns share the same checkpoint text. LLM API's prompt caching stores checkpoint in GPU VRAM, only the increment changes each time. As increment messages grow and next checkpoint triggers, increment is compressed into new fixed summary, cache hits again.
 
@@ -308,28 +306,28 @@ Advantage: LLM attention completely focused on compression task (no need to answ
 
 Problems: (1) Requires Agent loop modification (identify special output and process); (2) Compression and answer separated, two LLM calls; (3) Compression timing not under memory system control.
 
-**Approach B: Prefix Checkpoint (Current)**
+**Approach B: Prefix Checkpoint (Current)** — parallel side branch
 
-Replaces Approach B'. Compression is not a separate operation, but integrated into Agent's normal conversation turn — on next user question, append compression instruction (not system prompt) at prompt end. Agent completes extraction and answer in one turn:
+Compression is neither a separate cache-less call nor a task mixed into the answer turn: on the user question U_n, the memory system forks two read branches from the immutable prefix — the main branch `[H] + [X]` answers normally (critical path), the side branch `[H] + [compression instruction]` produces the summary in parallel. Prefix KV is shared; the side branch pays only its delta and lands before U_{n+1} (typing gap).
 
 ```
 Turn 1..N: Normal conversation, [ckpt] + increment appended each turn, Context Cache continuously hits
               ↓ Reaching threshold
-Turn N+1:  User asks question X
-           Prompt end appends: "Analyze the above conversation, call memory_store to extract
-                                memory, mark checkpoint, then answer: {X}"
-           → Agent one turn: tool_call(memory_store) + tool_call(checkpoint) + answer Y
-Turn N+2:  History becomes [ckpt_1] + [X] + [Y], restart
+Turn N:    main branch:  [H] + [question X]              → answer Y
+           side branch:  [H] + [compression instruction]  → tool_call(memory_store) + tool_call(checkpoint) → S
+              ↓ S lands in the typing gap
+Turn N+1:  History becomes [S] + [X] + [Y], restart with new stable prefix
 ```
 
-Advantages: (1) No Agent loop modification; (2) answer + compress share Context Cache; (3) User experience seamless; (4) Compression fully controlled by memory system (through tool calls).
+Advantages: (1) No Agent loop modification; (2) both branches share Context Cache; (3) zero user-perceived latency — the serial "compression must wait for the model to be free" delay is parallelized away; (4) attention stays dedicated (the mixed-turn form split it between answering and compressing); (5) fully controlled by the memory system.
 
-| Dimension | A (Parallel Extraction) | B' (Pure Append) | B (Integrated Agent Turn) |
-|:--|:--|:--|:--|
-| Agent Modification | Required | Required | Not Required |
-| LLM Calls | Per turn | Separate compression call | Reuses normal turn |
-| Attention | Distributed | Focused on compression | Distributed (but tool call mechanism ensures) |
-| Control | Agent | Uncertain | Memory System |
+| Dimension | A (Parallel Extraction) | B' (Pure Append) | Mixed-turn (old form of B) | B (Parallel Side Branch, current) |
+|:--|:--|:--|:--|:--|
+| Agent Modification | Required | Required | Not Required | Not Required |
+| LLM Calls | Per turn | Separate compression call | Reuses answer turn | Parallel branch, shares prefix cache |
+| Attention | Distributed | Focused | Distributed (answer + compress in one turn) | Dedicated (branch does only compression) |
+| User Latency | Preempts | Serial when model is busy | Preempts conversation rhythm | Zero (hidden in the typing gap) |
+| Control | Agent | Uncertain | Memory System | Memory System |
 
 ### Storage
 
@@ -552,6 +550,6 @@ skillforge has implemented the two-layer architecture's Surface (threshold trigg
 ### Design Principles
 
 1. **Surface and Engine separation**: Switch frameworks only change Surface, switch storage/retrieval only change Engine
-2. **LLM call minimization**: Unaware within 100 messages, compression integrated into Agent normal turn, no separate LLM calls
+2. **LLM call minimization**: Unaware within 100 messages; compression runs as a parallel side branch (shares the prefix cache, off the critical path, never mixed into the answer turn)
 3. **Framework agnostic**: Memory logic doesn't depend on any specific Agent framework
 4. **Progressive evolution**: Use flat KV when sufficient, upgrade to graph structure when needed

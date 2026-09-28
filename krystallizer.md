@@ -25,9 +25,9 @@ summarize(...)        组合操作：注入压缩指令（经 tail）→ 收集�
 
 尾提示词注入和摘要化都只是分支操作：tail 是单轮分支，summarize 是注入+截断。一个机制，没有特例。
 
-**触发策略上移到调用方——修正为「被动决策在 Krystallizer」。** 核心提供原语；压缩决策默认在 Krystallizer 内部（fetch 时视图组装决定是否注入尾提示词——它持有全部上下文，信息最全）， Gravity 只能感知外部信号时主动调 `summarize`（主动压缩直接结束本轮，纯压缩 turn）。旧的自动触发退化为一种默认策略，不是硬接线——调用方仍可关闭、可按 session 调整、可在其他时机触发；这是旧 `ConversationMemory` 把 `checkpoint_threshold` 硬接线进 `get_context()` 导致调用方完全无控制权的教训。两版教训的公共内核：**策略必须是调用方可控的配置，不是隐藏在存储层的私有行为**——Krystallizer 的被动压缩也要能配置阈值与关闭，配置面在 store 构造期。
+**触发策略：决策在 Krystallizer，发起在 Gravity，执行走并行旁路。** 核心提供原语；压缩决策默认在 Krystallizer 内部（fetch 时视图组装判断水位——它持有全部上下文，信息最全），到达水位即标记一条旁路；旁路的 LLM 请求由 Gravity 在 U_n 到达时与主分支并行发起（同前缀分叉，缓存共享），摘要落地于 U_{n+1} 之前的轮次间隙，前缀切换是后台事务、不占对话关键路径。无 turn 可挂的时间间隔触发由客户端侧发起（CLI 空闲 tick、Prism 定时投递、Aura `@cron` 摊位）。旧的自动触发退化为一种默认策略，不是硬接线——调用方仍可关闭、可按 session 调整、可在其他时机触发；这是旧 `ConversationMemory` 把 `checkpoint_threshold` 硬接线进 `get_context()` 导致调用方完全无控制权的教训。教训内核：**策略必须是调用方可控的配置，不是隐藏在存储层的私有行为**——旁路压缩同样要能配置阈值与关闭，配置面在 store 构造期。
 
-**LLM 调用归调用方（Gravity），Krystallizer 零 LLM 依赖。** 压缩等尾提示词触发的 LLM 调用由 Gravity 实现：上下文缓存与模型（及账户）绑定，只有发起推理的那一侧才知道用哪个模型、走哪个账户——Krystallizer 不需要也不应该知道这些。被动模式下压缩决策在 Krystallizer（fetch 时注入尾提示词，Gravity 无感执行），主动模式暴露 `summarize` 原语；LLM 调用一律发生在 Gravity 的 turn 内，缓存天然命中。唯一例外是内部向量嵌入：Krystallizer 自己调用 embedding 模型，因为不同模型的嵌入空间互不兼容——写入与检索必须用同一个模型算向量，这个绑定是数据正确性约束，不是策略选择。两条边界的判据一致：**绑定到模型身份的调用归谁持有会话真相谁做**——推理缓存绑定 Gravity 的模型账户，嵌入空间绑定 Krystallizer 的存储内部。
+**LLM 调用归调用方（Gravity），Krystallizer 零 LLM 依赖。** 压缩旁路的 LLM 调用由 Gravity 实现：上下文缓存与模型（及账户）绑定，只有发起推理的那一侧才知道用哪个模型、走哪个账户——Krystallizer 不需要也不应该知道这些。压缩决策在 Krystallizer（fetch 时判水位、标记旁路），旁路请求由 Gravity 与主分支并行发出，缓存天然命中。唯一例外是内部向量嵌入：Krystallizer 自己调用 embedding 模型，因为不同模型的嵌入空间互不兼容——写入与检索必须用同一个模型算向量，这个绑定是数据正确性约束，不是策略选择。两条边界的判据一致：**绑定到模型身份的调用归谁持有会话真相谁做**——推理缓存绑定 Gravity 的模型账户，嵌入空间绑定 Krystallizer 的存储内部。
 
 ### 接口面 2：记忆
 
@@ -96,70 +96,70 @@ Turn N+2:  新 checkpoint + 新增量，重新开始
 优势：LLM 注意力完全集中在压缩任务上（不需要同时回答用户），提取质量可能更高。
 问题：(1) 需要改 Agent loop（识别特殊输出并处理）；(2) 压缩和回答分开，两次 LLM 调用；(3) 压缩时机不在记忆系统控制下。
 
-#### 原位检查点压缩（Prefix Checkpoint，当前方案）
+#### 检查点压缩（Prefix Checkpoint，当前方案）
 
-替代上述两种方案。核心思路：压缩不是单独的 LLM 调用，而是融入 Agent 的正常对话 turn——下一个用户提问时，注入尾提示词（不是 system prompt），Agent 一次 turn 同时完成提取和回答。
+替代上述两种方案。核心思路：压缩不是单独的无缓存 LLM 调用，也不是混进回答 turn——而是从**不可变前缀分叉的并行旁路**。下一个用户提问到达时，主分支照常回答；同一水位上，压缩指令作为旁路请求并行发起，前缀 KV 两分支共享、旁路只付增量。摘要落地发生在下一次用户请求之前（打字间隙），前缀切换是后台事务——用户零感知。
 
 **四步闭环**：
-1. **拦截与触发**：记忆系统监控 token 长度，达到阈值时修改用户消息注入压缩指令，前文 token 绝对不变，100% 命中上下文缓存
-2. **原位函数调用**：主模型在完整上下文基础上，按顺序执行 generate_summary() + create_checkpoint()
-3. **正常回复用户**：完成元任务后，继续基于压缩后上下文回答用户原始问题
-4. **历史净化**：turn 结束后还原用户消息为原始内容，保证历史可重放、无伪指令
+1. **拦截与触发**：记忆系统监控水位，达到阈值时在 fetch 视图上标记旁路，前文 token 绝对不变，主分支与旁路都 100% 命中上下文缓存
+2. **并行分叉**：Gravity 同时发出两个请求——主分支 `[H] + [用户问题]` 流式回答，旁路 `[H] + [压缩指令]` 专职压缩
+3. **旁路落库**：旁路的 tool_call（memory_store + memory_checkpoint）由 Krystallizer 在 append 时识别处理——摘要入 checkpoint、facts 入图谱、截断旧消息；输出不进对话流
+4. **间隙切换**：U_{n+1} 到达前会话切换为 `[S] + [近段]`，S 成为新的稳定前缀
 
 ```
 Turn 1..N: 正常对话，[checkpoint] + 增量逐条追加到 prompt，上下文缓存持续命中
               ↓ 达到阈值（100 条）
-Turn N+1:  用户提问 X
-           prompt 末尾追加: "先回答用户的问题，然后分析以上对话，
-                           调用 memory_store 提取记忆，标记 checkpoint"
-           → Agent 一次 turn: 先回答 Y，再 tool_call(memory_store) + tool_call(checkpoint)
-Turn N+2:  历史变为 [ckpt_1] + [X] + [Y]，重新开始
+Turn N 同时发出:
+  主分支: [H] + [用户问题 X]                    → 正常回答 Y（关键路径）
+  旁路:   [H] + [压缩指令]                      → tool_call(memory_checkpoint) → 摘要 S
+              ↓ U_{n+1} 到达前旁路落地（打字间隙，绰绰有余）
+Turn N+1:  历史变为 [S] + [X] + [Y] + [U_{n+1}]，全命中重新开始
 ```
 
 **未压缩内容在 session 中**：阈值内的消息虽然还没被压缩为 checkpoint 或提取为长期记忆，但原始内容完整保存在 session_messages 表中，Agent 通过增量消息直接看到。不是"丢失"或"滞后"，只是还没被压缩——原始数据始终可用。
 
-**历史纯净性**：尾提示词是临时的——只存在于当次 turn 的 prompt 中，从不写入 session。session 中存储的是 `[checkpoint] + [用户原始消息] + [Agent 回答]`，而不是 `[checkpoint] + [尾提示词 + 用户原始消息] + [Agent 回答]`。turn 结束后，如果 prompt 中修改了用户消息（追加指令），需要还原为原始内容，保证历史可重放、无伪指令。
-
-在会话控制原语下，历史纯净性从"靠小心代码维持的约定"升级为结构性性质：尾提示词经 tail（单轮分支）注入，分支用完即弃，主会话历史天然不被污染。
+**历史纯净性**：压缩指令只存在于旁路请求的 prompt 中，主分支的用户消息从不被修改，从不写入 session。session 里永远是 `[checkpoint] + [用户原始消息] + [Agent 回答]`——旁路模型下这条结构性成立：压缩根本不在主分支的 prompt 里。
 
 **优势**：
-- 不改 Agent loop——压缩通过正常 tool call 完成，记忆系统完全控制
-- 不单独调 LLM——复用 Agent 的正常 turn，answer + compress 共享上下文缓存
-- 用户体验无感——正常回答用户，同时后台完成压缩和记忆提取
-- cache 天然命中——历史部分全部缓存，只有尾提示词 + 用户问题是新 token
+- 不改 Agent loop——旁路走标准 tool call 回流，记忆系统完全控制
+- 注意力专一——旁路只做压缩，不与分析用户问题分散（混入 turn 旧形的缺陷）
+- 用户体验无感——回答延迟 = 普通一轮；串行旧形里「压缩必须等模型空出来」的排队延迟被并行消掉
+- cache 天然命中——两分支共享前缀 KV（推理服务对同前缀并发请求天然支持前缀复用），各自只付增量
 
-**三种方案对比**：
+**方案演进对比**：
 
-| 维度 | 并行提取（旧） | 纯追加指令（旧） | Prefix Checkpoint（新） |
-|:--|:--|:--|:--|
-| Agent 改造 | 需要 | 需要 | 不需要 |
-| LLM 调用 | 每轮 | 压缩单独一次 | 复用正常 turn |
-| 注意力 | 分散 | 集中在压缩 | 分散（但 tool call 机制保障） |
-| 控制权 | Agent | 不确定 | 记忆系统 |
+| 维度 | 并行提取（旧） | 纯追加指令（旧） | 混入 turn（旧形） | 并行旁路（当前） |
+|:--|:--|:--|:--|:--|
+| Agent 改造 | 需要 | 需要 | 不需要 | 不需要 |
+| LLM 调用 | 每轮 | 压缩单独一次（无缓存） | 复用回答 turn | 并行分支，共享前缀缓存 |
+| 注意力 | 分散 | 集中在压缩 | 分散（回答+压缩挤同 turn） | 专一（旁路只做压缩） |
+| 用户延迟 | 抢占 | 排队时串行 | 抢占对话节奏 | 零（藏在轮次间隙） |
+| 控制权 | Agent | 不确定 | 记忆系统 | 记忆系统 |
 
 ### 基础策略：Checkpoint 压缩
 
-Prefix Checkpoint 方案下，压缩融入 Agent 的正常 turn——阈值到达时，注入尾提示词，Agent 一次 turn 完成：
+Prefix Checkpoint 方案下，压缩走与主分支并行的旁路——阈值到达时，旁路请求从不可变前缀分叉，专职完成提取与标记：
 
 ```
-100 条消息 → 尾提示词 → Agent 一次 turn:
-  1. 回答用户（LLM 直接输出）
-  2. memory_store(...)  ← LLM 主动判断，提取长期记忆（flat 或 graph facts）
-  3. memory_checkpoint(...) ← Agent 框架执行，纯 DB 操作
+100 条消息 → 旁路请求 [H] + [压缩指令]:
+  tool_call: memory_store(...)      ← LLM 主动判断，提取长期记忆（flat 或 graph facts）
+  tool_call: memory_checkpoint(...) ← Agent 框架执行，纯 DB 操作
+  （主分支同时照常回答用户，互不等待）
 ```
 
-#### 一次调用双层输出
+#### 旁路一次调用双层输出
 
-核心思想不变：一次 LLM 调用同时产出两层输出。只是实现方式从"直接输出 JSON"变为"通过 tool call"：
+核心思想不变：一次 LLM 调用同时产出两层输出。只是实现方式从"直接输出 JSON"变为"通过 tool call"，载体从回答 turn 换成专职旁路：
 
-| 维度 | 旧方案（CheckpointCompressor） | 当前方案（Prefix Checkpoint） |
-|:--|:--|:--|
-| 触发方式 | 独立 LLM 调用 | prompt 尾提示词 → Agent 正常 turn |
-| 输出方式 | LLM 直接输出 JSON（checkpoint + memories） | LLM 回答用户 + tool call（memory_store + memory_checkpoint） |
-| 缓存 | 不共享（新 API 调用） | 共享上下文缓存（同一 turn） |
-| 长期记忆 | LLM 在压缩调用中提取 | LLM 在 tool call 中提取 |
+| 维度 | 旧方案（CheckpointCompressor） | 混入 turn（旧形） | 当前方案（并行旁路） |
+|:--|:--|:--|:--|
+| 触发方式 | 独立 LLM 调用 | prompt 尾提示词 → 回答 turn 顺带 | 前缀标记 → 并行旁路 |
+| 输出方式 | LLM 直接输出 JSON | 回答 + tool call 挤同 turn | 旁路 tool call（memory_store + memory_checkpoint） |
+| 缓存 | 不共享（新 API 调用） | 共享（同 turn） | 共享（同前缀分叉） |
+| 注意力 | 集中 | 分散 | 专一 |
+| 长期记忆 | LLM 在压缩调用中提取 | LLM 在 tool call 中提取 | LLM 在旁路 tool call 中提取 |
 
-两种方案都是一次调用产出两层，但当前方案复用 Agent 的正常 turn，cache 命中率从 0% 提升到 ~99%。
+三种都试图一次调用产出两层，当前方案兼得：混入 turn 的 cache 命中 + 纯追加指令的注意力集中，同时用户延迟为零。
 
 #### 提取格式演进
 
@@ -362,13 +362,13 @@ SurrealDB 的多模型架构让迁移自然——graph record 和 KV record 共�
 
 dsh 的会话模型与本系统的设计独立收敛到同一形态：append-only 事件日志为唯一真相源，LLM 消息历史由 `deriveMessages()` 从日志**派生**而非存储，压缩是日志之上的视图替换（surface replace），原始事件一个不删。两点设计可直接印证或吸收：
 
-- **压缩调用的缓存复用**：dsh 生成摘要时重放被压缩请求的前缀、在尾部追加压缩指令，使 provider 侧 KV cache 命中——与本系统尾提示词机制的缓存收益相同（它是独立压缩调用的尾提示词，我们是混入正常 turn 的尾提示词）。
+- **压缩调用的缓存复用**：dsh 生成摘要时重放被压缩请求的前缀、在尾部追加压缩指令，使 provider 侧 KV cache 命中——与本系统旁路压缩的缓存收益相同（dsh 是独立压缩调用自带尾提示词，我们是与主分支并行分叉的旁路请求，前缀 KV 同源复用）。
 - **剪裁的结构对齐**：dsh 的保留单元是完整闭合的 step（工具调用 + 结果成对），切割点落在 step 中间就扩展到对齐，`compactRegion` 拒绝拆散工具对。compress_task 的截断边界应采用同一规则，取代固定条数。
 
 ## 交叉引用## 交叉引用
 
 - **[图谱化记忆](graph-memory.md)**：原子事实图的概念设计——计算时机光谱、聚簇策略、权重系统、图谱化 Skill。
 - **[Agent 记忆选型](agent-memory.md)**：通用记忆选型分析——Surface/Engine 两层、注入方式、外部开源方案对比。
-- **[无状态 Agent 架构](stateless-agent-architecture.md)**：组件架构总纲——turn 模型、压缩双模式、Surface 架构语义、Prism/Gravity/Probe。
+- **[无状态 Agent 架构](stateless-agent-architecture.md)**：组件架构总纲——turn 模型、压缩并行旁路、Surface 架构语义、Prism/Gravity/Probe。
 - **[KV 存储引擎](kv-storage-engine.md)**：存储层承载——属性图编码模式、读改写消除、二级索引更新策略、WriteBatch 事务。
 - **[缓存树和尾提示词优化](tail-prompt-optimization.md)**：尾提示词的缓存旁路机制。

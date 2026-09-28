@@ -72,7 +72,7 @@ Surface 的完整架构语义——Prefix Checkpoint 机制、记忆控制框架
                 └→ flat memories / graph triples（写入存储）
 ```
 
-提取时机三方案（并行提取 → 纯追加指令 → Prefix Checkpoint）的演进记录完整保留在 [Krystallizer](krystallizer.md)。当前方案即 Prefix Checkpoint：压缩融入 Agent 正常 turn，不单独调 LLM。
+提取时机方案（并行提取 → 纯追加指令 → 混入 turn → Prefix Checkpoint 并行旁路）的演进记录完整保留在 [Krystallizer](krystallizer.md)。当前方案即 Prefix Checkpoint：压缩从不可变前缀分叉并行旁路，主分支照常回答，用户零感知。
 
 ### 提取规格：三轴分离
 
@@ -213,7 +213,7 @@ skillforge 已实现两层架构的 Surface（阈值触发 + checkpoint 注入 +
 
 1. **Surface 和 Engine 分离**：换框架只改Surface，换存储/检索只改Engine
 2. **mem 模块厚，agent 适配层薄**：所有记忆逻辑封装在 WorkingMemory，适配层只做三步调用
-3. **LLM 调用最小化**：100 条以内无感知，压缩融入 Agent 正常 turn，不单独调 LLM
+3. **LLM 调用最小化**：100 条以内无感知，压缩走并行旁路（共享前缀缓存，不占关键路径、不混入回答 turn）
 4. **框架无关**：记忆逻辑不依赖任何特定 Agent 框架
 5. **渐进式演进**：当前 flat KV 够用就用 flat KV，需要图结构时再升级
 
@@ -221,7 +221,7 @@ skillforge 已实现两层架构的 Surface（阈值触发 + checkpoint 注入 +
 
 ## 交叉引用
 
-- **[无状态 Agent 架构](stateless-agent-architecture.md)**：Surface 机制的架构篇——Prefix Checkpoint 详解、记忆控制、触发时机、注入方式、压缩双模式。
+- **[无状态 Agent 架构](stateless-agent-architecture.md)**：Surface 机制的架构篇——Prefix Checkpoint 详解、记忆控制、触发时机、注入方式、压缩并行旁路。
 - **[Krystallizer](krystallizer.md)**：本项目记忆系统的实现设计——会话控制原语、full/assist 模式、提取三方案演进、KDL 序列化、skillforge 实现现状。
 - **[图谱化记忆](graph-memory.md)**：图谱的记忆概念设计——计算时机光谱详述、双层模型、聚簇策略、权重系统、涌现式 Skill、做梦沉淀。
 - **[缓存树和尾提示词优化](tail-prompt-optimization.md)**：尾提示词的缓存旁路机制。
