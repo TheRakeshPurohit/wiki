@@ -171,6 +171,8 @@ Rust 原生实现的摊位引擎利用 Tokio MPSC 管道建立低开销的 Host 
 
 **外部调用**：框架通过 `ctx.invoke()` + 统一调用注册表提供同步调用（详见 aura 仓库 [`docs/design/realm.md`](https://github.com/orbsh/aura/blob/main/docs/design/realm.md) §ctx.invoke 统一调用原语）。Host 管控调用生命周期（超时、审计、可观测），Fluxora 负责 HTTP 请求。摊位不直接通过 PyO3 调用外部系统——这绕过 Host 管控。进程内调用（PyO3/WASM）始终优先于跨进程调用。
 
+**流式调用（iterate）**：与 emit/on/invoke 并列的第四个原语（ADR-0034）：`ctx.iterate(target, handler, args)` 返回游标，逐条拉取类型化信封 `{item, done}`——终止、背压、消费方活性由拉取结构内建，不是约定。生产方形态按语言分流：python 写 `yield` 生成器（框架停放驱动，耗尽即 done）；steel/nushell/wasm 无宿主可驱动生成器，handler 显式写信封（Rust-wasm guest 在模块状态内映射 `Iterator`）。消费方形态同样按语言：python 脚本用原生 `ctx_iterate(...)` generator（break 自动 dispose），Rust 用游标，其余拉到 done；每次拉取是 hot 调用，骑既有调用机件（流不持久、不可重放——要 at-least-once 用事件）。动机场景：provider 摊位（python `httpx.stream` 消费 SSE → yield per token）供 wasm 兄弟摊位消费，落实 ADR-0031「对外访问归摊位代码」。
+
 **AI Agent/Harness 场景的分层**：
 
 Agent 的逻辑分为两层——编排层和工具层，分别用不同语言实现：
