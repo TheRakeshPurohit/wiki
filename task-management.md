@@ -54,4 +54,5 @@ scratch **存数据库**：
 ## 四、agent 集成模式
 
 - 考虑 scratch 与 agent 的集成模式：任务树 + 标签树可作为 agent 的任务/记忆结构。
+- **协调定位**：task 图不止是个人任务清单，还是**多 agent 协调介质**（共享任务视图替代消息互传）与**组织账本**（工作走图则追踪零成本）——论据见 [graph-memory.md](graph-memory.md) §任务网状化。
 - **终局**：与 [graph-memory.md](graph-memory.md) 一起集成到 agent（任务结构并入 agent 的记忆/推理编排）。
